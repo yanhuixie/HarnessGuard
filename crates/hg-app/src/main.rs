@@ -1,6 +1,11 @@
 //! HarnessGuard 服务入口（技术设计 §2：配置加载、平台选择、组装装配）。
-//! M1：Windows 控制台模式（管理员运行）；windows-service 宿主化与完整停机
-//! 序列（§9.3）在 M4。
+//! 运行形态：
+//! - `run`（默认，无参）：控制台管理员模式（M1 行为，演示/调试用）
+//! - `service`：SCM 服务宿主（M4 P2.8 归位；安装后由服务控制管理器拉起）
+//! - `install` / `uninstall`：服务安装/卸载（含恢复策略配置，需管理员执行）
+
+#[cfg(windows)]
+mod service;
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering::Relaxed;
@@ -25,12 +30,44 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "info".into()),
         )
         .init();
+    match std::env::args().nth(1).as_deref() {
+        None | Some("run") => run_server(None),
+        #[cfg(windows)]
+        Some("service") => service::dispatch(),
+        #[cfg(windows)]
+        Some("install") => service::install(),
+        #[cfg(windows)]
+        Some("uninstall") => service::uninstall(),
+        other => anyhow::bail!("未知参数 {other:?}；用法：harnessguard [run|service|install|uninstall]"),
+    }
+}
 
-    let cfg_path = PathBuf::from(
-        std::env::args()
-            .nth(1)
-            .unwrap_or_else(|| "config.toml".into()),
-    );
+/// 等待停止信号：控制台模式等 Ctrl+C；服务模式等 SCM Stop（经 watch 通道，
+/// Session 0 无控制台，Ctrl+C 分支仅为异常场景兜底）。
+async fn wait_for_stop(mut stop: Option<tokio::sync::watch::Receiver<bool>>) {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => tracing::info!("收到 Ctrl+C"),
+        _ = async {
+            match stop.as_mut() {
+                Some(rx) => rx.changed().await.ok(),
+                None => std::future::pending::<Option<()>>().await,
+            }
+        } => tracing::info!("收到服务停止信号"),
+    }
+}
+
+/// 服务主体（控制台/SCM 共用）：装配全链路并阻塞至停止信号，
+/// 随后执行停机序列（技术设计 §9.3 摘要：ETW 会话回收 + 存储冲刷）。
+pub(crate) fn run_server(
+    stop: Option<tokio::sync::watch::Receiver<bool>>,
+) -> anyhow::Result<()> {
+    // 配置路径：`run [config]` 或 `service [config]`；缺省当前目录 config.toml
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    const MODES: [&str; 4] = ["run", "service", "install", "uninstall"];
+    let cfg_path = PathBuf::from(match args.first().map(|s| s.as_str()) {
+        Some(m) if MODES.contains(&m) => args.get(1).cloned().unwrap_or_else(|| "config.toml".into()),
+        _ => args.first().cloned().unwrap_or_else(|| "config.toml".into()),
+    });
     let cfg = if cfg_path.exists() {
         FileConfig::load(&cfg_path)?
     } else {
@@ -136,14 +173,20 @@ fn main() -> anyhow::Result<()> {
     });
 
     println!("==================================================================");
-    println!(" HarnessGuard M1 已启动（控制台模式）");
+    println!(" HarnessGuard M4 已启动（控制台模式；服务宿主：harnessguard install）");
     println!(" Web UI： http://{bind}/?token={token}");
     println!("==================================================================");
 
-    rt.block_on(async {
-        let _ = tokio::signal::ctrl_c().await;
-    });
-    tracing::info!("收到 Ctrl+C：M1 直接退出（ETW session 随进程回收；完整停机序列 §9.3 在 M4）");
+    rt.block_on(wait_for_stop(stop));
+
+    // 停机序列（技术设计 §9.3）：ETW 会话显式回收（防残留——强杀会话不死，
+    // M1 实测教训）→ 写通道全闭 → writer 冲刷退出 → 运行时收尾
+    tracing::info!("停机序列：回收 ETW 会话");
+    hg_plat_win::stop_etw_sessions();
+    drop(store_tx);
+    rt.shutdown_timeout(Duration::from_secs(2)); // 执行器任务结束 → 其 store_tx 克隆释放
+    std::thread::sleep(Duration::from_millis(400)); // 等 writer 通道关闭冲刷落盘
+    tracing::info!("停机完成");
     Ok(())
 }
 

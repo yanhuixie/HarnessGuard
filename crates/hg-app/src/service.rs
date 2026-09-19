@@ -1,0 +1,134 @@
+//! windows-service 服务宿主（技术设计 §2/§5.1：单特权系统服务 + 恢复策略；
+//! M1 偏差表归位：控制台管理员模式 → SCM 宿主）。
+//!
+//! P2 级交付：**编译级验证**。本仓库无人值守纪律禁止系统状态变更——
+//! install/uninstall 只提供实现，不在本会话执行；复验命令清单见 M4 报告。
+//!
+//! 恢复策略：create_service 不覆盖 failure actions，安装时经 `sc.exe failure`
+//! 配置三级重启（5s×3，等效 SCM Recovery 页）；binPath 由 launch_arguments
+//! 自动拼装为 `"...\harnessguard.exe" service`。
+
+use std::ffi::OsString;
+use std::time::Duration;
+
+use windows_service::service::{
+    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
+    ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+};
+use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+use windows_service::service_dispatcher;
+use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+pub const SERVICE_NAME: &str = "HarnessGuard";
+
+/// SCM 入口（binPath 形如 `"...\harnessguard.exe" service`）。
+pub fn dispatch() -> anyhow::Result<()> {
+    service_dispatcher::start(SERVICE_NAME, ffi_service_main)
+        .map_err(|e| anyhow::anyhow!("SCM 调度启动失败：{e}"))
+}
+
+/// SCM 调度回调签名（裸入口，不接参——配置路径走服务工作目录/绝对约定）。
+extern "system" fn ffi_service_main(_argc: u32, _argv: *mut *mut u16) {
+    service_main();
+}
+
+fn service_main() {
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let event_handler = move |control_event| -> ServiceControlHandlerResult {
+        match control_event {
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            ServiceControl::Stop => {
+                let _ = stop_tx.send(true);
+                ServiceControlHandlerResult::NoError
+            }
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }
+    };
+    let status_handle = match service_control_handler::register(SERVICE_NAME, event_handler) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!("服务控制处理器注册失败：{e}");
+            return;
+        }
+    };
+    let report = |state, code, wait_hint| {
+        let st = ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: state,
+            // Interrogate 由 SCM 隐式支持，无需（也无位）声明
+            controls_accepted: ServiceControlAccept::STOP,
+            exit_code: ServiceExitCode::Win32(code),
+            checkpoint: 0,
+            wait_hint,
+            process_id: None,
+        };
+        if let Err(e) = status_handle.set_service_status(st) {
+            tracing::error!("服务状态上报失败（{state:?}）：{e}");
+        }
+    };
+    report(ServiceState::Running, 0, Duration::from_secs(3));
+    tracing::info!("[服务] HarnessGuard 服务主体启动（SCM 宿主）");
+
+    if let Err(e) = crate::run_server(Some(stop_rx)) {
+        tracing::error!("[服务] 服务主体退出（失败）：{e:#}");
+        report(ServiceState::Stopped, 1, Duration::ZERO);
+        return;
+    }
+    report(ServiceState::Stopped, 0, Duration::ZERO);
+}
+
+/// 安装服务（需管理员）：LocalSystem 自启动 + `service` 启动参数 + 三级失败重启。
+/// **本会话未执行**——复验时由管理员运行（M4 报告有完整命令清单）。
+pub fn install() -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    let manager = ServiceManager::local_computer(
+        None::<&str>,
+        ServiceManagerAccess::CREATE_SERVICE | ServiceManagerAccess::CONNECT,
+    )?;
+    let info = ServiceInfo {
+        name: OsString::from(SERVICE_NAME),
+        display_name: OsString::from("HarnessGuard（AI harness 行为防护）"),
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: ServiceStartType::AutoStart, // 开机自启
+        error_control: ServiceErrorControl::Normal,
+        executable_path: exe,
+        // SCM 以 main 参数传入（非 service_main 参数）——对应 `service` 子命令
+        launch_arguments: vec![OsString::from("service")],
+        dependencies: vec![],
+        account_name: None, // LocalSystem（特权服务，需求 §6.1）
+        account_password: None,
+    };
+    let service = manager.create_service(&info, ServiceAccess::ALL_ACCESS)?;
+    service.set_description("ETW 事件源 + 规则引擎 + 处置（需求 §6.1 单特权服务）")?;
+
+    // 恢复策略（需求 §6.3/技术设计 §8.2）：三级重启，计数 24h 重置
+    let out = std::process::Command::new("sc")
+        .args([
+            "failure", SERVICE_NAME,
+            "reset=", "86400",
+            "actions=", "restart/5000/restart/5000/restart/5000",
+        ])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!("恢复策略配置失败：{}", String::from_utf8_lossy(&out.stderr));
+    }
+    println!("服务已安装（LocalSystem 自启动，失败三级重启）");
+    println!("启动：sc start {SERVICE_NAME}（需管理员）");
+    Ok(())
+}
+
+/// 卸载服务（需管理员）。**本会话未执行**。
+pub fn uninstall() -> anyhow::Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service =
+        manager.open_service(SERVICE_NAME, ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS | ServiceAccess::STOP)?;
+    // 运行中先停（运行中删除只标记，不移除）
+    let status = service.query_status()?;
+    if status.current_state != ServiceState::Stopped {
+        service.stop()?;
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    service.delete()?;
+    println!("服务已卸载");
+    Ok(())
+}

@@ -27,3 +27,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 rand = { workspace = true }
 axum = { workspace = true }
+
+# M4 P2.8：SCM 服务宿主（仅 Windows；编译级验证，安装/启动待管理员实机复验）
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"

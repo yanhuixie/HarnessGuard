@@ -32,3 +32,11 @@ pub use notify::WinNotifier;
 pub fn describe() -> &'static str {
     "hg-plat-win：ETW 事件源 + 杀进程/断连接/封 IP 处置（M1）"
 }
+
+/// 停机序列用：显式回收本服务的三个 ETW 会话（强杀进程不会自动停会话，
+/// 残留会话导致二次启动 0 事件——M1 实测教训；技术设计 §9.3）。
+pub fn stop_etw_sessions() {
+    for s in ["HarnessGuard", "HarnessGuardDns", "HarnessGuardSched"] {
+        let _ = ferrisetw::trace::stop_trace_by_name(s);
+    }
+}
