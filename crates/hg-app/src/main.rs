@@ -185,10 +185,16 @@ pub(crate) fn run_server(
         }
     });
 
-    println!("==================================================================");
-    println!(" HarnessGuard M4 已启动（控制台模式；服务宿主：harnessguard install）");
-    println!(" Web UI： http://{bind}/?token={token}");
-    println!("==================================================================");
+    // 控制台横幅仅非服务模式打印（服务模式 Session 0 无 stdout，println!
+    // 写失败会 panic——复验前预防性修复；服务模式改走 tracing）
+    if stop.is_none() {
+        println!("==================================================================");
+        println!(" HarnessGuard M4 已启动（控制台模式；服务宿主：harnessguard install）");
+        println!(" Web UI： http://{bind}/?token={token}");
+        println!("==================================================================");
+    } else {
+        tracing::info!("HarnessGuard 服务模式已启动，Web UI：http://{bind}/?token={token}");
+    }
 
     rt.block_on(wait_for_stop(stop));
 
