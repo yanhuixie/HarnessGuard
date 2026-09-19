@@ -2,9 +2,10 @@
 //! - 仅监听 127.0.0.1（装配方保证）；随机 token；`Authorization: Bearer` 鉴权；
 //! - Host 校验中间件（防 DNS rebinding，需求 §6.2）；
 //! - 静态资源 rust-embed 嵌入（无构建前端）；
-//! - `/api/stream`（SSE）M1 未实现（UI 以 3s 轮询替代），M4 接入——已知偏差。
+//! - `/api/stream`（SSE）实时推送判定与审计事件（M4 接入，替换 M1 的 UI 3s 轮询）；
+//!   鉴权例外：query token 仅放行本端点（拍板记录 8——EventSource 无法带 header）。
 //!
-//! 已知偏差（相对设计 §7）：封禁 WFP→netsh 见 M1 报告；SSE→轮询见本文件头。
+//! 已知偏差（相对设计 §7）：封禁 WFP→netsh 见 M1 报告（M4 换 FwpmFilterAdd）。
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -13,6 +14,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
+use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -27,10 +29,19 @@ use hg_core::FileConfig;
 use rust_embed::Embed;
 use serde::Deserialize;
 use serde_json::json;
+use tokio_stream::StreamExt;
 
 #[derive(Embed)]
 #[folder = "../../ui/"]
 struct Assets;
+
+/// SSE 推送事件：`event` 为事件名（verdict/audit），`data` 为预序列化 JSON。
+/// 经 broadcast 通道多播给所有已连接的 UI（无订阅者时发送即弃，不阻塞执行器）。
+#[derive(Debug, Clone)]
+pub struct SseEvent {
+    pub event: &'static str,
+    pub data: String,
+}
 
 pub struct AppState {
     pub token: String,
@@ -44,6 +55,8 @@ pub struct AppState {
     pub conns: Arc<ConnRegistry>,
     pub src_stats: Arc<SourceStats>,
     pub eng_stats: Arc<EngineStats>,
+    /// SSE 多播通道（执行器喂入，/api/stream 订阅）
+    pub sse: tokio::sync::broadcast::Sender<SseEvent>,
     pub started: Instant,
 }
 
@@ -67,7 +80,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/whitelist", get(wl_list).post(wl_add))
         .route("/api/whitelist", delete(wl_del))
         .route("/api/config", get(config_get).put(config_put))
-        .route("/api/stream", get(stream_stub));
+        .route("/api/stream", get(stream));
     Router::new()
         .route("/", get(index))
         .merge(api.route_layer(middleware::from_fn_with_state(state.clone(), auth)))
@@ -75,6 +88,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 /// Bearer 鉴权 + Host 校验（仅 /api/*；静态首页为壳页面不鉴权）。
+/// SSE 例外（技术设计 §7 / 拍板记录 8）：query token 仅放行 `/api/stream`。
 async fn auth(
     State(st): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -89,12 +103,19 @@ async fn auth(
     } else {
         return (StatusCode::FORBIDDEN, "缺少 Host").into_response();
     }
-    let ok = headers
+    let bearer_ok = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .is_some_and(|t| t == st.token);
-    if !ok {
+    // query token 仅对 /api/stream 有效（token 为 hex，无需百分号解码）
+    let query_ok = req.uri().path() == "/api/stream"
+        && req
+            .uri()
+            .query()
+            .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("token=")))
+            .is_some_and(|t| t == st.token);
+    if !bearer_ok && !query_ok {
         return (StatusCode::UNAUTHORIZED, "无效 token").into_response();
     }
     next.run(req).await
@@ -308,11 +329,44 @@ fn toml_parse(s: &str) -> anyhow::Result<FileConfig> {
     Ok(toml::from_str(s)?)
 }
 
-/// `/api/stream`：SSE 实时推送。M1 以 UI 轮询替代（技术设计 §7 已知偏差，M4 接入）。
-async fn stream_stub() -> Response {
+/// SSE 帧编码（event + data 各一行，空行结尾）。
+fn sse_frame(ev: &SseEvent) -> axum::body::Bytes {
+    axum::body::Bytes::from(format!("event: {}\ndata: {}\n\n", ev.event, ev.data))
+}
+
+/// `/api/stream`：SSE 实时推送（技术设计 §7）。
+/// - 首帧 `retry: 3000`（EventSource 断线 3s 重连）；
+/// - verdict/audit 事件经 broadcast 多播；15s keepalive 注释帧探测死连接；
+/// - broadcast 滞后（UI 慢）时丢帧并发 `: lagged` 注释，UI 按需重新拉取列表。
+async fn stream(State(st): State<Arc<AppState>>) -> Response {
+    use std::time::Duration;
+    let retry = tokio_stream::iter(vec![Ok::<_, std::convert::Infallible>(
+        axum::body::Bytes::from_static(b"retry: 3000\n\n"),
+    )]);
+    let events = tokio_stream::wrappers::BroadcastStream::new(st.sse.subscribe()).map(|r| {
+        Ok::<_, std::convert::Infallible>(match r {
+            Ok(ev) => sse_frame(&ev),
+            // 滞后丢帧：注释帧告知客户端，随后 UI 靠重新拉取对齐
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                axum::body::Bytes::from(format!(": lagged {n}\n\n"))
+            }
+        })
+    });
+    let mut ka = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(15),
+        Duration::from_secs(15),
+    );
+    ka.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let keepalive = tokio_stream::wrappers::IntervalStream::new(ka)
+        .map(|_| Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b": keepalive\n\n")));
+    let body = Body::from_stream(retry.chain(events.merge(keepalive)));
     (
-        StatusCode::NOT_IMPLEMENTED,
-        "SSE 实时流 M4 接入；当前请轮询 /api/verdicts 与 /api/events",
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, "text/event-stream"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
     )
         .into_response()
 }
@@ -323,10 +377,101 @@ fn _unused(_ip: IpAddr) {}
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use tower::util::ServiceExt;
+
+    /// 构造可服务的最小状态（stream/status 路径不触库，db_path 占位即可）。
+    fn test_state() -> Arc<AppState> {
+        let (sse_tx, _keep) = tokio::sync::broadcast::channel(64);
+        let cfg = FileConfig::default();
+        let snap = RulesSnapshot::compile(&cfg.to_rules_config(vec![])).expect("编译规则");
+        Arc::new(AppState {
+            token: "t123".into(),
+            expected_host: "127.0.0.1:18099".into(),
+            rules: Arc::new(ArcSwap::from_pointee(snap)),
+            config: Arc::new(RwLock::new(cfg)),
+            config_path: "unused.toml".into(),
+            db_path: "unused.db".into(),
+            procs: Arc::new(ProcTable::new()),
+            conns: Arc::new(ConnRegistry::new()),
+            src_stats: Arc::new(SourceStats::default()),
+            eng_stats: Arc::new(EngineStats::default()),
+            sse: sse_tx,
+            started: Instant::now(),
+        })
+    }
+
+    async fn call(state: &Arc<AppState>, uri: &str, bearer: bool) -> axum::response::Response {
+        let mut b = axum::http::Request::builder()
+            .uri(uri)
+            .header("host", "127.0.0.1:18099");
+        if bearer {
+            b = b.header("authorization", "Bearer t123");
+        }
+        router(state.clone())
+            .oneshot(b.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn sse_帧编码() {
+        let f = sse_frame(&SseEvent { event: "verdict", data: "{\"id\":1}".into() });
+        assert_eq!(std::str::from_utf8(&f).unwrap(), "event: verdict\ndata: {\"id\":1}\n\n");
+    }
+
+    /// 拍板记录 8 的验收：query token 仅放行 /api/stream，其余端点仅 Bearer。
+    #[tokio::test]
+    async fn query_token_仅放行_stream端点() {
+        let st = test_state();
+        // 无任何 token
+        assert_eq!(call(&st, "/api/status", false).await.status(), StatusCode::UNAUTHORIZED);
+        // query token 打普通 API → 拒绝
+        assert_eq!(call(&st, "/api/status?token=t123", false).await.status(), StatusCode::UNAUTHORIZED);
+        // 错误 query token 打 SSE → 拒绝
+        assert_eq!(call(&st, "/api/stream?token=wrong", false).await.status(), StatusCode::UNAUTHORIZED);
+        // 正确 query token 打 SSE → 放行且为事件流
+        let r = call(&st, "/api/stream?token=t123", false).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(r
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/event-stream")));
+        // Bearer 打普通 API → 正常（回归）
+        assert_eq!(call(&st, "/api/status", true).await.status(), StatusCode::OK);
+    }
+
+    /// SSE 首帧为 retry 指令、事件帧可推送到订阅者（端到端经完整 router）。
+    #[tokio::test]
+    async fn sse_首帧retry与事件推送() {
+        let st = test_state();
+        let r = call(&st, "/api/stream?token=t123", false).await;
+        let mut body = r.into_body();
+        let f1 = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+            .await
+            .expect("首帧超时")
+            .unwrap()
+            .expect("流提前结束");
+        assert_eq!(f1.data_ref().unwrap(), "retry: 3000\n\n");
+        // 喂入一帧事件，应原样到达订阅端
+        st.sse
+            .send(SseEvent { event: "verdict", data: "{\"rule\":\"r\"}".into() })
+            .expect("发送事件");
+        let f2 = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+            .await
+            .expect("事件帧超时")
+            .unwrap()
+            .expect("流提前结束");
+        assert_eq!(f2.data_ref().unwrap(), "event: verdict\ndata: {\"rule\":\"r\"}\n\n");
+    }
+
     #[test]
     fn 路由可构建() {
-        // 状态依赖较多，此处仅验证静态资源嵌入
-        let page = super::Assets::get("index.html");
+        // 静态资源嵌入回归（M1 原测试保留）
+        let page = Assets::get("index.html");
         assert!(page.is_some(), "index.html 未嵌入");
     }
 }

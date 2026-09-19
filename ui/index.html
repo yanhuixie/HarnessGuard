@@ -188,7 +188,19 @@ async function cfgReload(){ cfgLoad(); }
 
 
 loadStatus(); loadVerdicts();
-setInterval(()=>{ loadStatus(); loadVerdicts(); }, 3000);
+// SSE 实时推送（M4 替换 M1 的 3s 轮询）：verdict/audit 事件驱动刷新，
+// 状态卡片保留 30s 慢刷兜底（uptime 等非事件型指标）
+try {
+  const es = new EventSource('/api/stream?token='+encodeURIComponent(TOKEN));
+  es.onopen = () => { $('conn-dot').style.color = '#5dd97c'; };
+  es.onerror = () => { $('conn-dot').style.color = '#ff5d5d'; };  // EventSource 自动重连
+  es.addEventListener('verdict', () => { loadVerdicts(); loadStatus(); });
+  es.addEventListener('audit', () => {
+    const cur = document.querySelector('nav button.on');
+    if (cur && cur.dataset.p === 'events') loadEvents();
+  });
+} catch (e) { fail(e); setInterval(()=>{ loadStatus(); loadVerdicts(); }, 3000); }
+setInterval(loadStatus, 30000);
 </script>
 </body>
 </html>

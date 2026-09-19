@@ -19,3 +19,11 @@ tracing = { workspace = true }
 rust-embed = { workspace = true }
 anyhow = { workspace = true }
 toml = { workspace = true }
+
+# SSE 流式响应：BroadcastStream/IntervalStream 组合子（纯内存组合器，无 RSS 增量）
+tokio-stream = { version = "0.1", features = ["sync", "time"] }
+
+[dev-dependencies]
+# /api/stream 鉴权矩阵与帧推送的单测（oneshot 直连 router，不起端口）
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

@@ -50,10 +50,12 @@ fn main() -> anyhow::Result<()> {
     let src_stats = Arc::new(SourceStats::default());
     let eng_stats = Arc::new(EngineStats::default());
 
-    // 通道：事件流 mpsc(65536)（技术设计 §9.2）；引擎输出；存储写入
+    // 通道：事件流 mpsc(65536)（技术设计 §9.2）；引擎输出；存储写入；
+    // SSE 多播（容量 1024：UI 消费慢则丢帧 + lagged 提示，不反压执行器）
     let (etw_tx, etw_rx) = tokio::sync::mpsc::channel::<Envelope>(65536);
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<EngineOutput>(4096);
     let (store_tx, store_rx) = std::sync::mpsc::channel::<StoreOp>();
+    let (sse_tx, _) = tokio::sync::broadcast::channel::<hg_web::SseEvent>(1024);
     hg_store::writer::spawn_writer(&db_path, store_rx, cfg.storage.retention_days);
 
     // 平台事件源（Windows ETW）+ 持久化轮询
@@ -89,7 +91,7 @@ fn main() -> anyhow::Result<()> {
     ));
     rt.spawn(engine.clone().run(etw_rx));
 
-    // 执行器：处置/通知/落库（异步路径，技术设计 §1.2）
+    // 执行器：处置/通知/落库/SSE 推送（异步路径，技术设计 §1.2）
     let enforcer = Arc::new(hg_plat_win::WinEnforcer::new());
     let notifier = Arc::new(hg_plat_win::WinNotifier::new());
     {
@@ -97,9 +99,10 @@ fn main() -> anyhow::Result<()> {
         let notifier = notifier.clone();
         let store_tx = store_tx.clone();
         let eng_stats = eng_stats.clone();
+        let sse_tx = sse_tx.clone();
         rt.spawn(async move {
             while let Some(out) = out_rx.recv().await {
-                execute(out, &enforcer, &notifier, &store_tx, &eng_stats);
+                execute(out, &enforcer, &notifier, &store_tx, &eng_stats, &sse_tx);
             }
         });
     }
@@ -118,6 +121,7 @@ fn main() -> anyhow::Result<()> {
         conns: conns.clone(),
         src_stats: src_stats.clone(),
         eng_stats: eng_stats.clone(),
+        sse: sse_tx,
         started: std::time::Instant::now(),
     });
     let app = hg_web::router(state);
@@ -146,9 +150,23 @@ fn execute(
     notifier: &Arc<hg_plat_win::WinNotifier>,
     store: &std::sync::mpsc::Sender<StoreOp>,
     stats: &Arc<EngineStats>,
+    sse: &tokio::sync::broadcast::Sender<hg_web::SseEvent>,
 ) {
     match out {
         EngineOutput::Verdict { ts, pid, exe, verdict } => {
+            // SSE 推送（技术设计 §7：无订阅者时发送即弃；ts 为 UTC 毫秒，与轮询行同构）
+            let _ = sse.send(hg_web::SseEvent {
+                event: "verdict",
+                data: serde_json::json!({
+                    "ts": ts,
+                    "rule_id": verdict.rule_id.0,
+                    "action": verdict.action.as_str(),
+                    "pid": pid,
+                    "exe": exe,
+                    "summary": verdict.evidence.summary,
+                })
+                .to_string(),
+            });
             let _ = store.send(StoreOp::Verdict {
                 ts: ts as i64,
                 rule_id: verdict.rule_id.0.to_string(),
@@ -188,6 +206,17 @@ fn execute(
             notifier.notify(&title, &body);
         }
         EngineOutput::StoreEvent { ts, kind, pid, detail } => {
+            // SSE 推送审计事件（事件流页实时刷新；数据与 /api/events 行同构减 id）
+            let _ = sse.send(hg_web::SseEvent {
+                event: "audit",
+                data: serde_json::json!({
+                    "ts": ts,
+                    "kind": kind,
+                    "pid": pid,
+                    "detail": detail,
+                })
+                .to_string(),
+            });
             let _ = store.send(StoreOp::Event {
                 ts: ts as i64,
                 pid: pid as i64,
