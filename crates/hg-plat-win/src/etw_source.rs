@@ -264,8 +264,11 @@ impl EtwInner {
             g.insert(fo, n.clone());
             self.stats.file_cache_entries.store(g.len() as u64, Relaxed);
             drop(g);
-            // Name 迟到重试：此前 unknown 的同 FileObject 事件现在补发
-            if let Some((pid2, op2)) = self.pending_files.lock().unwrap().remove(&fo) {
+            // Name 迟到重试：此前 unknown 的同 FileObject 事件现在补发。
+            // 先 remove 释放锁再 emit——emit 链含路径解析与通道发送，锁内执行
+            // 放大临界区（M4 待修清单 2）
+            let pending = self.pending_files.lock().unwrap().remove(&fo);
+            if let Some((pid2, op2)) = pending {
                 self.emit_file_event(pid2, op2, n);
             }
         }
@@ -345,12 +348,16 @@ impl EtwInner {
                         }
                     }
                 }
+                // 无 FileObject 的事件永远等不到 Name（Name 事件以 FileObject 关联）
+                // ——不入 pending（原以 key 0 登记吞 16384 配额且永无补发机会，
+                // M4 待修清单 3）
+                let Some(fo) = obj else { return };
                 // Name 未到：挂起等 Name 事件补发（上限 16384，满则整表清空防涨内存）
                 let mut pend = self.pending_files.lock().unwrap();
                 if pend.len() >= 16384 {
                     pend.clear();
                 }
-                pend.insert(obj.unwrap_or(0), (pid, op));
+                pend.insert(fo, (pid, op));
             }
         }
     }
