@@ -25,18 +25,20 @@ pub(crate) fn net_port(p: u16) -> u32 {
     (((p & 0xff) as u32) << 8) | ((p >> 8) as u32)
 }
 
-/// TCP 四元组 → `MIB_TCPROW_LH`（IPv4 断连接行）。纯函数无 IO，供单测覆盖
+/// TCP 四元组 → `MIB_TCPROW_LH`（IPv4）。纯函数无 IO，供单测覆盖
 /// 端口字节序与字段完整性。地址按网络序内存布局（小端机器上 u32 值为八位组反转）。
+/// `state` 由调用方给定（处置=DELETE_TCB，estats 轮询=ESTAB——单一字节序实现）。
 pub(crate) fn build_tcp_row_v4(
     quad: &TcpQuad,
+    state: u32,
 ) -> anyhow::Result<windows::Win32::NetworkManagement::IpHelper::MIB_TCPROW_LH> {
     use windows::Win32::NetworkManagement::IpHelper::{MIB_TCPROW_LH, MIB_TCPROW_LH_0};
     let (l, r) = match (quad.local.ip(), quad.remote.ip()) {
-        (std::net::IpAddr::V4(l), std::net::IpAddr::V4(r)) => (l, r),
+        (IpAddr::V4(l), IpAddr::V4(r)) => (l, r),
         _ => anyhow::bail!("v4 行构造收到非 IPv4 四元组：{} -> {}", quad.local, quad.remote),
     };
     Ok(MIB_TCPROW_LH {
-        Anonymous: MIB_TCPROW_LH_0 { dwState: MIB_TCP_STATE_DELETE_TCB },
+        Anonymous: MIB_TCPROW_LH_0 { dwState: state },
         dwLocalAddr: u32::from(l).swap_bytes(),
         dwLocalPort: net_port(quad.local.port()),
         dwRemoteAddr: u32::from(r).swap_bytes(),
@@ -44,20 +46,22 @@ pub(crate) fn build_tcp_row_v4(
     })
 }
 
-/// TCP 四元组 → `MIB_TCP6ROW`（IPv6 断连接行）。纯函数无 IO，供单测覆盖。
+/// TCP 四元组 → `MIB_TCP6ROW`（IPv6）。纯函数无 IO，供单测覆盖。
 /// scope id 恒 0：std `SocketAddr` 不携带 zone id，链路本地（fe80::/10）会因
 /// scope 不匹配而失败——受控限制，外联监控目标为全局单播，不受影响。
+/// `state` 由调用方给定（v6 处置通道当前不可用，见文件头；estats 轮询=ESTAB）。
 pub(crate) fn build_tcp_row_v6(
     quad: &TcpQuad,
+    state: windows::Win32::NetworkManagement::IpHelper::MIB_TCP_STATE,
 ) -> anyhow::Result<windows::Win32::NetworkManagement::IpHelper::MIB_TCP6ROW> {
-    use windows::Win32::NetworkManagement::IpHelper::{MIB_TCP6ROW, MIB_TCP_STATE_DELETE_TCB as ST_DELETE};
+    use windows::Win32::NetworkManagement::IpHelper::MIB_TCP6ROW;
     use windows::Win32::Networking::WinSock::{IN6_ADDR, IN6_ADDR_0};
     let (l, r) = match (quad.local.ip(), quad.remote.ip()) {
         (IpAddr::V6(l), IpAddr::V6(r)) => (l, r),
         _ => anyhow::bail!("v6 行构造收到非 IPv6 四元组：{} -> {}", quad.local, quad.remote),
     };
     Ok(MIB_TCP6ROW {
-        State: ST_DELETE,
+        State: state,
         LocalAddr: IN6_ADDR { u: IN6_ADDR_0 { Byte: l.octets() } },
         dwLocalScopeId: 0,
         dwLocalPort: net_port(quad.local.port()),
@@ -117,13 +121,16 @@ impl Enforcer for WinEnforcer {
         // 报错（87=参数/连接已不存在，与 M1 行为一致）
         let rc = match (quad.local.ip(), quad.remote.ip()) {
             (IpAddr::V4(_), IpAddr::V4(_)) => {
-                let row = build_tcp_row_v4(&quad)?;
+                let row = build_tcp_row_v4(&quad, MIB_TCP_STATE_DELETE_TCB)?;
                 unsafe { SetTcpEntry(&row) }
             }
             (IpAddr::V6(_), IpAddr::V6(_)) => {
                 // 行构造先行：校验 v6 四元组形状并保持与单测同构；随后显式报错
                 // ——见文件头「文档幻影」说明（设计拍板记录第 9 条）
-                let _row = build_tcp_row_v6(&quad)?;
+                let _row = build_tcp_row_v6(
+                    &quad,
+                    windows::Win32::NetworkManagement::IpHelper::MIB_TCP_STATE_DELETE_TCB,
+                )?;
                 anyhow::bail!(
                     "IPv6 连接级断开无用户态 API：SetTcp6Entry 为文档幻影（头文件/导入库/DLL 导出均无，M4 实测）；本连接已由 Kill/封 IP 路径兜底"
                 )
@@ -187,15 +194,22 @@ mod tests {
     /// 高 16 位必须为 0（历史 bug：swap_bytes(u32) 把端口放进高 16 位）。
     #[test]
     fn v4_行构造_端口网络序且低位存放() {
-        let row =
-            build_tcp_row_v4(&quad_v4([192, 168, 1, 10], 8080, [1, 2, 3, 4], 443)).unwrap();
+        let row = build_tcp_row_v4(
+            &quad_v4([192, 168, 1, 10], 8080, [1, 2, 3, 4], 443),
+            MIB_TCP_STATE_DELETE_TCB,
+        )
+        .unwrap();
         assert_eq!(row.dwLocalPort, 0x0000_901F, "本地端口 8080 应编码为低 16 位 0x901F");
         assert_eq!(row.dwRemotePort, 0x0000_BB01, "远端端口 443(0x01BB) 应编码为 0xBB01");
     }
 
     #[test]
     fn v4_行构造_端口边界值() {
-        let zero = build_tcp_row_v4(&quad_v4([10, 0, 0, 1], 0, [10, 0, 0, 2], 65535)).unwrap();
+        let zero = build_tcp_row_v4(
+            &quad_v4([10, 0, 0, 1], 0, [10, 0, 0, 2], 65535),
+            MIB_TCP_STATE_DELETE_TCB,
+        )
+        .unwrap();
         assert_eq!(zero.dwLocalPort, 0);
         assert_eq!(zero.dwRemotePort, 0xFFFF);
     }
@@ -204,8 +218,11 @@ mod tests {
     /// 防本地/远端串位与状态遗漏。
     #[test]
     fn v4_行构造_地址网络序与字段完整性() {
-        let row =
-            build_tcp_row_v4(&quad_v4([192, 168, 1, 10], 8080, [1, 2, 3, 4], 443)).unwrap();
+        let row = build_tcp_row_v4(
+            &quad_v4([192, 168, 1, 10], 8080, [1, 2, 3, 4], 443),
+            MIB_TCP_STATE_DELETE_TCB,
+        )
+        .unwrap();
         assert_eq!(row.dwLocalAddr.to_le_bytes(), [192, 168, 1, 10]);
         assert_eq!(row.dwRemoteAddr.to_le_bytes(), [1, 2, 3, 4]);
         assert_eq!(unsafe { row.Anonymous.dwState }, MIB_TCP_STATE_DELETE_TCB);
@@ -217,7 +234,7 @@ mod tests {
             local: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
             remote: SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 1),
         };
-        assert!(build_tcp_row_v4(&mixed).is_err());
+        assert!(build_tcp_row_v4(&mixed, MIB_TCP_STATE_DELETE_TCB).is_err());
     }
 
     fn quad_v6(l: std::net::Ipv6Addr, lp: u16, r: std::net::Ipv6Addr, rp: u16) -> TcpQuad {
@@ -233,7 +250,11 @@ mod tests {
     fn v6_行构造_地址八位组与端口网络序() {
         let l = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
         let r = std::net::Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
-        let row = build_tcp_row_v6(&quad_v6(l, 49152, r, 853)).unwrap();
+        let row = build_tcp_row_v6(
+            &quad_v6(l, 49152, r, 853),
+            windows::Win32::NetworkManagement::IpHelper::MIB_TCP_STATE_DELETE_TCB,
+        )
+        .unwrap();
         assert_eq!(unsafe { row.LocalAddr.u.Byte }, l.octets());
         assert_eq!(unsafe { row.RemoteAddr.u.Byte }, r.octets());
         assert_eq!(row.dwLocalPort, 0x0000_00C0, "49152(0xC000) → 低 16 位 0x00C0");
@@ -242,12 +263,15 @@ mod tests {
 
     #[test]
     fn v6_行构造_字段完整性() {
-        let row = build_tcp_row_v6(&quad_v6(
-            std::net::Ipv6Addr::LOCALHOST,
-            1,
-            std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2),
-            2,
-        ))
+        let row = build_tcp_row_v6(
+            &quad_v6(
+                std::net::Ipv6Addr::LOCALHOST,
+                1,
+                std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2),
+                2,
+            ),
+            windows::Win32::NetworkManagement::IpHelper::MIB_TCP_STATE_DELETE_TCB,
+        )
         .unwrap();
         assert_eq!(row.State.0, 12, "状态须为 MIB_TCP_STATE_DELETE_TCB");
         assert_eq!(row.dwLocalScopeId, 0);
@@ -256,7 +280,13 @@ mod tests {
 
     #[test]
     fn v6_行构造_非v6四元组应报错() {
-        assert!(build_tcp_row_v6(&quad_v4([1, 2, 3, 4], 1, [5, 6, 7, 8], 2)).is_err());
+        assert!(
+            build_tcp_row_v6(
+                &quad_v4([1, 2, 3, 4], 1, [5, 6, 7, 8], 2),
+                windows::Win32::NetworkManagement::IpHelper::MIB_TCP_STATE_DELETE_TCB,
+            )
+            .is_err()
+        );
     }
 
     /// kill 对已退出 pid 的错误路径：OpenProcess 对无存活引用的已退出 pid 失败，

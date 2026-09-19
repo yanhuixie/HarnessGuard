@@ -67,7 +67,10 @@ fn main() -> anyhow::Result<()> {
         .spawn(move || hg_platform::EventSource::run(source, tx_src))
         .expect("spawn ETW");
     std::thread::sleep(Duration::from_millis(800)); // 等 ETW 线程注入 tx 后再起轮询
-    hg_plat_win::runkey::spawn_runkey_poll(inner);
+    hg_plat_win::runkey::spawn_runkey_poll(inner.clone());
+    // 场景 C 字节计数替代路径（M1 缺口：内核 send 事件采样态，阈值不可达）：
+    // estats 轮询按 monitored_quads 差分 DataBytesOut 补喂 ConnTx
+    hg_plat_win::estats::spawn_estats_poll(inner);
 
     // 启动补扫描（技术设计 §3.2）
     let entries: Vec<_> = hg_plat_win::bootstrap::snapshot_processes()

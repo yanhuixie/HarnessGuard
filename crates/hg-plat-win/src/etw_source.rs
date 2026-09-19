@@ -81,6 +81,9 @@ pub struct EtwInner {
     /// 已发 ConnOpen 的连接（send/connect 任一先到都确保登记——实测 connect 事件
     /// 在部分路径缺失，send 带有效 pid 时补登记，防孤儿 send）
     emitted_conns: dashmap::DashSet<u64>,
+    /// 已发 ConnOpen 的四元组（conn_id → (local, remote)）：estats 轮询线程按此
+    /// 补计字节（场景 C 替代路径）；disconnect 时移除（同四元组复用可重登记）
+    pub(crate) monitored_quads: dashmap::DashMap<u64, (SocketAddr, SocketAddr)>,
 }
 
 impl EtwInner {
@@ -97,6 +100,7 @@ impl EtwInner {
             probe_last: Mutex::new(Instant::now() - probe::PROBE_MIN_INTERVAL),
             tcp_owner: Mutex::new((std::time::Instant::now() - std::time::Duration::from_secs(10), HashMap::new())),
             emitted_conns: dashmap::DashSet::new(),
+            monitored_quads: dashmap::DashMap::new(),
         })
     }
 
@@ -369,6 +373,7 @@ impl EtwInner {
                     }
                 }
                 self.emitted_conns.insert(conn_id.0);
+                self.monitored_quads.insert(conn_id.0, (local, remote));
                 self.emit(RawEvent::ConnOpen {
                     pid,
                     start_time: StartTime(0),
@@ -384,6 +389,7 @@ impl EtwInner {
                 if pid != u32::MAX && self.emitted_conns_guard() && self.emitted_conns.insert(conn_id.0) {
                     if self.procs.get(&pid).is_some_and(|id| id.harness_root.is_some()) {
                         let st = self.procs.get(&pid).map(|i| i.start_time).unwrap_or(StartTime(0));
+                        self.monitored_quads.insert(conn_id.0, (local, remote));
                         self.emit(RawEvent::ConnOpen {
                             pid,
                             start_time: st,
@@ -397,6 +403,9 @@ impl EtwInner {
                 self.emit(RawEvent::ConnTx { conn_id, bytes_out_delta: size });
             }
             NET_OP_DISCONNECT => {
+                // 移除登记（同四元组复用可重登记；estats 轮询侧幂等兜底）
+                self.emitted_conns.remove(&conn_id.0);
+                self.monitored_quads.remove(&conn_id.0);
                 self.emit(RawEvent::ConnClose { conn_id });
             }
             _ => {}
@@ -406,6 +415,7 @@ impl EtwInner {
     fn emitted_conns_guard(&self) -> bool {
         if self.emitted_conns.len() > 262_144 {
             self.emitted_conns.clear();
+            self.monitored_quads.clear();
         }
         true
     }

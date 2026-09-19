@@ -10,9 +10,11 @@
 //! - [`peb`]：PEB 命令行读取（内核 ETW 无命令行的降级链）
 //! - [`lru`]：FileObject 缓存的 O(1) LRU 封顶（M4 场景 A 缓解）
 //! - [`probe`]：unknown Create 事件的同对象句柄探测补名（M4 场景 A 缓解）
+//! - [`estats`]：GetPerTcpConnectionEStats 轮询补连接字节计数（M4 场景 C 替代路径）
 
 pub mod bootstrap;
 pub mod enforcer;
+pub mod estats;
 pub mod etw_source;
 pub mod lru;
 pub mod ntpath;
