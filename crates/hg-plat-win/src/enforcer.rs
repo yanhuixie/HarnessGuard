@@ -6,9 +6,8 @@
 //!   （socket 随进程关闭）+ 封 IP（netsh/WFP 均支持 v6）兜底；MIB_TCP6ROW
 //!   行构造保留（单测覆盖布局，供平台补齐或 NSI 未公开接口评估时复用）。
 //!   已登记技术设计「设计拍板记录」第 9 条。
-//! - 封 IP：`netsh advfirewall` 临时出站规则 + TTL 到期移除。
-//!   设计原文为用户态 WFP（FwpmFilterAdd0）；M1 以 netsh 过渡（同一防火墙栈，
-//!   免 BFE 子层装配），M4 换 FwpmFilterAdd——偏差已显式登记于 M1 报告。
+//! - 封 IP：WFP 动态会话过滤器（`FwpmFilterAdd0`，技术设计 §5.1 原文，M4 归位；
+//!   见 [`crate::wfp`]）+ TTL 到期解封；BFE 不可用时回落 netsh 临时规则。
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -150,31 +149,41 @@ impl Enforcer for WinEnforcer {
             tracing::warn!("block_ip 跳过回环地址 {ip}");
             return Ok(());
         }
-        let rule = format!("HarnessGuard-block-{}", ip.to_string().replace(':', "-"));
+        // WFP 动态会话主路径（技术设计 §5.1 原文；M4 归位）；BFE 不可用时回落
+        // netsh 临时规则（M1 行为）——处置不留空档
         std::thread::spawn(move || {
-            let add = std::process::Command::new("netsh")
-                .args([
-                    "advfirewall", "firewall", "add", "rule",
-                    &format!("name={rule}"),
-                    "dir=out", "action=block",
-                    &format!("remoteip={ip}"),
-                ])
-                .output();
-            match add {
-                Ok(o) if o.status.success() => {}
-                e => tracing::error!("netsh 添加封禁规则失败: {e:?}"),
-            }
-            std::thread::sleep(ttl);
-            let del = std::process::Command::new("netsh")
-                .args(["advfirewall", "firewall", "delete", "rule", &format!("name={rule}")])
-                .output();
-            if let Ok(o) = &del {
-                if !o.status.success() {
-                    tracing::error!("netsh 移除封禁规则失败: {}", String::from_utf8_lossy(&o.stderr));
-                }
+            if let Err(e) = crate::wfp::block_endpoint_wfp(ip, ttl) {
+                tracing::warn!("[wfp] 封禁失败回落 netsh：{e:#}");
+                netsh_block(ip, ttl);
             }
         });
         Ok(())
+    }
+}
+
+/// netsh 临时规则兜底（M1 主路径，现仅作 WFP 失败时的降级）。
+fn netsh_block(ip: IpAddr, ttl: Duration) {
+    let rule = format!("HarnessGuard-block-{}", ip.to_string().replace(':', "-"));
+    let add = std::process::Command::new("netsh")
+        .args([
+            "advfirewall", "firewall", "add", "rule",
+            &format!("name={rule}"),
+            "dir=out", "action=block",
+            &format!("remoteip={ip}"),
+        ])
+        .output();
+    match add {
+        Ok(o) if o.status.success() => {}
+        e => tracing::error!("netsh 添加封禁规则失败: {e:?}"),
+    }
+    std::thread::sleep(ttl);
+    let del = std::process::Command::new("netsh")
+        .args(["advfirewall", "firewall", "delete", "rule", &format!("name={rule}")])
+        .output();
+    if let Ok(o) = &del {
+        if !o.status.success() {
+            tracing::error!("netsh 移除封禁规则失败: {}", String::from_utf8_lossy(&o.stderr));
+        }
     }
 }
 

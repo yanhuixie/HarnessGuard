@@ -61,6 +61,9 @@ windows = { version = "0.61", features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Wdk_System_Threading",
     "Win32_System_Kernel",
+    # M4 P2.6：WFP FwpmFilterAdd0 封禁（System_Rpc 为 FwpmEngineOpen0 签名依赖）
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_System_Rpc",
 ] }
 
 # 平台专属依赖声明（cargo 不允许 virtual workspace 里放 [target] 段——
