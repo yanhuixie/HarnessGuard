@@ -25,8 +25,10 @@ use hg_model::{
 };
 use tokio::sync::mpsc;
 
+use crate::lru;
 use crate::ntpath::nt_to_win32;
 use crate::peb;
+use crate::probe;
 
 /// 事件源健康统计（定义于 hg-core::health，供 Web 状态页共享；技术设计 §9.1/§9.2）。
 pub use hg_core::health::SourceStats;
@@ -39,8 +41,12 @@ const FILE_OP_WRITE: u8 = 68;
 const NET_OP_CONNECT: u8 = 16;
 const NET_OP_SEND: u8 = 10;
 const NET_OP_DISCONNECT: u8 = 18;
-/// FileObject 缓存上限；超限整表清空重建（廉价批量逐出，M1 简化；LRU 为超支预案）
+/// FileObject 缓存容量（LRU 封顶，M1 为超限整表清空——burst 会误清热点；
+/// §10 预算表超支预案原文"FileObject 缓存加 LRU 上限"）
 const FILEOBJ_CAP: usize = 200_000;
+/// 探测失败表容量（FileObject → 已失败不重试；burst 中 Create→Close 极快，
+/// 句柄已关为主要 miss 原因，重试无意义）
+const PROBE_FAIL_CAP: usize = 4096;
 
 struct PidCtx {
     ppid: Pid,
@@ -61,9 +67,14 @@ pub struct EtwInner {
     tx: OnceLock<mpsc::Sender<Envelope>>,
     base: Instant,
     pid_ctx: DashMap<Pid, PidCtx>,
-    fileobj: Mutex<HashMap<u64, String>>,
+    /// FileObject → 文件名（LRU 封顶：M1 整表清空在 burst 下会误清热点条目）
+    fileobj: Mutex<lru::LruCache>,
     /// Name 事件迟到时的挂起重试表：obj → (pid, opcode)。Name 到达即补发（上限控制内存）。
     pending_files: Mutex<HashMap<u64, (Pid, u8)>>,
+    /// unknown Create 探测失败表（同对象不重试；LRU 封顶防涨）
+    probe_failed: Mutex<lru::LruCache>,
+    /// 探测限流：上次探测时刻（全系统句柄快照数 ms 级，burst 必须降频）
+    probe_last: Mutex<Instant>,
     /// TCP owner 表（GetExtendedTcpTable）：四元组 → 归属 pid。
     /// 实测教训：本机 TCP-IP 经典事件 PID 字段恒为 -1，归因只能走 owner 表。
     tcp_owner: Mutex<(std::time::Instant, HashMap<(std::net::SocketAddr, std::net::SocketAddr), Pid>)>,
@@ -80,8 +91,10 @@ impl EtwInner {
             tx: OnceLock::new(),
             base: Instant::now(),
             pid_ctx: DashMap::new(),
-            fileobj: Mutex::new(HashMap::new()),
+            fileobj: Mutex::new(lru::LruCache::new(FILEOBJ_CAP)),
             pending_files: Mutex::new(HashMap::new()),
+            probe_failed: Mutex::new(lru::LruCache::new(PROBE_FAIL_CAP)),
+            probe_last: Mutex::new(Instant::now() - probe::PROBE_MIN_INTERVAL),
             tcp_owner: Mutex::new((std::time::Instant::now() - std::time::Duration::from_secs(10), HashMap::new())),
             emitted_conns: dashmap::DashSet::new(),
         })
@@ -223,9 +236,6 @@ impl EtwInner {
             .map(|ptr| *ptr as u64);
         if let (Some(n), Some(fo)) = (&name, obj) {
             let mut g = self.fileobj.lock().unwrap();
-            if g.len() >= FILEOBJ_CAP {
-                g.clear();
-            }
             g.insert(fo, n.clone());
             self.stats.file_cache_entries.store(g.len() as u64, Relaxed);
             drop(g);
@@ -254,7 +264,10 @@ impl EtwInner {
                 self.stats.file_resolved.fetch_add(1, Relaxed);
                 Some(n)
             }
-            None => match obj.and_then(|fo| self.fileobj.lock().unwrap().get(&fo).cloned()) {
+            None => match obj.and_then(|fo| {
+                    let mut g = self.fileobj.lock().unwrap();
+                    g.get(fo).map(|s| s.to_string())
+                }) {
                 Some(n) => {
                     self.stats.file_resolved.fetch_add(1, Relaxed);
                     Some(n)
@@ -269,6 +282,38 @@ impl EtwInner {
         match path {
             Some(path) => self.emit_file_event(pid, op, &path),
             None => {
+                // 场景 A 缓解（M1 缺口 1）：unknown 的 Create 事件做同对象句柄探测
+                // 补名（限流 + 失败不重试，见 probe 模块头注释）；成功则回填缓存
+                // 并补发事件，后续同 FileObject 的 Read/Write 直接走缓存命中
+                if let Some(fo) = obj {
+                    let allowed = {
+                        let failed = self.probe_failed.lock().unwrap().contains(fo);
+                        let mut last = self.probe_last.lock().unwrap();
+                        let elapsed_ok = last.elapsed() >= probe::PROBE_MIN_INTERVAL;
+                        if elapsed_ok {
+                            *last = Instant::now();
+                        }
+                        drop(last);
+                        probe::probe_allowed(op == FILE_OP_CREATE, failed, elapsed_ok)
+                    };
+                    if allowed {
+                        self.stats.file_probe_tried.fetch_add(1, Relaxed);
+                        match probe::probe_file_name(pid, fo) {
+                            Some(name) => {
+                                self.stats.file_probe_hit.fetch_add(1, Relaxed);
+                                let mut g = self.fileobj.lock().unwrap();
+                                g.insert(fo, name.clone());
+                                self.stats.file_cache_entries.store(g.len() as u64, Relaxed);
+                                drop(g);
+                                self.emit_file_event(pid, op, &name);
+                                return;
+                            }
+                            None => {
+                                self.probe_failed.lock().unwrap().insert(fo, String::new());
+                            }
+                        }
+                    }
+                }
                 // Name 未到：挂起等 Name 事件补发（上限 16384，满则整表清空防涨内存）
                 let mut pend = self.pending_files.lock().unwrap();
                 if pend.len() >= 16384 {

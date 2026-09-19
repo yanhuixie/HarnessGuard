@@ -13,6 +13,9 @@ pub struct SourceStats {
     pub file_resolved: AtomicU64,
     pub file_unknown: AtomicU64,
     pub file_cache_entries: AtomicU64,
+    /// unknown Create 句柄探测（M4 场景 A 缓解）：尝试 / 命中
+    pub file_probe_tried: AtomicU64,
+    pub file_probe_hit: AtomicU64,
 }
 
 /// 引擎判定统计。

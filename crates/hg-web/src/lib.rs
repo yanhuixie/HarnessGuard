@@ -147,6 +147,8 @@ async fn status(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
             "file_resolved": s.file_resolved.load(Relaxed),
             "file_unknown": s.file_unknown.load(Relaxed),
             "file_cache_entries": s.file_cache_entries.load(Relaxed),
+            "file_probe_tried": s.file_probe_tried.load(Relaxed),
+            "file_probe_hit": s.file_probe_hit.load(Relaxed),
         },
         "engine": {
             "events_processed": e.events_processed.load(Relaxed),
