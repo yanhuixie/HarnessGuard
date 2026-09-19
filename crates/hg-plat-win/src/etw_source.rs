@@ -6,7 +6,7 @@
 //! - DNS：Dns-Client 按 GUID 挂独立 UserTrace（by_name 本机 NotFound，M0 轮 1）。
 //! manifest 版 Kernel-Process 在本机不出事件（M0 轮 2–4），弃用。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering::Relaxed;
@@ -47,6 +47,20 @@ const FILEOBJ_CAP: usize = 200_000;
 /// 探测失败表容量（FileObject → 已失败不重试；burst 中 Create→Close 极快，
 /// 句柄已关为主要 miss 原因，重试无意义）
 const PROBE_FAIL_CAP: usize = 4096;
+/// 计划任务注册工具 cmdline 特征（小写包含匹配；schtasks / PowerShell
+/// Register-ScheduledTask / COM RegisterTask 定义）
+const SCHED_MARKERS: [&str; 3] = ["schtasks", "register-scheduledtask", "registertask"];
+/// 注册候选缓存容量（Exec 时快照；106 事件常晚于发起 cmd 退出——归因竞态修复）
+const SCHED_CAND_CAP: usize = 64;
+/// 注册候选有效期（106 相对 cmd 退出的延迟为数十 ms～数 s，窗口取宽防误归因旧进程）
+const SCHED_CAND_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Exec 时缓存的计划任务注册候选（cmdline 含 [`SCHED_MARKERS`] 特征）。
+struct SchedCandidate {
+    pid: Pid,
+    cmdline: String,
+    at: Instant,
+}
 
 struct PidCtx {
     ppid: Pid,
@@ -84,6 +98,9 @@ pub struct EtwInner {
     /// 已发 ConnOpen 的四元组（conn_id → (local, remote)）：estats 轮询线程按此
     /// 补计字节（场景 C 替代路径）；disconnect 时移除（同四元组复用可重登记）
     pub(crate) monitored_quads: dashmap::DashMap<u64, (SocketAddr, SocketAddr)>,
+    /// 计划任务注册候选（Exec 时快照）：106 事件到达时发起 cmd 常已退出，
+    /// 实时进程扫描必 miss——按此缓存归因（容量/时效封顶，见 prune 函数）
+    sched_candidates: Mutex<VecDeque<SchedCandidate>>,
 }
 
 impl EtwInner {
@@ -101,6 +118,7 @@ impl EtwInner {
             tcp_owner: Mutex::new((std::time::Instant::now() - std::time::Duration::from_secs(10), HashMap::new())),
             emitted_conns: dashmap::DashSet::new(),
             monitored_quads: dashmap::DashMap::new(),
+            sched_candidates: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -185,6 +203,9 @@ impl EtwInner {
         let cwd = ctx.cwd.clone();
         drop(ctx);
         let (cmdline, _, _) = peb::query_process(pid);
+        // 归因竞态修复：计划任务注册工具进程在 Exec 时快照 cmdline 候选
+        //（106 事件到达时常已退出，届时实时扫描已无对象）
+        self.remember_task_registrar(pid, &cmdline);
         if let Some(mut ctx) = self.pid_ctx.get_mut(&pid) {
             ctx.exec_sent = true;
         }
@@ -530,10 +551,13 @@ impl EtwInner {
     }
 
     /// TaskScheduler 持久化检测（技术设计 §5.1 原文；M1 偏差表归位：原仅 RunKey
-    /// 轮询、无计划任务覆盖）。106=任务注册，141/140=任务更新——均属持久化面。
-    /// pid 归因链（事件自身一般不携带）：① 事件 ProcessId 字段（部分版本）→
-    /// ② 监控树内 cmdline 含注册工具特征的进程（schtasks/Register-ScheduledTask/
-    /// RegisterTask）→ ③ 0（未归因，引擎侧仍出 Audit 判定，证据含 detail）。
+    /// 轮询、无计划任务覆盖）。事件语义：106=任务注册，140=任务更新，141=任务删除
+    /// ——均属持久化面（141 单列"删除"语义，防误导调查；M4 待修清单 4）。
+    /// pid 归因链（事件自身一般不携带）：
+    /// ① 事件 ProcessId 字段（属监控树才采用）→ ② 实时扫描树内 cmdline 含注册
+    /// 工具特征的进程 → ③ Exec 时缓存的候选（发起 cmd 常先于 106 退出，②必 miss
+    /// ——复验竞态修复，detail 附 cmdline 供人工核对）→ ④ 0（未归因，引擎侧仍出
+    /// Audit 判定，证据含 detail）。
     fn on_sched(&self, record: &EventRecord, loc: &SchemaLocator) {
         if !matches!(record.event_id(), 106 | 140 | 141) {
             return;
@@ -545,20 +569,21 @@ impl EtwInner {
         let user: String = p.try_parse::<String>("UserContext").unwrap_or_default();
         let kind = match record.event_id() {
             106 => "注册",
-            _ => "更新",
+            140 => "更新",
+            _ => "删除",
         };
-        let pid = Self::parse_u32(&p, &["ProcessId", "ProcessID", "Pid"])
-            .filter(|v| *v != 0)
-            .map(|v| {
-                // 事件携带 pid：仅当属监控树才直接归因（否则保留 0 走扫描链）
-                if self.procs.get(&v).is_some() {
-                    v
-                } else {
-                    0
-                }
-            })
-            .unwrap_or_else(|| self.scan_task_registrar());
-        let how = if pid != 0 { "已归因" } else { "未归因（无匹配注册进程）" };
+        let event_pid = Self::parse_u32(&p, &["ProcessId", "ProcessID", "Pid"])
+            .filter(|v| *v != 0 && self.procs.get(v).is_some());
+        let (pid, how) = if let Some(v) = event_pid {
+            (v, "已归因".to_string())
+        } else if let Some(v) = self.scan_task_registrar() {
+            (v, "已归因（实时扫描）".to_string())
+        } else if let Some((v, cmdline)) = self.cached_task_registrar() {
+            let brief: String = cmdline.chars().take(80).collect();
+            (v, format!("缓存归因（进程已退出）：{brief}"))
+        } else {
+            (0, "未归因（无匹配注册进程）".to_string())
+        };
         tracing::warn!("[持久化] 计划任务{kind}：{task}（user={user}，pid={pid}，{how}）");
         self.emit(RawEvent::Persistence {
             pid,
@@ -567,23 +592,59 @@ impl EtwInner {
         });
     }
 
-    /// 归因扫描：监控树内 cmdline 含计划任务注册工具特征的进程（最近一个）。
+    /// 实时归因扫描：监控树内 cmdline 含注册工具特征的进程（最近一个）。
     /// 无时间戳可依（Identity 不含 exec 时刻），属启发式归因——确定性不足时
-    /// 返回 0，宁可缺归因不误归因。
-    fn scan_task_registrar(&self) -> Pid {
-        const MARKERS: [&str; 3] = ["schtasks", "register-scheduledtask", "registertask"];
-        let mut found = 0;
+    /// 返回 None，宁可缺归因不误归因。
+    fn scan_task_registrar(&self) -> Option<Pid> {
+        let mut found = None;
         for id in self.procs.snapshot() {
             if id.harness_root.is_none() {
                 continue;
             }
-            let cmdline = id.cmdline.iter().map(|a| a.to_string_lossy().to_lowercase()).collect::<Vec<_>>().join(" ");
-            if MARKERS.iter().any(|m| cmdline.contains(m)) {
-                found = id.pid;
+            if is_task_registrar_cmdline(&id.cmdline) {
+                found = Some(id.pid);
             }
         }
         found
     }
+
+    /// Exec 时缓存含注册工具特征的候选（同 pid 覆盖；容量/时效封顶防涨）。
+    fn remember_task_registrar(&self, pid: Pid, cmdline: &[std::ffi::OsString]) {
+        if !is_task_registrar_cmdline(cmdline) {
+            return;
+        }
+        let joined = cmdline.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" ");
+        let mut g = self.sched_candidates.lock().unwrap();
+        prune_sched_candidates(&mut g, Instant::now());
+        g.retain(|c| c.pid != pid);
+        g.push_back(SchedCandidate { pid, cmdline: joined, at: Instant::now() });
+    }
+
+    /// 取最新候选（供 106 事件归因兜底）；顺带做时效清理。
+    fn cached_task_registrar(&self) -> Option<(Pid, String)> {
+        let mut g = self.sched_candidates.lock().unwrap();
+        prune_sched_candidates(&mut g, Instant::now());
+        g.back().map(|c| (c.pid, c.cmdline.clone()))
+    }
+}
+
+/// 候选表维护：清过期条目 + 容量封顶（预留下一个插入位，纯函数单测覆盖）。
+fn prune_sched_candidates(g: &mut VecDeque<SchedCandidate>, now: Instant) {
+    // duration_since 饱和（时钟回拨时按 0 计），不会 panic
+    g.retain(|c| now.duration_since(c.at) < SCHED_CAND_MAX_AGE);
+    while g.len() >= SCHED_CAND_CAP {
+        g.pop_front();
+    }
+}
+
+/// cmdline 是否含计划任务注册工具特征（小写匹配 [`SCHED_MARKERS`]；纯函数，单测覆盖）。
+fn is_task_registrar_cmdline(cmdline: &[std::ffi::OsString]) -> bool {
+    let joined = cmdline
+        .iter()
+        .map(|a| a.to_string_lossy().to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    SCHED_MARKERS.iter().any(|m| joined.contains(m))
 }
 
 /// QueryResults 形如 `type: 5 name; type: 1 1.2.3.4;`——提取其中的 IP。
@@ -726,5 +787,72 @@ impl hg_platform::EventSource for EtwSource {
         loop {
             std::thread::park();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn args(v: &[&str]) -> Vec<OsString> {
+        v.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn 注册工具特征匹配矩阵() {
+        assert!(is_task_registrar_cmdline(&args(&["cmd", "/c", "SCHTASKS", "/create", "/tn", "X"])), "大小写不敏感");
+        assert!(is_task_registrar_cmdline(&args(&["powershell", "-Command", "Register-ScheduledTask", "-Name", "X"])));
+        assert!(is_task_registrar_cmdline(&args(&["powershell", "-ComObj", "RegisterTask('x')"])), "COM RegisterTask 变体");
+        assert!(!is_task_registrar_cmdline(&args(&["cmd", "/c", "type", "secret.txt"])));
+        assert!(!is_task_registrar_cmdline(&args(&["git", "status"])));
+        assert!(!is_task_registrar_cmdline(&[]), "空 cmdline 不匹配");
+    }
+
+    fn cand(pid: u32, cmdline: &str, at: Instant) -> SchedCandidate {
+        SchedCandidate { pid, cmdline: cmdline.into(), at }
+    }
+
+    #[test]
+    fn 候选表_容量封顶逐出最旧() {
+        let mut g: VecDeque<SchedCandidate> = VecDeque::new();
+        let now = Instant::now();
+        for i in 0..(SCHED_CAND_CAP + 3) as u32 {
+            g.push_back(cand(i, "schtasks /create", now));
+        }
+        prune_sched_candidates(&mut g, now);
+        assert!(g.len() < SCHED_CAND_CAP, "预留下一个插入位");
+        g.push_back(cand(9_999, "schtasks", now));
+        assert!(g.len() <= SCHED_CAND_CAP, "插入后不超容量");
+        assert!(g.iter().all(|c| c.pid != 0), "最旧的（pid=0 起）已被逐出");
+    }
+
+    #[test]
+    fn 候选表_过期清理保留新鲜() {
+        let mut g: VecDeque<SchedCandidate> = VecDeque::new();
+        let now = Instant::now();
+        g.push_back(cand(1, "schtasks", now - SCHED_CAND_MAX_AGE - std::time::Duration::from_secs(1)));
+        g.push_back(cand(2, "schtasks", now));
+        prune_sched_candidates(&mut g, now);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g.front().unwrap().pid, 2, "过期候选被清理");
+    }
+
+    #[test]
+    fn 候选缓存_同pid覆盖_非注册工具不入缓存() {
+        let inner = EtwInner::new(Arc::new(ProcTable::new()), Arc::new(SourceStats::default()));
+        inner.remember_task_registrar(100, &args(&["schtasks", "/create", "/tn", "A"]));
+        inner.remember_task_registrar(101, &args(&["powershell", "-Command", "Register-ScheduledTask"]));
+        let (pid, _) = inner.cached_task_registrar().expect("应有候选");
+        assert_eq!(pid, 101, "取最新候选");
+        // 同 pid 重新 Exec：覆盖旧候选而非并存
+        inner.remember_task_registrar(100, &args(&["schtasks", "/delete", "/tn", "B"]));
+        let (pid2, cmdline) = inner.cached_task_registrar().expect("应有候选");
+        assert_eq!(pid2, 100);
+        assert!(cmdline.contains("/delete"), "同 pid 覆盖旧候选");
+        // 非注册工具 cmdline 不入缓存（不影响现有候选）
+        inner.remember_task_registrar(102, &args(&["cmd", "/c", "dir"]));
+        let (pid3, _) = inner.cached_task_registrar().expect("应有候选");
+        assert_eq!(pid3, 100);
     }
 }
