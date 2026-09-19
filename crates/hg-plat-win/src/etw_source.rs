@@ -64,6 +64,12 @@ pub struct EtwInner {
     fileobj: Mutex<HashMap<u64, String>>,
     /// Name 事件迟到时的挂起重试表：obj → (pid, opcode)。Name 到达即补发（上限控制内存）。
     pending_files: Mutex<HashMap<u64, (Pid, u8)>>,
+    /// TCP owner 表（GetExtendedTcpTable）：四元组 → 归属 pid。
+    /// 实测教训：本机 TCP-IP 经典事件 PID 字段恒为 -1，归因只能走 owner 表。
+    tcp_owner: Mutex<(std::time::Instant, HashMap<(std::net::SocketAddr, std::net::SocketAddr), Pid>)>,
+    /// 已发 ConnOpen 的连接（send/connect 任一先到都确保登记——实测 connect 事件
+    /// 在部分路径缺失，send 带有效 pid 时补登记，防孤儿 send）
+    emitted_conns: dashmap::DashSet<u64>,
 }
 
 impl EtwInner {
@@ -76,6 +82,8 @@ impl EtwInner {
             pid_ctx: DashMap::new(),
             fileobj: Mutex::new(HashMap::new()),
             pending_files: Mutex::new(HashMap::new()),
+            tcp_owner: Mutex::new((std::time::Instant::now() - std::time::Duration::from_secs(10), HashMap::new())),
+            emitted_conns: dashmap::DashSet::new(),
         })
     }
 
@@ -294,9 +302,9 @@ impl EtwInner {
         }
         let Ok(schema) = loc.event_schema(record) else { return };
         let p = Parser::create(record, &schema);
-        let pid = {
+        let mut pid = {
             let hp = record.process_id();
-            if hp != 0 { hp } else { Self::parse_u32(&p, &["PID", "ProcessId"]).unwrap_or(0) }
+            if hp != 0 && hp != u32::MAX { hp } else { Self::parse_u32(&p, &["PID", "ProcessId"]).unwrap_or(u32::MAX) }
         };
         let saddr: IpAddr = p.try_parse("saddr").unwrap_or(IpAddr::from([0, 0, 0, 0]));
         let daddr: IpAddr = p.try_parse("daddr").unwrap_or(IpAddr::from([0, 0, 0, 0]));
@@ -305,12 +313,19 @@ impl EtwInner {
         let dport: u16 = p.try_parse::<u16>("dport").map(u16::from_be).unwrap_or(0);
         let local = SocketAddr::new(saddr, sport);
         let remote = SocketAddr::new(daddr, dport);
-        let conn_id = ConnId(Self::conn_hash(pid, local, remote));
+        // conn_id 只按四元组（不含 pid：send/connect 事件的 PID 均可能为 -1，实测教训）
+        let conn_id = ConnId(Self::conn_hash(local, remote));
         tracing::debug!("[net] op={op} pid={pid} {local} -> {remote}");
 
         match op {
             NET_OP_CONNECT => {
-                // 归因在引擎 ConnRegistry（此处只透传四元组）
+                // 归因：事件 PID 无效时查 TCP owner 表（必要时即时刷新）
+                if pid == u32::MAX {
+                    if let Some(owner) = self.lookup_tcp_owner(local, remote, true) {
+                        pid = owner;
+                    }
+                }
+                self.emitted_conns.insert(conn_id.0);
                 self.emit(RawEvent::ConnOpen {
                     pid,
                     start_time: StartTime(0),
@@ -322,12 +337,75 @@ impl EtwInner {
             }
             NET_OP_SEND => {
                 let size = Self::parse_u32(&p, &["size", "Size"]).unwrap_or(0) as u64;
+                // connect 事件缺失时的补登记：send 携带有效 pid 且属监控树 → 先发 ConnOpen
+                if pid != u32::MAX && self.emitted_conns.insert(conn_id.0) {
+                    if self.procs.get(&pid).is_some_and(|id| id.harness_root.is_some()) {
+                        let st = self.procs.get(&pid).map(|i| i.start_time).unwrap_or(StartTime(0));
+                        self.emit(RawEvent::ConnOpen {
+                            pid,
+                            start_time: st,
+                            conn_id,
+                            proto: Proto::Tcp,
+                            local,
+                            remote,
+                        });
+                    }
+                }
                 self.emit(RawEvent::ConnTx { conn_id, bytes_out_delta: size });
             }
             NET_OP_DISCONNECT => {
                 self.emit(RawEvent::ConnClose { conn_id });
             }
             _ => {}
+        }
+    }
+
+    fn lookup_tcp_owner(&self, local: SocketAddr, remote: SocketAddr, refresh: bool) -> Option<Pid> {
+        {
+            let g = self.tcp_owner.lock().unwrap();
+            if let Some(pid) = g.1.get(&(local, remote)) {
+                return Some(*pid);
+            }
+        }
+        if refresh {
+            self.refresh_tcp_owner();
+            let g = self.tcp_owner.lock().unwrap();
+            g.1.get(&(local, remote)).copied()
+        } else {
+            None
+        }
+    }
+
+    /// GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL) 快照（约 1-5ms，连接级调用频率下可接受）。
+    fn refresh_tcp_owner(&self) {
+        use windows::Win32::NetworkManagement::IpHelper::{GetExtendedTcpTable, TCP_TABLE_OWNER_PID_ALL};
+            use windows::Win32::Networking::WinSock::AF_INET;
+        unsafe {
+            let mut size = 0u32;
+            let _ = GetExtendedTcpTable(None, &mut size, false, AF_INET.0 as u32, TCP_TABLE_OWNER_PID_ALL, 0);
+            if size == 0 || size > 16 * 1024 * 1024 {
+                return;
+            }
+            let mut buf = vec![0u8; size as usize];
+            if GetExtendedTcpTable(Some(buf.as_mut_ptr() as *mut _), &mut size, false, AF_INET.0 as u32, TCP_TABLE_OWNER_PID_ALL, 0) != 0 {
+                return;
+            }
+            let n = *(buf.as_ptr() as *const u32);
+            let row_size = std::mem::size_of::<u32>() * 6; // state+laddr+lport+raddr+rport+pid
+            let mut map = HashMap::with_capacity(n as usize);
+            for i in 0..n as usize {
+                let row = buf.as_ptr().add(4 + i * row_size) as *const u32;
+                let la = (*(row.add(1))).swap_bytes();
+                let lp = ((*(row.add(2)) & 0xff) << 8 | (*(row.add(2)) & 0xff00) >> 8) as u16;
+                let ra = (*(row.add(3))).swap_bytes();
+                let rp = ((*(row.add(4)) & 0xff) << 8 | (*(row.add(4)) & 0xff00) >> 8) as u16;
+                let pid = *(row.add(5));
+                use std::net::Ipv4Addr;
+                let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(la)), lp);
+                let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ra)), rp);
+                map.insert((local, remote), pid);
+            }
+            *self.tcp_owner.lock().unwrap() = (std::time::Instant::now(), map);
         }
     }
 
@@ -348,13 +426,9 @@ impl EtwInner {
         lexical_normalize(&joined)
     }
 
-    fn conn_hash(pid: Pid, local: SocketAddr, remote: SocketAddr) -> u64 {
-        // fnv-1a over (pid, quad)
+    fn conn_hash(local: SocketAddr, remote: SocketAddr) -> u64 {
+        // fnv-1a over 四元组（唯一性足够：同四元组的并发连接不存在）
         let mut h: u64 = 0xcbf29ce484222325;
-        for b in pid.to_le_bytes() {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
         for sock in [local, remote] {
             let (ip, port) = (sock.ip(), sock.port());
             let ipb: Vec<u8> = match ip {

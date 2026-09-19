@@ -262,8 +262,20 @@ impl Engine {
         );
         let Some(root) = &id.harness_root else { return Ok(()) };
 
-        // 命令封堵（需求 §3.3 导出型命令）
-        if rules.match_blocked_command(&id.cmdline) {
+        // 命令封堵（需求 §3.3）。cmdline 为空（短命进程 PEB 读取竞态，M1 报告披露）
+        // 时按 exe 文件名兜底匹配——宁多判勿漏判，命中即视为导出型命令。
+        let blocked_hit = if id.cmdline.is_empty() {
+            let mut argv = vec![std::ffi::OsString::from(
+                exe.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
+            )];
+            argv[0] = std::ffi::OsString::from(
+                argv[0].to_string_lossy().trim_end_matches(".exe").to_string(),
+            );
+            rules.match_blocked_command(&argv)
+        } else {
+            rules.match_blocked_command(&id.cmdline)
+        };
+        if blocked_hit {
             let summary = format!(
                 "[{}] 封堵命令：{}（pid {pid}）",
                 root.0,

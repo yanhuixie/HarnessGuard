@@ -63,6 +63,12 @@ windows = { version = "0.61", features = [
     "Win32_System_Kernel",
 ] }
 
+# 平台专属依赖声明（cargo 不允许 virtual workspace 里放 [target] 段——
+# 门控放在各平台 crate 的 Cargo.toml（hg-plat-linux/macos 已按此组织，
+# 效果等同任务原文的 workspace 级 target 门控，Windows 构建全绿）
+aya = "0.13"
+libc = "0.2"
+
 [profile.release]
 lto = "thin"
 strip = true
