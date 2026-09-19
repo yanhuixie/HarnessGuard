@@ -14,6 +14,32 @@ use hg_platform::Enforcer;
 
 const MIB_TCP_STATE_DELETE_TCB: u32 = 12;
 
+/// MIB 约定：端口以网络字节序存放于 DWORD 低 16 位，高 16 位为 0
+/// （评审修正：原 (port as u32).swap_bytes() 把端口放进了高 16 位——该构造空档
+/// 曾长期无单测掩盖此 bug，M4 抽为纯函数补测，见 M1 报告缺口 2）。
+pub(crate) fn net_port(p: u16) -> u32 {
+    (((p & 0xff) as u32) << 8) | ((p >> 8) as u32)
+}
+
+/// TCP 四元组 → `MIB_TCPROW_LH`（IPv4 断连接行）。纯函数无 IO，供单测覆盖
+/// 端口字节序与字段完整性。地址按网络序内存布局（小端机器上 u32 值为八位组反转）。
+pub(crate) fn build_tcp_row_v4(
+    quad: &TcpQuad,
+) -> anyhow::Result<windows::Win32::NetworkManagement::IpHelper::MIB_TCPROW_LH> {
+    use windows::Win32::NetworkManagement::IpHelper::{MIB_TCPROW_LH, MIB_TCPROW_LH_0};
+    let (l, r) = match (quad.local.ip(), quad.remote.ip()) {
+        (std::net::IpAddr::V4(l), std::net::IpAddr::V4(r)) => (l, r),
+        _ => anyhow::bail!("v4 行构造收到非 IPv4 四元组：{} -> {}", quad.local, quad.remote),
+    };
+    Ok(MIB_TCPROW_LH {
+        Anonymous: MIB_TCPROW_LH_0 { dwState: MIB_TCP_STATE_DELETE_TCB },
+        dwLocalAddr: u32::from(l).swap_bytes(),
+        dwLocalPort: net_port(quad.local.port()),
+        dwRemoteAddr: u32::from(r).swap_bytes(),
+        dwRemotePort: net_port(quad.remote.port()),
+    })
+}
+
 #[derive(Default)]
 pub struct WinEnforcer;
 
@@ -59,22 +85,14 @@ impl Enforcer for WinEnforcer {
     }
 
     fn drop_tcp(&self, quad: TcpQuad) -> anyhow::Result<()> {
-        let (IpAddr::V4(l), IpAddr::V4(r)) = (quad.local.ip(), quad.remote.ip()) else {
+        use windows::Win32::NetworkManagement::IpHelper::SetTcpEntry;
+        if matches!(
+            (quad.local.ip(), quad.remote.ip()),
+            (std::net::IpAddr::V6(_), _) | (_, std::net::IpAddr::V6(_))
+        ) {
             anyhow::bail!("IPv6 断连接（SetTcp6Entry）在 windows 0.61 未导出，M4 补直调 iphlpapi")
-        };
-        use windows::Win32::NetworkManagement::IpHelper::{
-            SetTcpEntry, MIB_TCPROW_LH, MIB_TCPROW_LH_0,
-        };
-        // MIB 约定：地址与端口均为网络字节序，端口占 DWORD 低 16 位
-        // （评审修正：原 (port as u32).swap_bytes() 把端口放进了高 16 位）
-        let net_port = |p: u16| -> u32 { (((p & 0xff) as u32) << 8) | ((p >> 8) as u32) };
-        let row = MIB_TCPROW_LH {
-            Anonymous: MIB_TCPROW_LH_0 { dwState: MIB_TCP_STATE_DELETE_TCB },
-            dwLocalAddr: u32::from(l).swap_bytes(),
-            dwLocalPort: net_port(quad.local.port()),
-            dwRemoteAddr: u32::from(r).swap_bytes(),
-            dwRemotePort: net_port(quad.remote.port()),
-        };
+        }
+        let row = build_tcp_row_v4(&quad)?;
         let rc = unsafe { SetTcpEntry(&row) };
         if rc == 0 {
             Ok(())
@@ -114,5 +132,70 @@ impl Enforcer for WinEnforcer {
             }
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn quad_v4(la: [u8; 4], lp: u16, ra: [u8; 4], rp: u16) -> TcpQuad {
+        TcpQuad {
+            local: SocketAddr::new(IpAddr::V4(Ipv4Addr::from(la)), lp),
+            remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ra)), rp),
+        }
+    }
+
+    /// 端口字节序：8080=0x1F90 → 网络序内存 [0x1F,0x90] → DWORD 低 16 位 0x901F；
+    /// 高 16 位必须为 0（历史 bug：swap_bytes(u32) 把端口放进高 16 位）。
+    #[test]
+    fn v4_行构造_端口网络序且低位存放() {
+        let row =
+            build_tcp_row_v4(&quad_v4([192, 168, 1, 10], 8080, [1, 2, 3, 4], 443)).unwrap();
+        assert_eq!(row.dwLocalPort, 0x0000_901F, "本地端口 8080 应编码为低 16 位 0x901F");
+        assert_eq!(row.dwRemotePort, 0x0000_BB01, "远端端口 443(0x01BB) 应编码为 0xBB01");
+    }
+
+    #[test]
+    fn v4_行构造_端口边界值() {
+        let zero = build_tcp_row_v4(&quad_v4([10, 0, 0, 1], 0, [10, 0, 0, 2], 65535)).unwrap();
+        assert_eq!(zero.dwLocalPort, 0);
+        assert_eq!(zero.dwRemotePort, 0xFFFF);
+    }
+
+    /// 地址按网络序内存布局断言（to_le_bytes 即逐字节内存视角），并核全部 5 个字段，
+    /// 防本地/远端串位与状态遗漏。
+    #[test]
+    fn v4_行构造_地址网络序与字段完整性() {
+        let row =
+            build_tcp_row_v4(&quad_v4([192, 168, 1, 10], 8080, [1, 2, 3, 4], 443)).unwrap();
+        assert_eq!(row.dwLocalAddr.to_le_bytes(), [192, 168, 1, 10]);
+        assert_eq!(row.dwRemoteAddr.to_le_bytes(), [1, 2, 3, 4]);
+        assert_eq!(unsafe { row.Anonymous.dwState }, MIB_TCP_STATE_DELETE_TCB);
+    }
+
+    #[test]
+    fn v4_行构造_混合或v6四元组应报错() {
+        let mixed = TcpQuad {
+            local: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            remote: SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 1),
+        };
+        assert!(build_tcp_row_v4(&mixed).is_err());
+    }
+
+    /// kill 对已退出 pid 的错误路径：OpenProcess 对无存活引用的已退出 pid 失败，
+    /// kill_process 必须返回 Err——禁止把失败伪装成成功（M1 缺口 3 的回归测试）。
+    /// 说明：测试窗口内 pid 复用理论上存在但概率可忽略；若复现为活进程则本测试失败暴露。
+    #[test]
+    fn kill_对已退出pid_报错而非伪成功() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "exit"])
+            .spawn()
+            .expect("spawn cmd 失败");
+        let pid = child.id();
+        let _ = child.wait();
+        let r = WinEnforcer::new().kill_process(pid, StartTime(0));
+        assert!(r.is_err(), "对已退出 pid {pid} 的 kill 应返回 Err，实际 Ok");
     }
 }
