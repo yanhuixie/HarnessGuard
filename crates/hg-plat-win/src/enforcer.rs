@@ -1,7 +1,11 @@
 //! Windows 处置动作（技术设计 §5.1）：
 //! - 杀进程：OpenProcess + TerminateProcess（校验 start_time 防 pid 复用）；
-//! - 断连接：SetTcpEntry（MIB_TCP_STATE_DELETE_TCB）。IPv6 的 SetTcp6Entry 在
-//!   windows crate 0.61 未导出——M1 显式不支持并报错（演示为 IPv4），M4 直调 iphlpapi 补；
+//! - 断连接：SetTcpEntry（v4）。**v6 的 SetTcp6Entry 是文档幻影**：M4 实测
+//!   （Win10 26100）SDK 头文件无声明、iphlpapi.lib 无符号、DLL 导出表无此名，
+//!   无法直调——v6 连接级断开超出用户态文档化 API 能力，由引擎侧 Kill
+//!   （socket 随进程关闭）+ 封 IP（netsh/WFP 均支持 v6）兜底；MIB_TCP6ROW
+//!   行构造保留（单测覆盖布局，供平台补齐或 NSI 未公开接口评估时复用）。
+//!   已登记技术设计「设计拍板记录」第 9 条。
 //! - 封 IP：`netsh advfirewall` 临时出站规则 + TTL 到期移除。
 //!   设计原文为用户态 WFP（FwpmFilterAdd0）；M1 以 netsh 过渡（同一防火墙栈，
 //!   免 BFE 子层装配），M4 换 FwpmFilterAdd——偏差已显式登记于 M1 报告。
@@ -36,6 +40,29 @@ pub(crate) fn build_tcp_row_v4(
         dwLocalAddr: u32::from(l).swap_bytes(),
         dwLocalPort: net_port(quad.local.port()),
         dwRemoteAddr: u32::from(r).swap_bytes(),
+        dwRemotePort: net_port(quad.remote.port()),
+    })
+}
+
+/// TCP 四元组 → `MIB_TCP6ROW`（IPv6 断连接行）。纯函数无 IO，供单测覆盖。
+/// scope id 恒 0：std `SocketAddr` 不携带 zone id，链路本地（fe80::/10）会因
+/// scope 不匹配而失败——受控限制，外联监控目标为全局单播，不受影响。
+pub(crate) fn build_tcp_row_v6(
+    quad: &TcpQuad,
+) -> anyhow::Result<windows::Win32::NetworkManagement::IpHelper::MIB_TCP6ROW> {
+    use windows::Win32::NetworkManagement::IpHelper::{MIB_TCP6ROW, MIB_TCP_STATE_DELETE_TCB as ST_DELETE};
+    use windows::Win32::Networking::WinSock::{IN6_ADDR, IN6_ADDR_0};
+    let (l, r) = match (quad.local.ip(), quad.remote.ip()) {
+        (IpAddr::V6(l), IpAddr::V6(r)) => (l, r),
+        _ => anyhow::bail!("v6 行构造收到非 IPv6 四元组：{} -> {}", quad.local, quad.remote),
+    };
+    Ok(MIB_TCP6ROW {
+        State: ST_DELETE,
+        LocalAddr: IN6_ADDR { u: IN6_ADDR_0 { Byte: l.octets() } },
+        dwLocalScopeId: 0,
+        dwLocalPort: net_port(quad.local.port()),
+        RemoteAddr: IN6_ADDR { u: IN6_ADDR_0 { Byte: r.octets() } },
+        dwRemoteScopeId: 0,
         dwRemotePort: net_port(quad.remote.port()),
     })
 }
@@ -86,14 +113,23 @@ impl Enforcer for WinEnforcer {
 
     fn drop_tcp(&self, quad: TcpQuad) -> anyhow::Result<()> {
         use windows::Win32::NetworkManagement::IpHelper::SetTcpEntry;
-        if matches!(
-            (quad.local.ip(), quad.remote.ip()),
-            (std::net::IpAddr::V6(_), _) | (_, std::net::IpAddr::V6(_))
-        ) {
-            anyhow::bail!("IPv6 断连接（SetTcp6Entry）在 windows 0.61 未导出，M4 补直调 iphlpapi")
-        }
-        let row = build_tcp_row_v4(&quad)?;
-        let rc = unsafe { SetTcpEntry(&row) };
+        // IPv4 行构造为纯函数（单测覆盖字节序/字段完整性），失败路径统一 rc!=0
+        // 报错（87=参数/连接已不存在，与 M1 行为一致）
+        let rc = match (quad.local.ip(), quad.remote.ip()) {
+            (IpAddr::V4(_), IpAddr::V4(_)) => {
+                let row = build_tcp_row_v4(&quad)?;
+                unsafe { SetTcpEntry(&row) }
+            }
+            (IpAddr::V6(_), IpAddr::V6(_)) => {
+                // 行构造先行：校验 v6 四元组形状并保持与单测同构；随后显式报错
+                // ——见文件头「文档幻影」说明（设计拍板记录第 9 条）
+                let _row = build_tcp_row_v6(&quad)?;
+                anyhow::bail!(
+                    "IPv6 连接级断开无用户态 API：SetTcp6Entry 为文档幻影（头文件/导入库/DLL 导出均无，M4 实测）；本连接已由 Kill/封 IP 路径兜底"
+                )
+            }
+            _ => anyhow::bail!("混合协议四元组（v4/v6 不一致）：{} -> {}", quad.local, quad.remote),
+        };
         if rc == 0 {
             Ok(())
         } else {
@@ -182,6 +218,45 @@ mod tests {
             remote: SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 1),
         };
         assert!(build_tcp_row_v4(&mixed).is_err());
+    }
+
+    fn quad_v6(l: std::net::Ipv6Addr, lp: u16, r: std::net::Ipv6Addr, rp: u16) -> TcpQuad {
+        TcpQuad {
+            local: SocketAddr::new(IpAddr::V6(l), lp),
+            remote: SocketAddr::new(IpAddr::V6(r), rp),
+        }
+    }
+
+    /// IPv6 quad：地址八位组原样入 IN6_ADDR（本就是网络序内存布局），本地/远端
+    /// 互不串位；端口编码同 v4 约定（低 16 位、网络序）。
+    #[test]
+    fn v6_行构造_地址八位组与端口网络序() {
+        let l = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let r = std::net::Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888);
+        let row = build_tcp_row_v6(&quad_v6(l, 49152, r, 853)).unwrap();
+        assert_eq!(unsafe { row.LocalAddr.u.Byte }, l.octets());
+        assert_eq!(unsafe { row.RemoteAddr.u.Byte }, r.octets());
+        assert_eq!(row.dwLocalPort, 0x0000_00C0, "49152(0xC000) → 低 16 位 0x00C0");
+        assert_eq!(row.dwRemotePort, 0x0000_5503, "853(0x0355) → 低 16 位 0x5503");
+    }
+
+    #[test]
+    fn v6_行构造_字段完整性() {
+        let row = build_tcp_row_v6(&quad_v6(
+            std::net::Ipv6Addr::LOCALHOST,
+            1,
+            std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2),
+            2,
+        ))
+        .unwrap();
+        assert_eq!(row.State.0, 12, "状态须为 MIB_TCP_STATE_DELETE_TCB");
+        assert_eq!(row.dwLocalScopeId, 0);
+        assert_eq!(row.dwRemoteScopeId, 0);
+    }
+
+    #[test]
+    fn v6_行构造_非v6四元组应报错() {
+        assert!(build_tcp_row_v6(&quad_v4([1, 2, 3, 4], 1, [5, 6, 7, 8], 2)).is_err());
     }
 
     /// kill 对已退出 pid 的错误路径：OpenProcess 对无存活引用的已退出 pid 失败，

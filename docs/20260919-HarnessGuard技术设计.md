@@ -438,3 +438,4 @@ M0 spike 以实测 RSS 为验收项；超支预案：axum 降级 tiny_http、Fil
 6. **追加写 vs 滚动清理**的矛盾拍板：运行期触发器禁改、唯一 DELETE 来自每日清理任务（§4）。
 7. 通知经**会话桥**投递（Win 一次性代理 / Linux 会话 bus 遍历 / Mac per-user LaunchAgent）。
 8. token 经 query 传递仅限 SSE 端点（EventSource 无 header 能力），其余 API 仅 Bearer header。
+9. **IPv6 断连接降级**（M4 实测，2026-09-19）：§5.1 原文的 `SetTcp6Entry` 为**文档幻影**——Windows SDK 头文件（iphlpapi.h/netioapi.h 及整个 um/）无声明、iphlpapi.lib 无符号、iphlpapi.dll 导出表无此名（Win10 26100 全量导出枚举核对，仅 `SetTcpEntry`/`SetPerTcp(6)ConnectionEStats` 存在），用户态文档化 API 无法实现 v6 连接级断开。拍板：v6 连接处置由引擎侧 Kill（socket 随进程关闭）+ 封 IP（netsh/WFP 均支持 v6）兜底；`MIB_TCP6ROW` 行构造纯函数与单测保留（锚定 MIB 布局），供平台补齐或 NSI 未公开接口评估——后者超出"文档化用户态 API"设计边界，暂不采用。
