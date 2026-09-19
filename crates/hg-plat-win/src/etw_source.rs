@@ -42,7 +42,9 @@ const NET_OP_CONNECT: u8 = 16;
 const NET_OP_SEND: u8 = 10;
 const NET_OP_DISCONNECT: u8 = 18;
 /// FileObject 缓存容量（LRU 封顶，M1 为超限整表清空——burst 会误清热点；
-/// §10 预算表超支预案原文"FileObject 缓存加 LRU 上限"）
+/// §10 预算表超支预案原文"FileObject 缓存加 LRU 上限"。200k 全量约 26–29MB，
+/// 维持不核减的依据见技术设计拍板记录第 10 条——Name 缓存命中是文件路径
+/// 解析主路径，容量直接决定 burst 下 unknown 率）
 const FILEOBJ_CAP: usize = 200_000;
 /// 探测失败表容量（FileObject → 已失败不重试；burst 中 Create→Close 极快，
 /// 句柄已关为主要 miss 原因，重试无意义）

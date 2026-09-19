@@ -372,9 +372,16 @@ bind = "127.0.0.1:8377"
 | Rust 基础 + tokio（2–4 线程）+ axum | 15–25MB |
 | rusqlite（WAL 缓冲） | 3–8MB |
 | ProcTable（~5k 进程）+ ConnRegistry + 通道缓冲 | 3–6MB |
-| 平台事件源（ETW/auditpipe/eBPF ringbuf + FileObject 缓存） | 5–15MB |
+| 平台事件源缓冲（ETW/auditpipe/eBPF ringbuf） | 3–5MB |
+| FileObject→Name LRU 缓存（Windows，200k 条 × ~130–145B；拍板记录 10） | 26–29MB |
+| estats 差分表（Windows，封顶 262k × 16B） | ≤ 4MB |
 | 规则快照 + 杂项 | < 2MB |
-| **合计** | **~30–55MB**（余量 ≥ 45MB） |
+| **合计** | **~54–79MB**（余量 ≥ 21MB，未超硬约束；实机 RSS 待复验收口） |
+
+> 修订记录（2026-09-20，M4 第二批）：原表"平台事件源 5–15MB"含 FileObject 缓存，
+> 实测构成（200k 条 LRU 全量 26–29MB）超出该档。按拍板记录第 10 条拆列单计并
+> 维持 200k 容量（探测路径对短命句柄无效，缓存命中是文件路径解析主路径）；
+> 合计与余量相应修正。
 
 M0 spike 以实测 RSS 为验收项；超支预案：axum 降级 tiny_http、FileObject 缓存加 LRU 上限。
 
@@ -439,3 +446,4 @@ M0 spike 以实测 RSS 为验收项；超支预案：axum 降级 tiny_http、Fil
 7. 通知经**会话桥**投递（Win 一次性代理 / Linux 会话 bus 遍历 / Mac per-user LaunchAgent）。
 8. token 经 query 传递仅限 SSE 端点（EventSource 无 header 能力），其余 API 仅 Bearer header。
 9. **IPv6 断连接降级**（M4 实测，2026-09-19）：§5.1 原文的 `SetTcp6Entry` 为**文档幻影**——Windows SDK 头文件（iphlpapi.h/netioapi.h 及整个 um/）无声明、iphlpapi.lib 无符号、iphlpapi.dll 导出表无此名（Win10 26100 全量导出枚举核对，仅 `SetTcpEntry`/`SetPerTcp(6)ConnectionEStats` 存在），用户态文档化 API 无法实现 v6 连接级断开。拍板：v6 连接处置由引擎侧 Kill（socket 随进程关闭）+ 封 IP（netsh/WFP 均支持 v6）兜底；`MIB_TCP6ROW` 行构造纯函数与单测保留（锚定 MIB 布局），供平台补齐或 NSI 未公开接口评估——后者超出"文档化用户态 API"设计边界，暂不采用。
+10. **FileObject 缓存容量 200k 维持 + §10 预算表修订**（M4 第二批，2026-09-20）：M1 沿袭的 200k 全量约 26–29MB（条目 48B slab + ~16B 索引 + NT 路径字符串均值 ~80B），超原 §10"平台事件源 5–15MB"档。拍板**不核减容量、修订预算表拆列单计**，依据：① M4 复验定案——句柄探测对短命句柄无效（ETW 投递延迟 > 句柄存活期），Name 缓存命中是文件路径解析的唯一现实主路径，容量直接决定 burst（tar 解包/大仓 git）下的 unknown 率；② 核减至 64k 在 monorepo 规模 burst 下将重演 M1"整表清空后 Read/Write 全 unknown"教训，且当前无实测 unknown 率数据支撑核减的安全性；③ 100MB 硬约束仍满足（修订后合计 ~54–79MB，余量 ≥ 21MB）。实机 RSS 复验列入 M4 第二批复验清单。
