@@ -522,6 +522,62 @@ impl EtwInner {
         let answers = parse_dns_answers(results.as_deref());
         self.emit(RawEvent::DnsQuery { pid, qname, answers });
     }
+
+    /// TaskScheduler 持久化检测（技术设计 §5.1 原文；M1 偏差表归位：原仅 RunKey
+    /// 轮询、无计划任务覆盖）。106=任务注册，141/140=任务更新——均属持久化面。
+    /// pid 归因链（事件自身一般不携带）：① 事件 ProcessId 字段（部分版本）→
+    /// ② 监控树内 cmdline 含注册工具特征的进程（schtasks/Register-ScheduledTask/
+    /// RegisterTask）→ ③ 0（未归因，引擎侧仍出 Audit 判定，证据含 detail）。
+    fn on_sched(&self, record: &EventRecord, loc: &SchemaLocator) {
+        if !matches!(record.event_id(), 106 | 140 | 141) {
+            return;
+        }
+        let Ok(schema) = loc.event_schema(record) else { return };
+        let p = Parser::create(record, &schema);
+        let task: Option<String> = p.try_parse::<String>("TaskName").ok().filter(|s| !s.is_empty());
+        let Some(task) = task else { return };
+        let user: String = p.try_parse::<String>("UserContext").unwrap_or_default();
+        let kind = match record.event_id() {
+            106 => "注册",
+            _ => "更新",
+        };
+        let pid = Self::parse_u32(&p, &["ProcessId", "ProcessID", "Pid"])
+            .filter(|v| *v != 0)
+            .map(|v| {
+                // 事件携带 pid：仅当属监控树才直接归因（否则保留 0 走扫描链）
+                if self.procs.get(&v).is_some() {
+                    v
+                } else {
+                    0
+                }
+            })
+            .unwrap_or_else(|| self.scan_task_registrar());
+        let how = if pid != 0 { "已归因" } else { "未归因（无匹配注册进程）" };
+        tracing::warn!("[持久化] 计划任务{kind}：{task}（user={user}，pid={pid}，{how}）");
+        self.emit(RawEvent::Persistence {
+            pid,
+            kind: hg_model::PersistenceKind::SchedTask,
+            detail: format!("计划任务{kind}：{task}（user={user}，pid={pid}，{how}）"),
+        });
+    }
+
+    /// 归因扫描：监控树内 cmdline 含计划任务注册工具特征的进程（最近一个）。
+    /// 无时间戳可依（Identity 不含 exec 时刻），属启发式归因——确定性不足时
+    /// 返回 0，宁可缺归因不误归因。
+    fn scan_task_registrar(&self) -> Pid {
+        const MARKERS: [&str; 3] = ["schtasks", "register-scheduledtask", "registertask"];
+        let mut found = 0;
+        for id in self.procs.snapshot() {
+            if id.harness_root.is_none() {
+                continue;
+            }
+            let cmdline = id.cmdline.iter().map(|a| a.to_string_lossy().to_lowercase()).collect::<Vec<_>>().join(" ");
+            if MARKERS.iter().any(|m| cmdline.contains(m)) {
+                found = id.pid;
+            }
+        }
+        found
+    }
 }
 
 /// QueryResults 形如 `type: 5 name; type: 1 1.2.3.4;`——提取其中的 IP。
@@ -610,6 +666,7 @@ impl hg_platform::EventSource for EtwSource {
         // 清理上次异常退出残留的同名会话（强杀不会停 ETW session；完整停机序列 §9.3 在 M4）
         let _ = ferrisetw::trace::stop_trace_by_name("HarnessGuard");
         let _ = ferrisetw::trace::stop_trace_by_name("HarnessGuardDns");
+        let _ = ferrisetw::trace::stop_trace_by_name("HarnessGuardSched");
 
         let kernel_trace = KernelTrace::new()
             .named("HarnessGuard".into())
@@ -637,7 +694,25 @@ impl hg_platform::EventSource for EtwSource {
             .start_and_process();
         match dns_trace {
             Ok(_) => tracing::info!("ETW UserTrace(Dns-Client) 已启动"),
-            Err(e) => tracing::error!("ETW UserTrace(Dns-Client) 启动失败: {e:?}"),
+            Err(e) => tracing::error!("ETW UserTrace(Dns-Client) 启动失败（需管理员）: {e:?}"),
+        }
+
+        // Microsoft-Windows-TaskScheduler（Operational 源 by GUID）：计划任务注册/
+        // 更新 → Persistence 事件（M4 偏差归位；默认该日志通道可能未启用，实机
+        // 复验时若 0 事件需 wevtutil sl Microsoft-Windows-TaskScheduler/Operational /e:true）
+        let sched = Provider::by_guid("de7b246a-cffa-4c99-a82d-2f43ee0c9981")
+            .add_callback({
+                let inner = inner.clone();
+                move |r, l| inner.on_sched(r, l)
+            })
+            .build();
+        let sched_trace = UserTrace::new()
+            .named("HarnessGuardSched".into())
+            .enable(sched)
+            .start_and_process();
+        match sched_trace {
+            Ok(_) => tracing::info!("ETW UserTrace(TaskScheduler) 已启动"),
+            Err(e) => tracing::error!("ETW UserTrace(TaskScheduler) 启动失败: {e:?}"),
         }
 
         // 事件源线程常驻（停机序列在进程退出时由 OS 回收 ETW session；M4 补优雅停机）
