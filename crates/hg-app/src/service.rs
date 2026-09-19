@@ -1,21 +1,22 @@
 //! windows-service 服务宿主（技术设计 §2/§5.1：单特权系统服务 + 恢复策略；
 //! M1 偏差表归位：控制台管理员模式 → SCM 宿主）。
 //!
-//! P2 级交付：**编译级验证**。本仓库无人值守纪律禁止系统状态变更——
-//! install/uninstall 只提供实现，不在本会话执行；复验命令清单见 M4 报告。
+//! 实机状态：install/uninstall/启停/恢复策略/停机序列已于 2026-09-20 管理员
+//! 实机验证全项通过（M4 第一批复验报告）；后续改动按需复验。
 //!
 //! 恢复策略：create_service 不覆盖 failure actions，安装时经 `sc.exe failure`
 //! 配置三级重启（5s×3，等效 SCM Recovery 页）；binPath 由 launch_arguments
 //! 自动拼装为 `"...\harnessguard.exe" service`。
 
 use std::ffi::OsString;
+use std::sync::Arc;
 use std::time::Duration;
 
 use windows_service::service::{
     ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
     ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
-use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+use windows_service::service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle};
 use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -59,30 +60,46 @@ fn service_main() {
             return;
         }
     };
-    let report = |state, code, wait_hint| {
-        let st = ServiceStatus {
-            service_type: ServiceType::OWN_PROCESS,
-            current_state: state,
-            // Interrogate 由 SCM 隐式支持，无需（也无位）声明
-            controls_accepted: ServiceControlAccept::STOP,
-            exit_code: ServiceExitCode::Win32(code),
-            checkpoint: 0,
-            wait_hint,
-            process_id: None,
-        };
-        if let Err(e) = status_handle.set_service_status(st) {
-            tracing::error!("服务状态上报失败（{state:?}）：{e}");
-        }
-    };
-    report(ServiceState::Running, 0, Duration::from_secs(3));
+    let handle = Arc::new(status_handle);
+    // 状态时序（M4 待修清单 8）：先报 START_PENDING（wait_hint 30s）——run_server
+    // 装配（配置/ETW/SQLite/Web 监听）有耗时，直接报 RUNNING 时初始化若超
+    // wait_hint 会被 SCM 判超时；装配完成回调再报 RUNNING
+    report_state(&handle, ServiceState::StartPending, 0, Duration::from_secs(30));
     tracing::info!("[服务] HarnessGuard 服务主体启动（SCM 宿主）");
 
-    if let Err(e) = crate::run_server(Some(stop_rx)) {
+    let on_ready = {
+        let handle = handle.clone();
+        Some(Box::new(move || {
+            report_state(&handle, ServiceState::Running, 0, Duration::ZERO)
+        }) as Box<dyn FnOnce() + Send>)
+    };
+    if let Err(e) = crate::run_server(Some(stop_rx), on_ready) {
         tracing::error!("[服务] 服务主体退出（失败）：{e:#}");
-        report(ServiceState::Stopped, 1, Duration::ZERO);
+        report_state(&handle, ServiceState::Stopped, 1, Duration::ZERO);
         return;
     }
-    report(ServiceState::Stopped, 0, Duration::ZERO);
+    report_state(&handle, ServiceState::Stopped, 0, Duration::ZERO);
+}
+
+/// 状态上报（Interrogate 由 SCM 隐式支持，无需（也无位）声明）。
+fn report_state(
+    handle: &ServiceStatusHandle,
+    state: ServiceState,
+    code: u32,
+    wait_hint: Duration,
+) {
+    let st = ServiceStatus {
+        service_type: ServiceType::OWN_PROCESS,
+        current_state: state,
+        controls_accepted: ServiceControlAccept::STOP,
+        exit_code: ServiceExitCode::Win32(code),
+        checkpoint: 0,
+        wait_hint,
+        process_id: None,
+    };
+    if let Err(e) = handle.set_service_status(st) {
+        tracing::error!("服务状态上报失败（{state:?}）：{e}");
+    }
 }
 
 /// 安装服务（需管理员）：LocalSystem 自启动 + `service` 启动参数 + 三级失败重启。
@@ -130,11 +147,21 @@ pub fn uninstall() -> anyhow::Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service =
         manager.open_service(SERVICE_NAME, ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS | ServiceAccess::STOP)?;
-    // 运行中先停（运行中删除只标记，不移除）
+    // 运行中先停（运行中删除只标记，不移除）；轮询至 Stopped——原固定 sleep 2s
+    // 在停机序列超过 2s 时仍会撞上"只标记"路径（M4 待修清单 9）
     let status = service.query_status()?;
     if status.current_state != ServiceState::Stopped {
         service.stop()?;
-        std::thread::sleep(Duration::from_secs(2));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if service.query_status()?.current_state == ServiceState::Stopped {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                anyhow::bail!("等待服务停止超时（30s），请手动停止后重试卸载");
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
     }
     service.delete()?;
     println!("服务已卸载");

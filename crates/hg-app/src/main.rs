@@ -31,7 +31,7 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     match std::env::args().nth(1).as_deref() {
-        None | Some("run") => run_server(None),
+        None | Some("run") => run_server(None, None),
         #[cfg(windows)]
         Some("service") => service::dispatch(),
         #[cfg(windows)]
@@ -58,8 +58,11 @@ async fn wait_for_stop(mut stop: Option<tokio::sync::watch::Receiver<bool>>) {
 
 /// 服务主体（控制台/SCM 共用）：装配全链路并阻塞至停止信号，
 /// 随后执行停机序列（技术设计 §9.3 摘要：ETW 会话回收 + 存储冲刷）。
+/// `on_ready`：装配完成（含 Web 监听就绪）时回调——服务宿主据此上报 RUNNING
+/// （此前 START_PENDING 已先行上报；控制台模式传 None）。
 pub(crate) fn run_server(
     stop: Option<tokio::sync::watch::Receiver<bool>>,
+    on_ready: Option<Box<dyn FnOnce() + Send>>,
 ) -> anyhow::Result<()> {
     // 配置路径：`run [config]` 或 `service [config]`；缺省当前目录 config.toml
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -195,6 +198,12 @@ pub(crate) fn run_server(
         println!("==================================================================");
     } else {
         tracing::info!("HarnessGuard 服务模式已启动，Web UI：http://{bind}/?token={token}");
+    }
+
+    // 初始化完成（装配 + Web 监听就绪）：通知宿主（服务模式上报 RUNNING，
+    // M4 待修清单 8）
+    if let Some(cb) = on_ready {
+        cb();
     }
 
     rt.block_on(wait_for_stop(stop));
