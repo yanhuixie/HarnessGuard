@@ -50,7 +50,8 @@ const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC0000004u32 as i32;
 /// x64 布局：Object(8) + UniqueProcessId(8) + HandleValue(8) + GrantedAccess(4)
 /// + CreatorBackTraceIndex(2) + ObjectTypeIndex(2) + HandleAttributes(4) + Reserved(4)
 const HANDLE_ENTRY_SIZE: usize = 40;
-const DUPLICATE_SAME_ACCESS: u32 = 2;
+/// 文件对象查询权限：GetFinalPathNameByHandleW 所需的最小访问掩码
+const FILE_READ_ATTRIBUTES: u32 = 0x0080;
 
 /// 探测决策（纯函数，单测覆盖）：仅 Create/Read 事件（实机复验修正：cmd `type`
 /// 等读路径的首个事件常是 Read（op=67）而非 Create，仅限 Create 会漏掉全部读
@@ -109,7 +110,12 @@ unsafe fn probe_with_handle(hproc: HANDLE, pid: u32, file_object: u64) -> Option
     }
     let n = *(buf.as_ptr() as *const usize);
     let base = 16; // NumberOfHandles(8) + Reserved(8)
-    if base + n * HANDLE_ENTRY_SIZE > buf.len() {
+    // 条目数来自内核返回的缓冲首字段：异常值经 checked_mul/checked_add 防回绕
+    // 越过长度检查（M4 待修清单 1），溢出视同检索失败
+    let Some(total) = n.checked_mul(HANDLE_ENTRY_SIZE).and_then(|x| x.checked_add(base)) else {
+        return None;
+    };
+    if total > buf.len() {
         return None;
     }
     // 2. 找创建进程内同对象句柄（可能多条——任意一条即可）
@@ -124,16 +130,19 @@ unsafe fn probe_with_handle(hproc: HANDLE, pid: u32, file_object: u64) -> Option
         }
     }
     let src = found?;
-    // 3. 复制进本进程 → 4. 查询最终路径（含卷解析，等价 NtQueryInformationFile 链）
+    // 3. 复制进本进程 → 4. 查询最终路径（含卷解析，等价 NtQueryInformationFile 链）。
+    // 显式 FILE_READ_ATTRIBUTES 而非 DUPLICATE_SAME_ACCESS：原句柄继承的访问掩码
+    // 可能不含查询权限，复制等权限会使 GetFinalPathNameByHandleW 失败、探测命中率
+    // 打折（M4 待修清单 6）
     let mut dup = HANDLE(std::ptr::null_mut());
     let st = NtDuplicateObject(
         hproc,
         src,
         GetCurrentProcess(),
         &mut dup,
+        FILE_READ_ATTRIBUTES,
         0,
         0,
-        DUPLICATE_SAME_ACCESS,
     );
     if st < 0 {
         return None;
@@ -153,14 +162,11 @@ unsafe fn final_path(h: HANDLE) -> Option<String> {
         return None;
     }
     let s = String::from_utf16_lossy(&buf[..n as usize]);
-    // "\\?\C:\dir\file" → 盘符正斜杠形式（与 nt_to_win32 管线输出同构）
+    // "\\?\C:\dir\file" → 正斜杠形式（与 nt_to_win32 管线输出同构）；
+    // 非 DOS 路径（如设备映射）原样返回仍可参与规则匹配（两分支处理一致，
+    // 原 if/else 同代码冗余已删——M4 待修清单 7）
     let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
-    if s.len() >= 2 && s.as_bytes()[1] == b':' {
-        Some(s.replace('\\', "/"))
-    } else {
-        // 非 DOS 路径（如设备映射）——原样返回仍可参与规则匹配
-        Some(s.replace('\\', "/"))
-    }
+    Some(s.replace('\\', "/"))
 }
 
 #[cfg(test)]
