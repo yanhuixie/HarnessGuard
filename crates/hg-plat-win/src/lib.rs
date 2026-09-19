@@ -1,14 +1,26 @@
-//! Windows 平台适配（技术设计 §5.1）。
+//! Windows 平台适配（技术设计 §5.1，选型按 M0 spike 报告校准）。
 //!
-//! 计划落地的能力（当前骨架仅描述职责，实现随 M0 spike / M1 端到端进入）：
-//! - 事件源：ferrisetw 消费 ETW Kernel-Process / Kernel-File / Kernel-Network /
-//!   Dns-Client / TaskScheduler-Operational；FileObject→Name 关联缓存；
-//! - 处置：TerminateProcess（校验 start_time）/ SetTcpEntry+SetTcp6Entry（断连接）/
-//!   FwpmFilterAdd0 子层 BLOCK + TTL（封 IP，无需驱动）；
-//! - 宿主：windows-service 服务封装 + 恢复策略；
-//! - 通知会话桥：WTSEnumerateSessions → WTSQueryUserToken → CreateProcessAsUser
-//!   拉起一次性 Toast 代理（技术设计 §8.1）。
+//! 模块：
+//! - [`etw_source`]：ETW 事件源（进程/文件/网络 kernel flags + Dns-Client GUID）
+//! - [`enforcer`]：杀进程 / 断连接 / 临时封 IP
+//! - [`notify`]：OS 通知会话桥（WTS + CreateProcessAsUser 一次性 Toast 代理）
+//! - [`runkey`]：注册表 RunKey 持久化轮询（M1 范围）
+//! - [`bootstrap`]：启动补扫描（Toolhelp32 快照）
+//! - [`ntpath`]：NT 设备路径转盘符路径
+//! - [`peb`]：PEB 命令行读取（内核 ETW 无命令行的降级链）
+
+pub mod bootstrap;
+pub mod enforcer;
+pub mod etw_source;
+pub mod ntpath;
+pub mod notify;
+pub mod peb;
+pub mod runkey;
+
+pub use enforcer::WinEnforcer;
+pub use etw_source::{EtwInner, EtwSource, SourceStats};
+pub use notify::WinNotifier;
 
 pub fn describe() -> &'static str {
-    "hg-plat-win：ETW 事件源 + 杀进程/断连接/WFP 封禁处置（M0 spike → M1 端到端）"
+    "hg-plat-win：ETW 事件源 + 杀进程/断连接/封 IP 处置（M1）"
 }

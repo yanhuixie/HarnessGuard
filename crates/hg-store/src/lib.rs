@@ -5,6 +5,8 @@
 //! 是每日清理任务持有内部标记）、批量 flush（每 200ms 或 500 条）、滚动清理
 //! （30 天 / 500MB 双条件）、查询接口。
 
+pub mod writer;
+
 use anyhow::Result;
 use rusqlite::Connection;
 

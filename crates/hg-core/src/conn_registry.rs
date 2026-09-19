@@ -25,6 +25,7 @@ pub struct TxSample {
     pub pid: Pid,
     pub start_time: StartTime,
     pub harness_root: Option<HarnessId>,
+    pub local: SocketAddr,
     pub remote: SocketAddr,
     /// 该连接累计上行字节。
     pub bytes_out_total: u64,
@@ -66,6 +67,7 @@ impl ConnRegistry {
             pid: e.pid,
             start_time: e.start_time,
             harness_root: e.harness_root.clone(),
+            local: e.local,
             remote: e.remote,
             bytes_out_total: e.bytes_out,
         })

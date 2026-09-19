@@ -1,0 +1,514 @@
+//! ETW 事件源（技术设计 §5.1，选型按 M0 spike 校准）：
+//! - 进程：经典 kernel logger `EVENT_TRACE_FLAG_PROCESS`（start/stop + pid/ppid）
+//!   + `EVENT_TRACE_FLAG_IMAGE_LOAD`（Load 事件携带完整 exe NT 路径）；
+//! - 文件：`EVENT_TRACE_FLAG_FILE_IO(_INIT)`，FileObject→Name 缓存，按 harness 身份早过滤；
+//! - 网络：`EVENT_TRACE_FLAG_NETWORK_TCPIP`（connect/send/disconnect）；
+//! - DNS：Dns-Client 按 GUID 挂独立 UserTrace（by_name 本机 NotFound，M0 轮 1）。
+//! manifest 版 Kernel-Process 在本机不出事件（M0 轮 2–4），弃用。
+
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
+
+use dashmap::DashMap;
+use ferrisetw::parser::{Parser, Pointer};
+use ferrisetw::provider::{kernel_providers, Provider};
+use ferrisetw::schema_locator::SchemaLocator;
+use ferrisetw::trace::{KernelTrace, UserTrace};
+use ferrisetw::EventRecord;
+use hg_core::ProcTable;
+use hg_model::{
+    Access, ConnId, Envelope, Pid, Proto, RawEvent, StartTime, Timestamp,
+};
+use tokio::sync::mpsc;
+
+use crate::ntpath::nt_to_win32;
+use crate::peb;
+
+/// 事件源健康统计（定义于 hg-core::health，供 Web 状态页共享；技术设计 §9.1/§9.2）。
+pub use hg_core::health::SourceStats;
+
+/// 文件 opcode（M0 实测）：64=Create 67=Read 68=Write
+const FILE_OP_CREATE: u8 = 64;
+const FILE_OP_READ: u8 = 67;
+const FILE_OP_WRITE: u8 = 68;
+/// 网络 opcode：16=connect 10=send 18=disconnect（M0 实测分布）
+const NET_OP_CONNECT: u8 = 16;
+const NET_OP_SEND: u8 = 10;
+const NET_OP_DISCONNECT: u8 = 18;
+/// FileObject 缓存上限；超限整表清空重建（廉价批量逐出，M1 简化；LRU 为超支预案）
+const FILEOBJ_CAP: usize = 200_000;
+
+struct PidCtx {
+    ppid: Pid,
+    start_time: StartTime,
+    exe: Option<PathBuf>,
+    exec_sent: bool,
+    /// ProcessStart 事件是否已到（Exec 需 start+exe 双就绪再发：
+    /// ImageLoad 可能先于 ProcessStart 到达，此时 ppid 未知，提前发会丢继承）
+    start_seen: bool,
+    /// 进程 cwd（PEB 读取）：ETW 文件名常为相对形式，需 cwd 拼接（实测教训）
+    cwd: PathBuf,
+}
+
+/// ETW 回调线程与装配方共享的状态。
+pub struct EtwInner {
+    pub procs: Arc<ProcTable>,
+    pub stats: Arc<SourceStats>,
+    tx: OnceLock<mpsc::Sender<Envelope>>,
+    base: Instant,
+    pid_ctx: DashMap<Pid, PidCtx>,
+    fileobj: Mutex<HashMap<u64, String>>,
+    /// Name 事件迟到时的挂起重试表：obj → (pid, opcode)。Name 到达即补发（上限控制内存）。
+    pending_files: Mutex<HashMap<u64, (Pid, u8)>>,
+}
+
+impl EtwInner {
+    pub fn new(procs: Arc<ProcTable>, stats: Arc<SourceStats>) -> Arc<Self> {
+        Arc::new(Self {
+            procs,
+            stats,
+            tx: OnceLock::new(),
+            base: Instant::now(),
+            pid_ctx: DashMap::new(),
+            fileobj: Mutex::new(HashMap::new()),
+            pending_files: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn now(&self) -> Timestamp {
+        Timestamp(self.base.elapsed().as_millis() as u64)
+    }
+
+    /// 通道满即丢弃并计数（技术设计 §9.2：判定永不被审计拖累）。
+    pub fn emit(&self, event: RawEvent) {
+        if let Some(tx) = self.tx.get() {
+            match tx.try_send(Envelope::new(self.now(), event)) {
+                Ok(()) => {
+                    self.stats.events_sent.fetch_add(1, Relaxed);
+                }
+                Err(_) => {
+                    self.stats.events_dropped_full.fetch_add(1, Relaxed);
+                }
+            }
+        }
+    }
+
+    fn parse_u32(p: &Parser, names: &[&str]) -> Option<u32> {
+        for n in names {
+            if let Ok(v) = p.try_parse(n) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    fn on_process(&self, record: &EventRecord, loc: &SchemaLocator) {
+        match record.opcode() {
+            1 => {
+                let Ok(schema) = loc.event_schema(record) else { return };
+                let p = Parser::create(record, &schema);
+                let pid = Self::parse_u32(&p, &["ProcessId", "ProcessID"]).unwrap_or(0);
+                let ppid = Self::parse_u32(&p, &["ParentId", "ParentID"]).unwrap_or(0);
+                if pid == 0 {
+                    return;
+                }
+                // start_time 与 cwd：经典事件不带，立即读 PEB（竞态容忍缺省值）
+                let (_, st, cwd) = peb::query_process(pid);
+                if let Some(mut ctx) = self.pid_ctx.get_mut(&pid) {
+                    ctx.ppid = ppid;
+                    ctx.start_time = StartTime(st);
+                    ctx.start_seen = true;
+                    if ctx.cwd.as_os_str().is_empty() {
+                        ctx.cwd = cwd;
+                    }
+                } else {
+                    self.pid_ctx.insert(
+                        pid,
+                        PidCtx { ppid, start_time: StartTime(st), exe: None, exec_sent: false, start_seen: true, cwd },
+                    );
+                }
+                self.try_emit_exec(pid);
+            }
+            2 => {
+                let Ok(schema) = loc.event_schema(record) else { return };
+                let p = Parser::create(record, &schema);
+                let pid = Self::parse_u32(&p, &["ProcessId", "ProcessID"]).unwrap_or(0);
+                if pid == 0 {
+                    return;
+                }
+                if let Some((_, ctx)) = self.pid_ctx.remove(&pid) {
+                    self.emit(RawEvent::Exit { pid, start_time: ctx.start_time });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// exe 路径就绪（首个 ImageLoad）且 start 已到 → 发 Exec（含 PEB 命令行降级链）。
+    fn try_emit_exec(&self, pid: Pid) {
+        let Some(ctx) = self.pid_ctx.get(&pid) else { return };
+        if ctx.exec_sent || !ctx.start_seen || ctx.exe.is_none() {
+            return;
+        }
+        let exe = ctx.exe.clone().unwrap();
+        let ppid = ctx.ppid;
+        let st = ctx.start_time;
+        let cwd = ctx.cwd.clone();
+        drop(ctx);
+        let (cmdline, _, _) = peb::query_process(pid);
+        if let Some(mut ctx) = self.pid_ctx.get_mut(&pid) {
+            ctx.exec_sent = true;
+        }
+        self.emit(RawEvent::Exec {
+            pid,
+            ppid,
+            start_time: st,
+            exe,
+            cmdline,
+            cwd,
+        });
+    }
+
+    fn on_image_load(&self, record: &EventRecord, loc: &SchemaLocator) {
+        if record.opcode() != 10 {
+            return;
+        }
+        let Ok(schema) = loc.event_schema(record) else { return };
+        let p = Parser::create(record, &schema);
+        let pid = Self::parse_u32(&p, &["ProcessId", "ProcessID"]).unwrap_or(0);
+        let file: Option<String> = p.try_parse::<String>("FileName").ok();
+        if pid == 0 {
+            return;
+        }
+        let Some(file) = file else { return };
+        if let Some(mut ctx) = self.pid_ctx.get_mut(&pid) {
+            if ctx.exe.is_none() {
+                ctx.exe = Some(nt_to_win32(&file));
+            }
+        } else {
+            // start 事件尚未到达（或本进程早于服务启动）：先暂存，start 到达再发
+            let (_, _, cwd) = peb::query_process(pid);
+            self.pid_ctx.insert(
+                pid,
+                PidCtx { ppid: 0, start_time: StartTime(peb::process_start_time(pid)), exe: Some(nt_to_win32(&file)), exec_sent: false, start_seen: false, cwd },
+            );
+            return;
+        }
+        self.try_emit_exec(pid);
+    }
+
+    fn on_file(&self, record: &EventRecord, loc: &SchemaLocator) {
+        self.stats.kernel_events_seen.fetch_add(1, Relaxed);
+        let op = record.opcode();
+        let Ok(schema) = loc.event_schema(record) else { return };
+        let p = Parser::create(record, &schema);
+
+        // Name 事件：建缓存（与 opcode 无关，按字段成功与否识别）
+        let name: Option<String> = p.try_parse::<String>("FileName").ok().filter(|s| !s.is_empty());
+        let obj: Option<u64> = p
+            .try_parse::<Pointer>("FileObject")
+            .ok()
+            .map(|ptr| *ptr as u64);
+        if let (Some(n), Some(fo)) = (&name, obj) {
+            let mut g = self.fileobj.lock().unwrap();
+            if g.len() >= FILEOBJ_CAP {
+                g.clear();
+            }
+            g.insert(fo, n.clone());
+            self.stats.file_cache_entries.store(g.len() as u64, Relaxed);
+            drop(g);
+            // Name 迟到重试：此前 unknown 的同 FileObject 事件现在补发
+            if let Some((pid2, op2)) = self.pending_files.lock().unwrap().remove(&fo) {
+                self.emit_file_event(pid2, op2, n);
+            }
+        }
+
+        if !matches!(op, FILE_OP_CREATE | FILE_OP_READ | FILE_OP_WRITE) {
+            return;
+        }
+        // 经典内核 FileIo 事件的 PID 在事件头（schema 无此字段）——实测教训
+        let pid = {
+            let hp = record.process_id();
+            if hp != 0 { hp } else { Self::parse_u32(&p, &["ProcessId", "ProcessID"]).unwrap_or(0) }
+        };
+        // 早过滤：非监控树进程即读即弃（M0 实测 26k/s，此为硬要求）
+        let Some(id) = self.procs.get(&pid) else { return };
+        if id.harness_root.is_none() {
+            return;
+        }
+        let st = id.start_time;
+        // 解析路径：事件自带 FileName 或 FileObject→Name 缓存
+        let path = match name {
+            Some(n) => {
+                self.stats.file_resolved.fetch_add(1, Relaxed);
+                Some(n)
+            }
+            None => match obj.and_then(|fo| self.fileobj.lock().unwrap().get(&fo).cloned()) {
+                Some(n) => {
+                    self.stats.file_resolved.fetch_add(1, Relaxed);
+                    Some(n)
+                }
+                None => {
+                    self.stats.file_unknown.fetch_add(1, Relaxed);
+                    tracing::debug!("[file-unknown] pid={pid} op={op} obj={:x}", obj.unwrap_or(0));
+                    None
+                }
+            },
+        };
+        match path {
+            Some(path) => self.emit_file_event(pid, op, &path),
+            None => {
+                // Name 未到：挂起等 Name 事件补发（上限 4096，满则整表清空防涨内存）
+                let mut pend = self.pending_files.lock().unwrap();
+                if pend.len() >= 16384 {
+                    pend.clear();
+                }
+                pend.insert(obj.unwrap_or(0), (pid, op));
+            }
+        }
+        let _ = st;
+    }
+
+    fn emit_file_event(&self, pid: Pid, op: u8, raw: &str) {
+        let Some(id) = self.procs.get(&pid) else { return };
+        let path = self.resolve_file_name(pid, raw);
+        tracing::debug!("[file] pid={pid} op={op} root={:?} raw={raw:?} -> {}", id.harness_root.as_ref().map(|r| r.0.clone()), path.display());
+        let st = id.start_time;
+        match op {
+            FILE_OP_CREATE => self.emit(RawEvent::FileCreate { pid, start_time: st, path }),
+            FILE_OP_READ => self.emit(RawEvent::FileOpen { pid, start_time: st, path, access: Access::Read }),
+            FILE_OP_WRITE => self.emit(RawEvent::FileOpen { pid, start_time: st, path, access: Access::Write }),
+            _ => {}
+        }
+    }
+
+    fn on_net(&self, record: &EventRecord, loc: &SchemaLocator) {
+        self.stats.kernel_events_seen.fetch_add(1, Relaxed);
+        let op = record.opcode();
+        if !matches!(op, NET_OP_CONNECT | NET_OP_SEND | NET_OP_DISCONNECT) {
+            return;
+        }
+        let Ok(schema) = loc.event_schema(record) else { return };
+        let p = Parser::create(record, &schema);
+        let pid = {
+            let hp = record.process_id();
+            if hp != 0 { hp } else { Self::parse_u32(&p, &["PID", "ProcessId"]).unwrap_or(0) }
+        };
+        let saddr: IpAddr = p.try_parse("saddr").unwrap_or(IpAddr::from([0, 0, 0, 0]));
+        let daddr: IpAddr = p.try_parse("daddr").unwrap_or(IpAddr::from([0, 0, 0, 0]));
+        // 端口在事件中为网络序存储，按原生读出后需换序
+        let sport: u16 = p.try_parse::<u16>("sport").map(u16::from_be).unwrap_or(0);
+        let dport: u16 = p.try_parse::<u16>("dport").map(u16::from_be).unwrap_or(0);
+        let local = SocketAddr::new(saddr, sport);
+        let remote = SocketAddr::new(daddr, dport);
+        let conn_id = ConnId(Self::conn_hash(pid, local, remote));
+        tracing::debug!("[net] op={op} pid={pid} {local} -> {remote}");
+
+        match op {
+            NET_OP_CONNECT => {
+                // 归因在引擎 ConnRegistry（此处只透传四元组）
+                self.emit(RawEvent::ConnOpen {
+                    pid,
+                    start_time: StartTime(0),
+                    conn_id,
+                    proto: Proto::Tcp,
+                    local,
+                    remote,
+                });
+            }
+            NET_OP_SEND => {
+                let size = Self::parse_u32(&p, &["size", "Size"]).unwrap_or(0) as u64;
+                self.emit(RawEvent::ConnTx { conn_id, bytes_out_delta: size });
+            }
+            NET_OP_DISCONNECT => {
+                self.emit(RawEvent::ConnClose { conn_id });
+            }
+            _ => {}
+        }
+    }
+
+    /// ETW FileName 可能是：NT 设备路径 / 盘符绝对路径 / 进程相对路径（实测：
+    /// cmd/tar 的相对打开只给相对名）。相对名按进程 cwd 拼接后做词法归一。
+    fn resolve_file_name(&self, pid: Pid, raw: &str) -> PathBuf {
+        let norm = raw.replace(chr_backslash(), "/");
+        if norm.starts_with("/Device/") || norm.starts_with("/??/") || (norm.len() >= 2 && norm.as_bytes()[1] == b':') {
+            return nt_to_win32(raw);
+        }
+        // 相对路径：cwd 拼接
+        let cwd = self.pid_ctx.get(&pid).map(|c| c.cwd.clone()).unwrap_or_default();
+        if cwd.as_os_str().is_empty() {
+            return PathBuf::from(raw);
+        }
+        let base = cwd.display().to_string().replace(chr_backslash(), "/");
+        let joined = format!("{}/{}", base.trim_end_matches('/'), norm);
+        lexical_normalize(&joined)
+    }
+
+    fn conn_hash(pid: Pid, local: SocketAddr, remote: SocketAddr) -> u64 {
+        // fnv-1a over (pid, quad)
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in pid.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        for sock in [local, remote] {
+            let (ip, port) = (sock.ip(), sock.port());
+            let ipb: Vec<u8> = match ip {
+                IpAddr::V4(v4) => v4.octets().to_vec(),
+                IpAddr::V6(v6) => v6.octets().to_vec(),
+            };
+            for b in ipb {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            for b in port.to_le_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        }
+        h
+    }
+
+    fn on_dns(&self, record: &EventRecord, loc: &SchemaLocator) {
+        self.stats.dns_events_seen.fetch_add(1, Relaxed);
+        // 3008 = 查询完成（QueryName + QueryResults）
+        if record.event_id() != 3008 {
+            return;
+        }
+        let Ok(schema) = loc.event_schema(record) else { return };
+        let p = Parser::create(record, &schema);
+        let qname: Option<String> = p.try_parse::<String>("QueryName").ok().filter(|s| !s.is_empty());
+        let Some(qname) = qname else { return };
+        let pid = Self::parse_u32(&p, &["ProcessId", "PID"]).unwrap_or(0);
+        let results: Option<String> = p.try_parse("QueryResults").ok();
+        let answers = parse_dns_answers(results.as_deref());
+        self.emit(RawEvent::DnsQuery { pid, qname, answers });
+    }
+}
+
+/// QueryResults 形如 `type: 5 name; type: 1 1.2.3.4;`——提取其中的 IP。
+fn chr_backslash() -> char {
+    char::from_u32(0x5C).unwrap()
+}
+
+fn lexical_normalize(p: &str) -> PathBuf {
+    let mut out: Vec<&str> = Vec::new();
+    for c in p.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    PathBuf::from(out.join("/"))
+}
+
+fn parse_dns_answers(results: Option<&str>) -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    if let Some(s) = results {
+        for part in s.split(';') {
+            let token = part.trim().rsplit(' ').next().unwrap_or("");
+            if let Ok(ip) = token.parse::<IpAddr>() {
+                out.push(ip);
+            }
+        }
+    }
+    out
+}
+
+/// Windows ETW 事件源（实现 hg-platform::EventSource）。
+pub struct EtwSource {
+    inner: Arc<EtwInner>,
+}
+
+impl EtwSource {
+    pub fn new(inner: Arc<EtwInner>) -> Self {
+        Self { inner }
+    }
+}
+
+impl hg_platform::EventSource for EtwSource {
+    fn name(&self) -> &'static str {
+        "etw-win"
+    }
+
+    fn run(self, tx: mpsc::Sender<Envelope>) -> std::convert::Infallible {
+        let _ = self.inner.tx.set(tx.clone());
+        let inner = self.inner;
+
+        let process = Provider::kernel(&kernel_providers::PROCESS_PROVIDER)
+            .add_callback({
+                let inner = inner.clone();
+                move |r, l| inner.on_process(r, l)
+            })
+            .build();
+        let imgload = Provider::kernel(&kernel_providers::IMAGE_LOAD_PROVIDER)
+            .add_callback({
+                let inner = inner.clone();
+                move |r, l| inner.on_image_load(r, l)
+            })
+            .build();
+        let file = Provider::kernel(&kernel_providers::FILE_IO_PROVIDER)
+            .add_callback({
+                let inner = inner.clone();
+                move |r, l| inner.on_file(r, l)
+            })
+            .build();
+        let file_init = Provider::kernel(&kernel_providers::FILE_INIT_IO_PROVIDER)
+            .add_callback({
+                let inner = inner.clone();
+                move |r, l| inner.on_file(r, l)
+            })
+            .build();
+        let tcpip = Provider::kernel(&kernel_providers::TCP_IP_PROVIDER)
+            .add_callback({
+                let inner = inner.clone();
+                move |r, l| inner.on_net(r, l)
+            })
+            .build();
+
+        // 清理上次异常退出残留的同名会话（强杀不会停 ETW session；完整停机序列 §9.3 在 M4）
+        let _ = ferrisetw::trace::stop_trace_by_name("HarnessGuard");
+        let _ = ferrisetw::trace::stop_trace_by_name("HarnessGuardDns");
+
+        let kernel_trace = KernelTrace::new()
+            .named("HarnessGuard".into())
+            .enable(process)
+            .enable(imgload)
+            .enable(file)
+            .enable(file_init)
+            .enable(tcpip)
+            .start_and_process();
+        match kernel_trace {
+            Ok(_) => tracing::info!("ETW KernelTrace 已启动"),
+            Err(e) => tracing::error!("ETW KernelTrace 启动失败（需管理员）: {e:?}"),
+        }
+
+        // Dns-Client：by GUID 挂独立 UserTrace（M0 轮 1/2 校准）
+        let dns = Provider::by_guid("1c95126e-7eea-49a9-a3fe-a378b03ddb4d")
+            .add_callback({
+                let inner = inner.clone();
+                move |r, l| inner.on_dns(r, l)
+            })
+            .build();
+        let dns_trace = UserTrace::new()
+            .named("HarnessGuardDns".into())
+            .enable(dns)
+            .start_and_process();
+        match dns_trace {
+            Ok(_) => tracing::info!("ETW UserTrace(Dns-Client) 已启动"),
+            Err(e) => tracing::error!("ETW UserTrace(Dns-Client) 启动失败: {e:?}"),
+        }
+
+        // 事件源线程常驻（停机序列在进程退出时由 OS 回收 ETW session；M4 补优雅停机）
+        loop {
+            std::thread::park();
+        }
+    }
+}

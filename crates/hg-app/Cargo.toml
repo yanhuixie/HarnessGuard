@@ -15,7 +15,15 @@ hg-model = { workspace = true }
 hg-web = { workspace = true }
 hg-store = { workspace = true }
 hg-notify = { workspace = true }
+hg-platform = { workspace = true }
 hg-plat-win = { workspace = true }
 hg-plat-linux = { workspace = true }
 hg-plat-macos = { workspace = true }
 anyhow = { workspace = true }
+arc-swap = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rand = { workspace = true }
+axum = { workspace = true }

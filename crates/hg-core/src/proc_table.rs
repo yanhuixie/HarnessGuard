@@ -2,7 +2,7 @@
 
 use std::collections::hash_map::RandomState;
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use dashmap::DashMap;
 use hg_model::{HarnessId, Identity, Pid, StartTime};
@@ -74,6 +74,60 @@ impl ProcTable {
     /// 宁标勿漏；中间父链无法精确重建）。
     pub fn bootstrap_insert(&self, id: Identity) {
         self.inner.insert(id.pid, id);
+    }
+
+    /// 启动补扫描（技术设计 §3.2）：全量进程快照按特征库补建根身份，子进程继承
+    /// 传播（迭代至收敛，防快照顺序影响；未观察到的中间父链按 exe 特征直接判定，
+    /// 宁标勿漏）。
+    pub fn apply_bootstrap(
+        &self,
+        rules: &RulesSnapshot,
+        entries: Vec<(Pid, Pid, PathBuf, StartTime)>,
+    ) -> usize {
+        use std::collections::HashMap;
+        let mut roots: HashMap<Pid, Option<HarnessId>> =
+            entries.iter().map(|(pid, _, _, _)| (*pid, None)).collect();
+        let by_pid: HashMap<Pid, (Pid, PathBuf, StartTime)> = entries
+            .iter()
+            .map(|(pid, ppid, exe, st)| (*pid, (*ppid, exe.clone(), *st)))
+            .collect();
+        for _round in 0..8 {
+            let mut changed = false;
+            for (pid, (ppid, exe, _)) in &by_pid {
+                if roots.get(pid).is_some_and(|r| r.is_some()) {
+                    continue;
+                }
+                let own = rules.match_harness(exe).map(|name| HarnessId(name.to_string()));
+                let inherited = own.is_none().then(|| roots.get(ppid)).flatten().cloned().flatten();
+                let next = own.or(inherited);
+                if next.is_some() {
+                    roots.insert(*pid, next);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut inserted = 0usize;
+        for (pid, (ppid, exe, st)) in &by_pid {
+            let root = roots.get(pid).cloned().flatten();
+            if root.is_none() {
+                continue; // 非监控进程不入表（早过滤依赖表内查询）
+            }
+            let tool_exempt = rules.match_tool_exempt(exe).map(|s| s.to_string());
+            self.bootstrap_insert(Identity {
+                pid: *pid,
+                start_time: *st,
+                exe: exe.clone(),
+                cmdline: vec![],
+                harness_root: root,
+                tool_exempt,
+            });
+            inserted += 1;
+            let _ = ppid;
+        }
+        inserted
     }
 
     /// 身份表快照（UI /api/processes 用）。

@@ -13,24 +13,26 @@ use std::net::IpAddr;
 use std::path::Path;
 
 use hg_model::{Access, Action, Evidence, Identity, RuleId, Verdict};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// 文件类规则动作（需求 §3.1：默认阻断，用户可改为审计）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileAction {
     Block,
     Audit,
 }
 
 /// harness 特征库条目（需求 §3.4：路径 glob；哈希特征 M1 扩展）。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HarnessFeature {
     pub name: String,
+    /// 设计 §6 TOML 键名为 `paths`，此处字段名 path_globs，serde alias 双兼容
+    #[serde(alias = "paths")]
     pub path_globs: Vec<String>,
 }
 
 /// 身份矩阵豁免条目（需求 §3.3：工具 × 路径模式）。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolExemptConf {
     pub exe: String,
     pub allow_paths: Vec<String>,
@@ -38,7 +40,7 @@ pub struct ToolExemptConf {
 
 /// 规则配置的内存形态（技术设计 §6 的默认值即 [`RulesConfig::default`]；
 /// TOML 解析与"文件 + Web UI 双通道"写回在 M1 接入）。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RulesConfig {
     pub upload_threshold_mb: u64,
     pub sensitive_escalation_divisor: u64,
@@ -354,7 +356,7 @@ fn join_argv(argv: &[OsString]) -> Option<String> {
 }
 
 /// 路径任一组件为 ".git"（即 .git 目录下文件；含嵌套如 .git/objects/xx）。
-fn under_git_dir(path: &Path) -> bool {
+pub fn under_git_dir(path: &Path) -> bool {
     path.components()
         .any(|c| c.as_os_str() == std::ffi::OsStr::new(".git"))
 }

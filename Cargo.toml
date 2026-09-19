@@ -39,9 +39,29 @@ arc-swap = "1"
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 globset = "0.4"
 rusqlite = { version = "0.37", features = ["bundled"] }
 axum = "0.8"
+toml = "0.8"
+rust-embed = { version = "8", features = ["compression"] }
+rand = "0.8"
+ferrisetw = "1"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_System_RemoteDesktop",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Environment",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Wdk_System_Threading",
+    "Win32_System_Kernel",
+] }
 
 [profile.release]
 lto = "thin"
