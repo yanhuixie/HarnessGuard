@@ -6,3 +6,8 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+# M0 spike（examples/etw_spike.rs）：ETW 消费 + RSS 自测
+ferrisetw = "1"
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_ProcessStatus"] }
