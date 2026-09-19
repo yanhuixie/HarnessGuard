@@ -105,7 +105,8 @@ pub(crate) fn run_server(
         .expect("spawn ETW");
     std::thread::sleep(Duration::from_millis(800)); // 等 ETW 线程注入 tx 后再起轮询
     hg_plat_win::runkey::spawn_runkey_poll(inner.clone());
-    // 场景 C 字节计数替代路径（M1 缺口：内核 send 事件采样态，阈值不可达）：
+    // 场景 C 字节计数补充路径（M4 复验定案：ETW send 事件为主路径；本机 estats
+    // Set rc=50 不可用——轮询线程逐连接降级跳过，不影响主路径）：
     // estats 轮询按 monitored_quads 差分 DataBytesOut 补喂 ConnTx
     hg_plat_win::estats::spawn_estats_poll(inner);
 
