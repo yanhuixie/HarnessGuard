@@ -1,0 +1,10 @@
+[package]
+name = "hg-store"
+description = "HarnessGuard SQLite 存储层：schema、追加写、滚动清理、查询（技术设计 §4）"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+rusqlite = { workspace = true }

@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hg-model",
+    "crates/hg-core",
+    "crates/hg-platform",
+    "crates/hg-plat-win",
+    "crates/hg-plat-linux",
+    "crates/hg-plat-macos",
+    "crates/hg-store",
+    "crates/hg-notify",
+    "crates/hg-web",
+    "crates/hg-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# 依赖方向（技术设计 §2，无环）：
+# hg-app → {hg-plat-*, hg-web, hg-store, hg-notify} → hg-core → hg-model ← hg-platform
+[workspace.dependencies]
+hg-model = { path = "crates/hg-model" }
+hg-core = { path = "crates/hg-core" }
+hg-platform = { path = "crates/hg-platform" }
+hg-plat-win = { path = "crates/hg-plat-win" }
+hg-plat-linux = { path = "crates/hg-plat-linux" }
+hg-plat-macos = { path = "crates/hg-plat-macos" }
+hg-store = { path = "crates/hg-store" }
+hg-notify = { path = "crates/hg-notify" }
+hg-web = { path = "crates/hg-web" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal"] }
+dashmap = "6"
+arc-swap = "1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+globset = "0.4"
+rusqlite = { version = "0.37", features = ["bundled"] }
+axum = "0.8"
+
+[profile.release]
+lto = "thin"
+strip = true

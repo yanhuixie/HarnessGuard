@@ -1,0 +1,11 @@
+[package]
+name = "hg-plat-linux"
+description = "HarnessGuard Linux 适配：eBPF(aya) 进程事件、fanotify 同步阻断、nft 处置（技术设计 §5.2）"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Linux 专属依赖（aya、nftables 等）在代码落地时以 workspace 级
+# [target.'cfg(target_os = "linux")'.dependencies] 组织，确保 Windows 上
+# cargo check --workspace 全绿（技术任务硬约束 3）。
+[dependencies]

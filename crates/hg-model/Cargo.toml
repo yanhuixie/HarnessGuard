@@ -1,0 +1,10 @@
+[package]
+name = "hg-model"
+description = "HarnessGuard 领域模型：统一事件、进程身份、判定（技术设计 §3）"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

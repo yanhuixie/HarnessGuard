@@ -1,0 +1,8 @@
+[package]
+name = "hg-notify"
+description = "HarnessGuard 通知封装 + 三平台会话桥（技术设计 §8.1）"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]

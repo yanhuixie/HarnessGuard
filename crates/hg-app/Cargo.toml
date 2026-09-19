@@ -1,0 +1,21 @@
+[package]
+name = "hg-app"
+description = "HarnessGuard 服务入口：配置加载、平台选择、组装装配（技术设计 §2）"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "harnessguard"
+path = "src/main.rs"
+
+[dependencies]
+hg-core = { workspace = true }
+hg-model = { workspace = true }
+hg-web = { workspace = true }
+hg-store = { workspace = true }
+hg-notify = { workspace = true }
+hg-plat-win = { workspace = true }
+hg-plat-linux = { workspace = true }
+hg-plat-macos = { workspace = true }
+anyhow = { workspace = true }
