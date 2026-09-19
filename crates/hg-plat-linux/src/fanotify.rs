@@ -11,8 +11,6 @@
 //! 停机：drain 未决权限事件统一 FAN_ALLOW（§9.3，宁放勿卡）。
 
 use std::io::Read;
-use std::os::unix::io::AsRawFd;
-use std::os::unix::net as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
@@ -26,8 +24,8 @@ use arc_swap::ArcSwap;
 
 // libc 常量（glibc 头文件值；libc crate 未全量导出 fanotify 常量）
 const FAN_CLASS_CONTENT: libc::c_int = 0x0000_0004;
+// 阻塞读（评审修正：非阻塞+2ms 轮询与同步判定微秒预算矛盾；停机经 close(fd) 解除阻塞）
 const FAN_CLOEXEC: libc::c_int = 0x0000_0001;
-const FAN_NONBLOCK: libc::c_int = 0x0000_4000;
 const FAN_MARK_ADD: libc::c_uint = 0x0000_0001;
 const FAN_MARK_FILESYSTEM: libc::c_uint = 0x0000_0100;
 const FAN_OPEN_PERM: u64 = 0x0001_0000;
@@ -80,7 +78,7 @@ impl FanotifySource {
         rules: Arc<ArcSwap<RulesSnapshot>>,
         tx: mpsc::Sender<Envelope>,
     ) -> anyhow::Result<Self> {
-        let fd = unsafe { libc::fanotify_init(FAN_CLASS_CONTENT | FAN_CLOEXEC | FAN_NONBLOCK, O_RDONLY_LARGEFILE) };
+        let fd = unsafe { libc::fanotify_init(FAN_CLASS_CONTENT | FAN_CLOEXEC, O_RDONLY_LARGEFILE) };
         if fd < 0 {
             return Err(anyhow::anyhow!("fanotify_init 失败 errno={}（需 root）", errno()));
         }
@@ -118,12 +116,13 @@ impl FanotifySource {
             let n = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n < 0 {
                 let e = errno();
-                if e == libc::EAGAIN {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                    continue;
-                }
                 if e == libc::EINTR {
                     continue;
+                }
+                // 停机 close(fd) 后返回 EBADF：检查停止标志退出
+                if stop.load(Relaxed) {
+                    self.allow_all_pending();
+                    return;
                 }
                 tracing::error!("fanotify read errno={e}，事件源失效（大声告警，§9.1）");
                 // 失效重建由健康监控负责（M2 接入指数退避重建）

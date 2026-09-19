@@ -210,6 +210,16 @@ impl Engine {
             }
             RawEvent::DnsQuery { pid, qname, answers } => {
                 let ts = self.utc(env.ts);
+                // 容量护栏（评审 #4：长期运行内存上限，粗粒度整表重建）
+                if self.dns.len() > 65536 {
+                    self.dns.clear();
+                }
+                if self.root_bytes.len() > 16384 {
+                    self.root_bytes.clear();
+                }
+                if self.handled_conns.len() > 65536 {
+                    self.handled_conns.clear();
+                }
                 for ip in answers {
                     self.dns.insert(ip, qname.clone());
                     self.send(EngineOutput::StoreDns {

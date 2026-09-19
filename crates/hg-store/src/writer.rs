@@ -37,7 +37,7 @@ CREATE TRIGGER IF NOT EXISTS tr_conns_delete AFTER DELETE ON conns BEGIN
 const DROP_TRIGGERS_SQL: &str = "DROP TRIGGER IF EXISTS tr_events_append; DROP TRIGGER IF EXISTS tr_events_delete; DROP TRIGGER IF EXISTS tr_verdicts_append; DROP TRIGGER IF EXISTS tr_verdicts_delete; DROP TRIGGER IF EXISTS tr_conns_append; DROP TRIGGER IF EXISTS tr_conns_delete;";
 
 /// 启动写入线程（独占一个写连接；WAL 下读连接并发不受影响）。
-pub fn spawn_writer(db_path: &str, rx: Receiver<StoreOp>) {
+pub fn spawn_writer(db_path: &str, rx: Receiver<StoreOp>, retention_days: u32) {
     let path = db_path.to_string();
     std::thread::Builder::new()
         .name("hg-store-writer".into())
@@ -77,7 +77,7 @@ pub fn spawn_writer(db_path: &str, rx: Receiver<StoreOp>) {
                     last_flush = Instant::now();
                 }
                 if last_cleanup.elapsed() >= Duration::from_secs(3600 * 24) {
-                    cleanup(&conn, 30);
+                    cleanup(&conn, retention_days as u64);
                     last_cleanup = Instant::now();
                 }
             }

@@ -248,7 +248,6 @@ impl EtwInner {
         if id.harness_root.is_none() {
             return;
         }
-        let st = id.start_time;
         // 解析路径：事件自带 FileName 或 FileObject→Name 缓存
         let path = match name {
             Some(n) => {
@@ -270,7 +269,7 @@ impl EtwInner {
         match path {
             Some(path) => self.emit_file_event(pid, op, &path),
             None => {
-                // Name 未到：挂起等 Name 事件补发（上限 4096，满则整表清空防涨内存）
+                // Name 未到：挂起等 Name 事件补发（上限 16384，满则整表清空防涨内存）
                 let mut pend = self.pending_files.lock().unwrap();
                 if pend.len() >= 16384 {
                     pend.clear();
@@ -278,7 +277,6 @@ impl EtwInner {
                 pend.insert(obj.unwrap_or(0), (pid, op));
             }
         }
-        let _ = st;
     }
 
     fn emit_file_event(&self, pid: Pid, op: u8, raw: &str) {
@@ -338,7 +336,7 @@ impl EtwInner {
             NET_OP_SEND => {
                 let size = Self::parse_u32(&p, &["size", "Size"]).unwrap_or(0) as u64;
                 // connect 事件缺失时的补登记：send 携带有效 pid 且属监控树 → 先发 ConnOpen
-                if pid != u32::MAX && self.emitted_conns.insert(conn_id.0) {
+                if pid != u32::MAX && self.emitted_conns_guard() && self.emitted_conns.insert(conn_id.0) {
                     if self.procs.get(&pid).is_some_and(|id| id.harness_root.is_some()) {
                         let st = self.procs.get(&pid).map(|i| i.start_time).unwrap_or(StartTime(0));
                         self.emit(RawEvent::ConnOpen {
@@ -358,6 +356,13 @@ impl EtwInner {
             }
             _ => {}
         }
+    }
+
+    fn emitted_conns_guard(&self) -> bool {
+        if self.emitted_conns.len() > 262_144 {
+            self.emitted_conns.clear();
+        }
+        true
     }
 
     fn lookup_tcp_owner(&self, local: SocketAddr, remote: SocketAddr, refresh: bool) -> Option<Pid> {

@@ -535,6 +535,15 @@ dependencies = [
 [[package]]
 name = "hg-plat-macos"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hg-core",
+ "hg-model",
+ "hg-platform",
+ "libc",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "hg-plat-win"

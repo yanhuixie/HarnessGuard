@@ -44,7 +44,11 @@ impl Enforcer for WinEnforcer {
             let ok = GetProcessTimes(h, &mut create, &mut exit_t, &mut k, &mut u);
             let create_u64 =
                 ((create.dwHighDateTime as u64) << 32) | create.dwLowDateTime as u64;
-            if ok.is_ok() && start_time.0 != 0 && create_u64 != start_time.0 {
+            if !ok.is_ok() {
+                let _ = CloseHandle(h);
+                anyhow::bail!("pid {pid} GetProcessTimes 失败，拒绝无校验处置");
+            }
+            if start_time.0 != 0 && create_u64 != start_time.0 {
                 let _ = CloseHandle(h);
                 anyhow::bail!("pid {pid} 已被复用（start_time 不匹配），跳过处置");
             }
@@ -61,12 +65,15 @@ impl Enforcer for WinEnforcer {
         use windows::Win32::NetworkManagement::IpHelper::{
             SetTcpEntry, MIB_TCPROW_LH, MIB_TCPROW_LH_0,
         };
+        // MIB 约定：地址与端口均为网络字节序，端口占 DWORD 低 16 位
+        // （评审修正：原 (port as u32).swap_bytes() 把端口放进了高 16 位）
+        let net_port = |p: u16| -> u32 { (((p & 0xff) as u32) << 8) | ((p >> 8) as u32) };
         let row = MIB_TCPROW_LH {
             Anonymous: MIB_TCPROW_LH_0 { dwState: MIB_TCP_STATE_DELETE_TCB },
             dwLocalAddr: u32::from(l).swap_bytes(),
-            dwLocalPort: (quad.local.port() as u32).swap_bytes(),
+            dwLocalPort: net_port(quad.local.port()),
             dwRemoteAddr: u32::from(r).swap_bytes(),
-            dwRemotePort: (quad.remote.port() as u32).swap_bytes(),
+            dwRemotePort: net_port(quad.remote.port()),
         };
         let rc = unsafe { SetTcpEntry(&row) };
         if rc == 0 {

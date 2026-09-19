@@ -54,7 +54,7 @@ fn main() -> anyhow::Result<()> {
     let (etw_tx, etw_rx) = tokio::sync::mpsc::channel::<Envelope>(65536);
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<EngineOutput>(4096);
     let (store_tx, store_rx) = std::sync::mpsc::channel::<StoreOp>();
-    hg_store::writer::spawn_writer(&db_path, store_rx);
+    hg_store::writer::spawn_writer(&db_path, store_rx, cfg.storage.retention_days);
 
     // 平台事件源（Windows ETW）+ 持久化轮询
     let inner = hg_plat_win::EtwInner::new(procs.clone(), src_stats.clone());

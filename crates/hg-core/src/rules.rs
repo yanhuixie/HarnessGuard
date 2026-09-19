@@ -357,8 +357,11 @@ fn join_argv(argv: &[OsString]) -> Option<String> {
 
 /// 路径任一组件为 ".git"（即 .git 目录下文件；含嵌套如 .git/objects/xx）。
 pub fn under_git_dir(path: &Path) -> bool {
-    path.components()
-        .any(|c| c.as_os_str() == std::ffi::OsStr::new(".git"))
+    path.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case(".git"))
+    })
 }
 
 fn verdict(rule_id: &'static str, action: Action, summary: impl Into<String>) -> Verdict {
