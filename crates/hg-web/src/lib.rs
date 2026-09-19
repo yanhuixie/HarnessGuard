@@ -175,7 +175,9 @@ async fn verdicts(
     Query(p): Query<LimitQ>,
 ) -> ApiResult {
     let limit = p.limit.unwrap_or(50).min(500) as i64;
-    let conn = hg_store::open(&st.db_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))).unwrap_or_else(|_| unreachable!());
+    // db 打开失败按 500 返回（原 unwrap_or_else(unreachable!) 在库缺失/损坏时
+    // 直接 panic 整个 worker——M4 待修清单 12，三处同修）
+    let conn = hg_store::open(&st.db_path).map_err(db_err)?;
     let mut stmt = conn
         .prepare("SELECT id, ts, rule_id, action, pid, exe, evidence_json, notified FROM verdicts ORDER BY id DESC LIMIT ?1")
         .map_err(db_err)?;
@@ -200,7 +202,7 @@ async fn events(
     Query(p): Query<LimitQ>,
 ) -> ApiResult {
     let limit = p.limit.unwrap_or(50).min(500) as i64;
-    let conn = hg_store::open(&st.db_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))).unwrap_or_else(|_| unreachable!());
+    let conn = hg_store::open(&st.db_path).map_err(db_err)?;
     let mut stmt = conn
         .prepare("SELECT id, ts, pid, kind, detail_json FROM events ORDER BY id DESC LIMIT ?1")
         .map_err(db_err)?;
@@ -237,7 +239,7 @@ async fn processes(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
 }
 
 async fn wl_list(State(st): State<Arc<AppState>>) -> ApiResult {
-    let conn = hg_store::open(&st.db_path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))).unwrap_or_else(|_| unreachable!());
+    let conn = hg_store::open(&st.db_path).map_err(db_err)?;
     let mut stmt = conn
         .prepare("SELECT id, kind, value, note, created_ts FROM whitelist ORDER BY id DESC")
         .map_err(db_err)?;
@@ -386,6 +388,10 @@ mod tests {
 
     /// 构造可服务的最小状态（stream/status 路径不触库，db_path 占位即可）。
     fn test_state() -> Arc<AppState> {
+        test_state_with_db("unused.db")
+    }
+
+    fn test_state_with_db(db_path: &str) -> Arc<AppState> {
         let (sse_tx, _keep) = tokio::sync::broadcast::channel(64);
         let cfg = FileConfig::default();
         let snap = RulesSnapshot::compile(&cfg.to_rules_config(vec![])).expect("编译规则");
@@ -395,7 +401,7 @@ mod tests {
             rules: Arc::new(ArcSwap::from_pointee(snap)),
             config: Arc::new(RwLock::new(cfg)),
             config_path: "unused.toml".into(),
-            db_path: "unused.db".into(),
+            db_path: db_path.into(),
             procs: Arc::new(ProcTable::new()),
             conns: Arc::new(ConnRegistry::new()),
             src_stats: Arc::new(SourceStats::default()),
@@ -403,6 +409,18 @@ mod tests {
             sse: sse_tx,
             started: Instant::now(),
         })
+    }
+
+    /// db 打开失败返回 500 而非 panic（M4 待修清单 12 回归锚定：
+    /// 目录作库路径使打开必失败，三端点均应 500）。
+    #[tokio::test]
+    async fn db打开失败返回500而非panic() {
+        let dir = std::env::temp_dir().join("hg-web-db-500-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = test_state_with_db(&dir.display().to_string());
+        assert_eq!(call(&st, "/api/verdicts", true).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(call(&st, "/api/events", true).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(call(&st, "/api/whitelist", true).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     async fn call(state: &Arc<AppState>, uri: &str, bearer: bool) -> axum::response::Response {
