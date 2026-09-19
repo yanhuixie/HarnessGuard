@@ -64,7 +64,7 @@ pub fn spawn_estats_poll(inner: std::sync::Arc<EtwInner>) {
                     .collect();
                 for (conn, local, remote) in quads {
                     match read_bytes_out(&local, &remote, !enabled.contains(&conn)) {
-                        Ok(bytes) => {
+                        ReadOutcome::Bytes(bytes) => {
                             enabled.insert(conn);
                             if let Some(delta) = sampler.on_sample(conn, bytes) {
                                 if delta > 0 {
@@ -76,11 +76,15 @@ pub fn spawn_estats_poll(inner: std::sync::Arc<EtwInner>) {
                                 }
                             }
                         }
-                        Err(()) => {
+                        ReadOutcome::Gone => {
                             // 连接已不存在：清轮询状态（disconnect 事件侧也会移除，幂等）
                             enabled.remove(&conn);
                             sampler.forget(conn);
                             inner.monitored_quads.remove(&conn);
+                        }
+                        ReadOutcome::Transient => {
+                            // 保留登记（含首次 Set 失败的场景），下轮重试
+                            enabled.remove(&conn); // Set 可能未生效，下轮重新开启采集
                         }
                     }
                 }
@@ -89,23 +93,34 @@ pub fn spawn_estats_poll(inner: std::sync::Arc<EtwInner>) {
         .expect("spawn estats-poll");
 }
 
+/// 读取结果：正常字节值 / 连接已消失（移除登记）/ 暂时性错误（保留登记，rc 已记日志）。
+enum ReadOutcome {
+    Bytes(u64),
+    /// ERROR_NOT_FOUND：连接已不存在（表项移除）
+    Gone,
+    /// 其他 rc（参数/缓冲等）：保留登记下轮重试，避免瞬时错误误杀活跃连接
+    Transient,
+}
+
 /// 读一条连接的 DataBytesOut 累计值；`enable_first` 时先开启 Data 采集。
-/// 返回 Err(()) 表示连接已不可查（调用方按关闭处理）。
-fn read_bytes_out(local: &SocketAddr, remote: &SocketAddr, enable_first: bool) -> Result<u64, ()> {
+fn read_bytes_out(local: &SocketAddr, remote: &SocketAddr, enable_first: bool) -> ReadOutcome {
     use windows::Win32::NetworkManagement::IpHelper::{
         GetPerTcp6ConnectionEStats, GetPerTcpConnectionEStats, MIB_TCP_STATE_ESTAB,
         SetPerTcp6ConnectionEStats, SetPerTcpConnectionEStats, TcpConnectionEstatsData,
     };
-    // TCP_ESTATS_DATA_RW_v1 { BOOLEAN EnableCollection }；ROD v1 布局：
-    // DataBytesOut(ULONG64) + DataBytesIn(ULONG64)
+    // TCP_ESTATS_DATA_RW_v1 { BOOLEAN EnableCollection }；
+    // ROD v1（评审修正：4 字段 24 字节）：DataBytesOut(8) + DataBytesIn(8)
+    // + DataSegsOut(4) + DataSegsIn(4)——短缓冲会被内核按版本校验拒绝
     let rw_enable = [1u8];
-    let mut rod = [0u8; 16];
+    let mut rod = [0u8; 24];
     unsafe {
         match (local.ip(), remote.ip()) {
             (std::net::IpAddr::V4(_), std::net::IpAddr::V4(_)) => {
                 let quad = hg_model::TcpQuad { local: *local, remote: *remote };
-                let row = crate::enforcer::build_tcp_row_v4(&quad, MIB_TCP_STATE_ESTAB.0 as u32)
-                    .map_err(|_| ())?;
+                let Ok(row) = crate::enforcer::build_tcp_row_v4(&quad, MIB_TCP_STATE_ESTAB.0 as u32)
+                else {
+                    return ReadOutcome::Transient;
+                };
                 if enable_first {
                     SetPerTcpConnectionEStats(&row, TcpConnectionEstatsData, &rw_enable, 1, 0);
                 }
@@ -120,7 +135,10 @@ fn read_bytes_out(local: &SocketAddr, remote: &SocketAddr, enable_first: bool) -
             }
             (std::net::IpAddr::V6(_), std::net::IpAddr::V6(_)) => {
                 let quad = hg_model::TcpQuad { local: *local, remote: *remote };
-                let row = crate::enforcer::build_tcp_row_v6(&quad, MIB_TCP_STATE_ESTAB).map_err(|_| ())?;
+                let Ok(row) = crate::enforcer::build_tcp_row_v6(&quad, MIB_TCP_STATE_ESTAB)
+                else {
+                    return ReadOutcome::Transient;
+                };
                 if enable_first {
                     SetPerTcp6ConnectionEStats(&row, TcpConnectionEstatsData, &rw_enable, 1, 0);
                 }
@@ -133,17 +151,22 @@ fn read_bytes_out(local: &SocketAddr, remote: &SocketAddr, enable_first: bool) -
                 );
                 estats_out(rc, &rod)
             }
-            _ => Err(()),
+            _ => ReadOutcome::Gone,
         }
     }
 }
 
-/// 返回值统一解析：NO_ERROR=0 取 ROD 首字段；否则视为连接不可查。
-unsafe fn estats_out(rc: u32, rod: &[u8; 16]) -> Result<u64, ()> {
-    if rc != 0 {
-        return Err(());
+/// 返回值统一解析：NO_ERROR=0 取 ROD 首字段；ERROR_NOT_FOUND(1168) 视为连接
+/// 消失；其余 rc 记日志保留（下轮重试），防止系统性错误把活跃连接批量误删。
+unsafe fn estats_out(rc: u32, rod: &[u8; 24]) -> ReadOutcome {
+    if rc == 0 {
+        return ReadOutcome::Bytes(u64::from_le_bytes(rod[..8].try_into().unwrap()));
     }
-    Ok(u64::from_le_bytes(rod[..8].try_into().unwrap()))
+    if rc == 1168 {
+        return ReadOutcome::Gone;
+    }
+    tracing::debug!("[conn-estats] Get rc={rc}（非 NOT_FOUND，保留登记下轮重试）");
+    ReadOutcome::Transient
 }
 
 #[cfg(test)]

@@ -37,7 +37,8 @@ CREATE TRIGGER IF NOT EXISTS tr_conns_delete AFTER DELETE ON conns BEGIN
 const DROP_TRIGGERS_SQL: &str = "DROP TRIGGER IF EXISTS tr_events_append; DROP TRIGGER IF EXISTS tr_events_delete; DROP TRIGGER IF EXISTS tr_verdicts_append; DROP TRIGGER IF EXISTS tr_verdicts_delete; DROP TRIGGER IF EXISTS tr_conns_append; DROP TRIGGER IF EXISTS tr_conns_delete;";
 
 /// 启动写入线程（独占一个写连接；WAL 下读连接并发不受影响）。
-pub fn spawn_writer(db_path: &str, rx: Receiver<StoreOp>, retention_days: u32) {
+/// 返回 JoinHandle 供停机序列汇合冲刷（通道全闭后线程 flush 并退出）。
+pub fn spawn_writer(db_path: &str, rx: Receiver<StoreOp>, retention_days: u32) -> std::thread::JoinHandle<()> {
     let path = db_path.to_string();
     std::thread::Builder::new()
         .name("hg-store-writer".into())
@@ -82,7 +83,7 @@ pub fn spawn_writer(db_path: &str, rx: Receiver<StoreOp>, retention_days: u32) {
                 }
             }
         })
-        .expect("spawn store writer");
+        .expect("spawn store writer")
 }
 
 fn flush(conn: &Connection, pending: &mut Vec<StoreOp>) {

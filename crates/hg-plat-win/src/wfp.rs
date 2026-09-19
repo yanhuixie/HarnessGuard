@@ -26,13 +26,50 @@ use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 /// HarnessGuard 自有子层 GUID（固定值：跨封禁复用；已存在时容忍 ALREADY_EXISTS）
 const SUBLAYER_GUID: GUID = GUID::from_u128(0x9d3f1a4c62be4f0a9c853a71e0d2b8f4);
 
+/// 子层持久装配完成标记（评审修正：子层若随动态会话添加，会话 A 关闭时子层
+/// 被删，会话 B 已装过滤器引用悬空、封禁提前失效——改为持久会话一次性装配）
+static SUBLAYER_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 在**持久**（非动态）引擎会话中装配子层：句柄关闭后对象留存，供后续所有
+/// 动态封禁会话的过滤器引用。幂等（进程内一次 + 内核侧容忍 ALREADY_EXISTS）。
+fn ensure_sublayer_persistent() -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if SUBLAYER_READY.load(Relaxed) {
+        return Ok(());
+    }
+    unsafe {
+        let mut engine = HANDLE(std::ptr::null_mut());
+        let rc = FwpmEngineOpen0(None, RPC_C_AUTHN_WINNT, None, None, &mut engine);
+        if rc != 0 {
+            anyhow::bail!("FwpmEngineOpen0(持久会话) rc={rc:#x}（BFE 未运行？）");
+        }
+        let sub = FWPM_SUBLAYER0 {
+            subLayerKey: SUBLAYER_GUID,
+            displayData: FWPM_DISPLAY_DATA0 {
+                name: PWSTR(w!("HarnessGuard 封禁子层").as_ptr() as *mut _),
+                description: PWSTR::null(),
+            },
+            ..Default::default()
+        };
+        let add_rc = FwpmSubLayerAdd0(engine, &sub, None);
+        let _ = FwpmEngineClose0(engine);
+        if add_rc != 0 && add_rc != windows::Win32::Foundation::FWP_E_ALREADY_EXISTS.0 as u32 {
+            anyhow::bail!("FwpmSubLayerAdd0 rc={add_rc:#x}");
+        }
+    }
+    SUBLAYER_READY.store(true, Relaxed);
+    Ok(())
+}
+
 /// 阻断指定远端 IP 的出站连接，`ttl` 到期后解封。
 ///
 /// 调用约定：在独立线程内运行（含 `ttl` 睡眠）；返回 Ok 时解封已完成，
 /// 返回 Err 表示 WFP 链路失败（调用方回落 netsh）。
 pub fn block_endpoint_wfp(ip: IpAddr, ttl: Duration) -> anyhow::Result<()> {
+    // 子层须在持久会话装配（动态会话对象随句柄消亡，过滤器不能引用之）
+    ensure_sublayer_persistent()?;
     unsafe {
-        // 1. 动态会话：句柄关闭/进程退出 → 过滤器自动移除
+        // 动态会话：句柄关闭/进程退出 → 本会话过滤器自动移除
         let sess = FWPM_SESSION0 {
             flags: FWPM_SESSION_FLAG_DYNAMIC,
             ..Default::default()
@@ -50,20 +87,6 @@ pub fn block_endpoint_wfp(ip: IpAddr, ttl: Duration) -> anyhow::Result<()> {
 }
 
 unsafe fn block_with_engine(engine: HANDLE, ip: IpAddr, ttl: Duration) -> anyhow::Result<()> {
-    // 2. 子层装配（幂等：已存在容忍；WFP 只读复制显示名，静态宽字符足够）
-    let sub = FWPM_SUBLAYER0 {
-        subLayerKey: SUBLAYER_GUID,
-        displayData: FWPM_DISPLAY_DATA0 {
-            name: PWSTR(w!("HarnessGuard 封禁子层").as_ptr() as *mut _),
-            description: PWSTR::null(),
-        },
-        ..Default::default()
-    };
-    let rc = FwpmSubLayerAdd0(engine, &sub, None);
-    if rc != 0 && rc != windows::Win32::Foundation::FWP_E_ALREADY_EXISTS.0 as u32 {
-        anyhow::bail!("FwpmSubLayerAdd0 rc={rc:#x}");
-    }
-
     // 3. 过滤器：ALE_AUTH_CONNECT（出站连接授权层）+ 远端地址精确匹配 + BLOCK。
     //    地址结构须存活至 FwpmFilterAdd0 返回（API 只读复制），故为局部变量。
     let mut v4 = FWP_V4_ADDR_AND_MASK { addr: 0, mask: u32::MAX };

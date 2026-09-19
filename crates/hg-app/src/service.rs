@@ -33,6 +33,14 @@ extern "system" fn ffi_service_main(_argc: u32, _argv: *mut *mut u16) {
 }
 
 fn service_main() {
+    // SCM 服务默认 CWD 为 %WinDir%\System32——统一切到 exe 目录，使
+    // config.toml / harnessguard.db 等相对路径锚定安装目录（评审修正：
+    // 否则首次服务启动会在 System32 下建配置与库文件）
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        if let Err(e) = std::env::set_current_dir(&dir) {
+            tracing::error!("[服务] 切换工作目录到 {} 失败：{e}", dir.display());
+        }
+    }
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {

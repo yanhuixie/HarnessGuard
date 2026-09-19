@@ -93,7 +93,7 @@ pub(crate) fn run_server(
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<EngineOutput>(4096);
     let (store_tx, store_rx) = std::sync::mpsc::channel::<StoreOp>();
     let (sse_tx, _) = tokio::sync::broadcast::channel::<hg_web::SseEvent>(1024);
-    hg_store::writer::spawn_writer(&db_path, store_rx, cfg.storage.retention_days);
+    let writer_handle = hg_store::writer::spawn_writer(&db_path, store_rx, cfg.storage.retention_days);
 
     // 平台事件源（Windows ETW）+ 持久化轮询
     let inner = hg_plat_win::EtwInner::new(procs.clone(), src_stats.clone());
@@ -149,8 +149,21 @@ pub(crate) fn run_server(
 
     // Web UI（127.0.0.1 + 随机 token + Host 校验，需求 §6.2）
     let token = random_token();
-    let bind = cfg.web.bind.clone();
-    let state = Arc::new(hg_web::AppState {
+    if stop.is_some() {
+        // 服务模式（Session 0 无控制台，println 无人可见）：token 落 exe 目录
+        // web-token.txt（评审修正：否则服务化后每次重启 token 随机且无处获取；
+        // 文件 ACL 收紧入 M4 待修清单）
+        if let Some(dir) =
+            std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        {
+            let p = dir.join("web-token.txt");
+            match std::fs::write(&p, format!("{token}\n")) {
+                Ok(()) => tracing::info!("服务模式：Web token 已写入 {}", p.display()),
+                Err(e) => tracing::error!("Web token 写盘失败（{}）：{e}", p.display()),
+            }
+        }
+    }
+    let bind = cfg.web.bind.clone();    let state = Arc::new(hg_web::AppState {
         expected_host: bind.clone(),
         token: token.clone(),
         rules: rules.clone(),
@@ -180,12 +193,23 @@ pub(crate) fn run_server(
     rt.block_on(wait_for_stop(stop));
 
     // 停机序列（技术设计 §9.3）：ETW 会话显式回收（防残留——强杀会话不死，
-    // M1 实测教训）→ 写通道全闭 → writer 冲刷退出 → 运行时收尾
+    // M1 实测教训）→ 写通道全闭 → 运行时收尾释放执行器的 store_tx 克隆 →
+    // writer 汇合冲刷（限时，防 SQLite 卡死阻塞停机）。
+    // 已知限制（评审披露）：ETW 线程常驻持有 etw_tx 且 OnceLock 不可清空，
+    // 引擎侧 recv 不会自然返回——执行器任务实为超时强制收尾，完整源侧可关闭
+    // 通道留待后续（M4 报告待修清单）
     tracing::info!("停机序列：回收 ETW 会话");
     hg_plat_win::stop_etw_sessions();
     drop(store_tx);
-    rt.shutdown_timeout(Duration::from_secs(2)); // 执行器任务结束 → 其 store_tx 克隆释放
-    std::thread::sleep(Duration::from_millis(400)); // 等 writer 通道关闭冲刷落盘
+    rt.shutdown_timeout(Duration::from_secs(2));
+    let (writer_done, writer_done_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let _ = writer_handle.join();
+        let _ = writer_done.send(());
+    });
+    if writer_done_rx.recv_timeout(Duration::from_secs(3)).is_err() {
+        tracing::error!("存储冲刷 3s 未完成，可能截断（WAL 下次启动恢复）");
+    }
     tracing::info!("停机完成");
     Ok(())
 }
