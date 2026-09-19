@@ -52,14 +52,16 @@ const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC0000004u32 as i32;
 const HANDLE_ENTRY_SIZE: usize = 40;
 const DUPLICATE_SAME_ACCESS: u32 = 2;
 
-/// 探测决策（纯函数，单测覆盖）：仅 Create 事件、该 FileObject 未探测失败过、
+/// 探测决策（纯函数，单测覆盖）：仅 Create/Read 事件（实机复验修正：cmd `type`
+/// 等读路径的首个事件常是 Read（op=67）而非 Create，仅限 Create 会漏掉全部读
+/// 场景——场景 A 的 .git 读取正是此路径）、该 FileObject 未探测失败过、
 /// 距上次探测超过限流间隔，三者同时满足才发起。
 pub(crate) fn probe_allowed(
-    op_create: bool,
+    op_file: bool,
     already_failed: bool,
     interval_elapsed: bool,
 ) -> bool {
-    op_create && !already_failed && interval_elapsed
+    op_file && !already_failed && interval_elapsed
 }
 
 /// 对 (pid, FileObject) 探测文件名：句柄表检索 → NtDuplicateObject →
@@ -167,8 +169,8 @@ mod tests {
 
     #[test]
     fn 探测决策_三条件缺一不可() {
-        assert!(probe_allowed(true, false, true), "Create+未失败+间隔到 → 探测");
-        assert!(!probe_allowed(false, false, true), "Read/Write 不探测");
+        assert!(probe_allowed(true, false, true), "Create/Read+未失败+间隔到 → 探测");
+        assert!(!probe_allowed(false, false, true), "Write 等其他 opcode 不探测");
         assert!(!probe_allowed(true, true, true), "失败过的 FileObject 不重试");
         assert!(!probe_allowed(true, false, false), "限流间隔未到不探测");
     }

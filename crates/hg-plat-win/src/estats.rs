@@ -122,7 +122,12 @@ fn read_bytes_out(local: &SocketAddr, remote: &SocketAddr, enable_first: bool) -
                     return ReadOutcome::Transient;
                 };
                 if enable_first {
-                    SetPerTcpConnectionEStats(&row, TcpConnectionEstatsData, &rw_enable, 1, 0);
+                    let src = SetPerTcpConnectionEStats(&row, TcpConnectionEstatsData, &rw_enable, 1, 0);
+                    if src != 0 {
+                        // 实机复验：Get 全败 rc=50（NOT_SUPPORTED）疑因 Set 开启失败，
+                        // 记录返回值定位根因（estats Data 集合须采集开启后才可读）
+                        tracing::debug!("[conn-estats] Set(v4) rc={src}（Data 采集开启失败）");
+                    }
                 }
                 let rc = GetPerTcpConnectionEStats(
                     &row,
@@ -140,7 +145,10 @@ fn read_bytes_out(local: &SocketAddr, remote: &SocketAddr, enable_first: bool) -
                     return ReadOutcome::Transient;
                 };
                 if enable_first {
-                    SetPerTcp6ConnectionEStats(&row, TcpConnectionEstatsData, &rw_enable, 1, 0);
+                    let src = SetPerTcp6ConnectionEStats(&row, TcpConnectionEstatsData, &rw_enable, 1, 0);
+                    if src != 0 {
+                        tracing::debug!("[conn-estats] Set(v6) rc={src}（Data 采集开启失败）");
+                    }
                 }
                 let rc = GetPerTcp6ConnectionEStats(
                     &row,

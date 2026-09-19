@@ -298,7 +298,13 @@ impl EtwInner {
                             *last = Instant::now();
                         }
                         drop(last);
-                        probe::probe_allowed(op == FILE_OP_CREATE, failed, elapsed_ok)
+                        // 实机复验修正：Read（cmd type 等读路径）也探测——
+                        // 否则 .git 读取判定永远卡在 pending 等 Name
+                        probe::probe_allowed(
+                            matches!(op, FILE_OP_CREATE | FILE_OP_READ),
+                            failed,
+                            elapsed_ok,
+                        )
                     };
                     if allowed {
                         self.stats.file_probe_tried.fetch_add(1, Relaxed);
@@ -697,10 +703,11 @@ impl hg_platform::EventSource for EtwSource {
             Err(e) => tracing::error!("ETW UserTrace(Dns-Client) 启动失败（需管理员）: {e:?}"),
         }
 
-        // Microsoft-Windows-TaskScheduler（Operational 源 by GUID）：计划任务注册/
-        // 更新 → Persistence 事件（M4 偏差归位；默认该日志通道可能未启用，实机
-        // 复验时若 0 事件需 wevtutil sl Microsoft-Windows-TaskScheduler/Operational /e:true）
-        let sched = Provider::by_guid("de7b246a-cffa-4c99-a82d-2f43ee0c9981")
+        // Microsoft-Windows-TaskScheduler（Operational 源 by GUID——实机复验修正：
+        // 正确 GUID 为 de7b24ea-73c8-4a09-985d-5bdadcfa9017，注册表 Publishers 核对）：
+        // 计划任务注册/更新 → Persistence 事件（M4 偏差归位；Operational 通道默认
+        // 可能未启用，复验需 wevtutil sl Microsoft-Windows-TaskScheduler/Operational /e:true）
+        let sched = Provider::by_guid("de7b24ea-73c8-4a09-985d-5bdadcfa9017")
             .add_callback({
                 let inner = inner.clone();
                 move |r, l| inner.on_sched(r, l)
