@@ -1,6 +1,14 @@
 # HarnessGuard
 
-监控 AI 编程 Harness 软件（Claude Code、Codex、Cursor 等）行为的终端安全防护工具：侦测并阻止其打包上传用户源代码等资产的行为。
+简体中文 | [English](README.en.md)
+
+监控 AI 编程 Harness 软件（Claude Code、Codex、Cursor、ZCode 等）行为的终端安全防护工具：侦测并阻止其打包上传用户源代码等资产的行为。
+
+## 缘起
+
+公开技术调查发现：ZCode（智谱）在用户登录后即自动在后台将**整个工作区**打包加密上传至厂商云端——包括 `.git` 完整历史（含已从工作区删除、仅存于历史中的密钥与配置），全程无通知、无任何设置可关闭，且加密密钥仅厂商持有，数据一经上传用户便无法解密、完全失去控制；其隐私政策对此并无披露。这不是孤例的 bug，而是 AI 编程工具行业的结构性风险：它们对用户最核心的资产（代码仓库）拥有完全读写权，而用户对"何时、什么内容、被传到哪里"毫无可见性。
+
+HarnessGuard 由此而生：不依赖厂商的自觉与隐私政策承诺，以独立特权进程对 harness 的文件、进程、网络行为做持续监控与实时阻断，把控制权拿回用户自己手里。
 
 ## 它解决什么问题
 
@@ -47,11 +55,11 @@ hg-app                  # 主程序装配（特权服务）
 
 ```powershell
 cargo build --release
-# 一键安装：前置检查（提权/端口/BFE）→ 配置生成 → 自保护 ACL → 服务安装
+# 一键安装：前置检查（提权/端口/BFE）→ 配置生成 → 自保护 ACL（管理员可写、用户只读）→ 服务安装
 # （已装则版本化升级，配置与数据库保留）→ 启动至防护生效
 .\target\release\harnessguard.exe install
 
-# Web UI（token 在安装目录 web-token.txt，仅 SYSTEM/Administrators 可读）
+# Web UI（token 在安装目录 web-token.txt，普通用户可直接读取，无需提权）
 start "http://127.0.0.1:8377/?token=<web-token.txt 内容>"
 
 # 卸载：停服（轮询）→ 删服务 → 清 web-token.txt；config/db/logs 保留（审计数据）
@@ -102,7 +110,6 @@ B/D 端到端）、`m4-verify.ps1`（M4 主轮）、`m4-verify3.ps1`（修复验
 | [M0 报告](docs/20260919-M0-Windows-spike报告.md) | Windows 平台技术验证结论 |
 | [M1 报告](docs/20260919-M1-Windows-端到端报告.md) | Windows 端到端验收报告 |
 | [M4 第一批报告](docs/20260919-M4第一批报告.md) | Windows 加固（SSE/WFP/estats/TaskScheduler/服务宿主） |
-| [M4 第一批复验报告](docs/20260920-M4第一批复验报告.md) | 管理员实机复验（6 项，4 轮） |
 | [M4 第一批复验报告](docs/20260920-M4第一批复验报告.md) | 管理员实机复验（6 项，4 轮） |
 | [M4 第二批报告](docs/20260920-M4第二批报告.md) | Windows 收尾（estats 降级/归因竞态/4663/ACL/日志/安装器） |
 | [M4 第二批复验报告](docs/20260920-M4第二批复验报告.md) | 管理员实机复验（11 项，10 轮，3 项实机修复） |
