@@ -10,7 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -80,7 +80,9 @@ struct PidCtx {
 pub struct EtwInner {
     pub procs: Arc<ProcTable>,
     pub stats: Arc<SourceStats>,
-    tx: OnceLock<mpsc::Sender<Envelope>>,
+    /// 事件通道句柄（可关闭：停机时置 None 使引擎 recv 自然返回——技术设计
+    /// §9.3 完整停机序列；OnceLock 不可清空故改 Mutex<Option>）
+    tx: Mutex<Option<mpsc::Sender<Envelope>>>,
     base: Instant,
     pid_ctx: DashMap<Pid, PidCtx>,
     /// FileObject → 文件名（LRU 封顶：M1 整表清空在 burst 下会误清热点条目）
@@ -110,7 +112,7 @@ impl EtwInner {
         Arc::new(Self {
             procs,
             stats,
-            tx: OnceLock::new(),
+            tx: Mutex::new(None),
             base: Instant::now(),
             pid_ctx: DashMap::new(),
             fileobj: Mutex::new(lru::LruCache::new(FILEOBJ_CAP)),
@@ -129,8 +131,9 @@ impl EtwInner {
     }
 
     /// 通道满即丢弃并计数（技术设计 §9.2：判定永不被审计拖累）。
+    /// 通道已关闭（停机）时静默丢弃——回调线程不因停机中断。
     pub fn emit(&self, event: RawEvent) {
-        if let Some(tx) = self.tx.get() {
+        if let Some(tx) = self.tx.lock().unwrap().as_ref() {
             match tx.try_send(Envelope::new(self.now(), event)) {
                 Ok(()) => {
                     self.stats.events_sent.fetch_add(1, Relaxed);
@@ -140,6 +143,12 @@ impl EtwInner {
                 }
             }
         }
+    }
+
+    /// 关闭事件通道（停机序列 §9.3）：置 None 释放 Sender，引擎 recv 自然返回
+    /// → 执行器退出 → writer 汇合。此后 emit 静默丢弃（回调线程仍常驻）。
+    pub fn close_channel(&self) {
+        *self.tx.lock().unwrap() = None;
     }
 
     fn parse_u32(p: &Parser, names: &[&str]) -> Option<u32> {
@@ -715,7 +724,9 @@ impl hg_platform::EventSource for EtwSource {
     }
 
     fn run(self, tx: mpsc::Sender<Envelope>) -> std::convert::Infallible {
-        let _ = self.inner.tx.set(tx.clone());
+        // Sender 完整移交 inner（本线程不保留克隆——否则停机 close 后引擎
+        // recv 永不返回，完整停机序列无法成立；M4 第二批 P1-6）
+        *self.inner.tx.lock().unwrap() = Some(tx);
         let inner = self.inner;
 
         let process = Provider::kernel(&kernel_providers::PROCESS_PROVIDER)

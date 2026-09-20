@@ -140,7 +140,8 @@ pub(crate) fn run_server(
     // 场景 C 字节计数补充路径（M4 复验定案：ETW send 事件为主路径；本机 estats
     // Set rc=50 不可用——轮询线程逐连接降级跳过，不影响主路径）：
     // estats 轮询按 monitored_quads 差分 DataBytesOut 补喂 ConnTx
-    hg_plat_win::estats::spawn_estats_poll(inner);
+    hg_plat_win::estats::spawn_estats_poll(inner.clone());
+    let inner_shutdown = inner;
 
     // 启动补扫描（技术设计 §3.2）
     let entries: Vec<_> = hg_plat_win::bootstrap::snapshot_processes()
@@ -237,16 +238,20 @@ pub(crate) fn run_server(
 
     rt.block_on(wait_for_stop(stop));
 
-    // 停机序列（技术设计 §9.3）：ETW 会话显式回收（防残留——强杀会话不死，
-    // M1 实测教训）→ 写通道全闭 → 运行时收尾释放执行器的 store_tx 克隆 →
-    // writer 汇合冲刷（限时，防 SQLite 卡死阻塞停机）。
-    // 已知限制（评审披露）：ETW 线程常驻持有 etw_tx 且 OnceLock 不可清空，
-    // 引擎侧 recv 不会自然返回——执行器任务实为超时强制收尾，完整源侧可关闭
-    // 通道留待后续（M4 报告待修清单）
+    // 停机序列（技术设计 §9.3，完整化 M4 第二批 P1-6）：
+    // ① 回收 ETW 会话（防残留——强杀会话不死，M1 实测教训；回调线程随进程退出）
+    // ② 关闭事件通道（inner tx 置 None + 释放本函数持有的 etw_tx）→ 引擎
+    //    recv 自然返回 → 执行器随 out_rx 关闭退出 → 释放 store_tx 克隆
+    // ③ 运行时限时收尾（排水 + 兜底取消未竟任务）
+    // ④ writer 汇合冲刷（限时，防 SQLite 卡死阻塞停机）
     tracing::info!("停机序列：回收 ETW 会话");
     hg_plat_win::stop_etw_sessions();
+    tracing::info!("停机序列：事件通道已关闭（引擎排水中）");
+    inner_shutdown.close_channel();
+    drop(etw_tx);
     drop(store_tx);
-    rt.shutdown_timeout(Duration::from_secs(2));
+    rt.shutdown_timeout(Duration::from_secs(3));
+    tracing::info!("停机序列：运行时已收尾（引擎/执行器排水完成或超时兜底）");
     let (writer_done, writer_done_rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
         let _ = writer_handle.join();
