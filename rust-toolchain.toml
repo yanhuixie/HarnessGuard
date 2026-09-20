@@ -1,0 +1,5 @@
+# 工具链钉版：rustfmt/clippy 的判定与版本强相关（CI「警告即失败」「格式即失败」
+# 门禁下，本地与 runner 版本不一致会产生假红）。升级时改此文件，本地与 CI 同步换挡。
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]

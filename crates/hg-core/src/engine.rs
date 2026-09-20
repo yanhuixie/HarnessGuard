@@ -727,7 +727,10 @@ mod tests {
     /// Create 是注入面唯一可靠触发点），默认不杀 + 通知
     #[test]
     fn create打开_git_hooks_直接block() {
-        for p in ["D:/repo/.git/hooks/pre-commit", "D:/repo/.git/hooks/applypatch-msg.sample"] {
+        for p in [
+            "D:/repo/.git/hooks/pre-commit",
+            "D:/repo/.git/hooks/applypatch-msg.sample",
+        ] {
             let (eng, mut rx) = engine();
             eng.on_file_create(20812, Path::new(p), Timestamp(0))
                 .unwrap();
@@ -744,7 +747,8 @@ mod tests {
                 ..Default::default()
             };
             let (eng, mut rx) = engine_with(cfg);
-            eng.on_file_create(20812, Path::new(p), Timestamp(0)).unwrap();
+            eng.on_file_create(20812, Path::new(p), Timestamp(0))
+                .unwrap();
             assert_eq!(kill_count(&drain(&mut rx)), 1, "{p}：kill 开启应杀");
         }
     }
@@ -790,7 +794,11 @@ mod tests {
             let (eng, mut rx) = engine();
             eng.on_file_open(20812, Path::new(p), a).unwrap();
             let out = drain(&mut rx);
-            assert_eq!(block_verdict_count(&out), 1, "{p} {a:?}：真实读写应出 Block");
+            assert_eq!(
+                block_verdict_count(&out),
+                1,
+                "{p} {a:?}：真实读写应出 Block"
+            );
             assert_eq!(kill_count(&out), 0, "{p} {a:?}：默认不杀");
 
             let cfg = RulesConfig {

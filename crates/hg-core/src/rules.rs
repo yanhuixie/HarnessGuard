@@ -552,9 +552,11 @@ pub fn is_git_hooks_touch(path: &Path) -> bool {
         {
             continue;
         }
-        return comps
-            .next()
-            .is_some_and(|c| c.as_os_str().to_string_lossy().eq_ignore_ascii_case("hooks"));
+        return comps.next().is_some_and(|c| {
+            c.as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("hooks")
+        });
     }
     false
 }

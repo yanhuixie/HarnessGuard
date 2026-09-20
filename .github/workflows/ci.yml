@@ -15,8 +15,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # 版本与 rust-toolchain.toml 一致（fmt/clippy 判定随版本漂移，必须同版）
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.98.1"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: 格式检查
@@ -33,7 +35,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
       - uses: Swatinem/rust-cache@v2
       - name: 编译检查（hg-plat-linux：eBPF/aya 用户态 + fanotify 路径）
         run: cargo check --locked -p hg-model -p hg-core -p hg-platform -p hg-plat-linux -p hg-store -p hg-notify -p hg-web
@@ -45,7 +49,9 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
       - uses: Swatinem/rust-cache@v2
       - name: 编译检查（hg-plat-macos：auditpipe/pcap 路径）
         run: cargo check --locked -p hg-model -p hg-core -p hg-platform -p hg-plat-macos -p hg-store -p hg-notify -p hg-web
