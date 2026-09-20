@@ -24,12 +24,20 @@ use hg_platform::Enforcer;
 use hg_store::writer::StoreOp;
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    // 服务模式：滚动文件日志（Session 0 无 stderr；拍板见 M4 第二批报告——
+    // 文件优先于 Event Log：无需消息清单注册、复验脚本可直接 tail）。
+    // guard 随 main 存活，进程退出前 drop 刷写尾部日志（含停机序列）。
+    let _log_guard = if std::env::args().nth(1).as_deref() == Some("service") {
+        init_service_logging()
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "info".into()),
+            )
+            .init();
+        None
+    };
     match std::env::args().nth(1).as_deref() {
         None | Some("run") => run_server(None, None),
         #[cfg(windows)]
@@ -60,6 +68,105 @@ fn main() -> anyhow::Result<()> {
         }
         other => anyhow::bail!("未知参数 {other:?}；用法：harnessguard [run|service|install|uninstall|enable-file-audit <目录>|disable-file-audit <目录>]"),
     }
+}
+
+/// 服务模式日志初始化：exe 目录 logs/harnessguard.log.YYYY-MM-DD 按日轮转，
+/// 非阻塞写（guard 返回给 main 持有，退出时刷尾）。启动时顺带清理过期日志。
+/// 失败（目录不可建等）回落 stderr 并告警——日志不可用不得阻断服务启动。
+fn init_service_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::util::SubscriberInitExt;
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("logs")));
+    let Some(dir) = dir else {
+        eprintln!("[日志] 无法定位 exe 目录，回落 stderr");
+        return None;
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("[日志] 创建日志目录失败（{}）：{e}，回落 stderr", dir.display());
+        return None;
+    }
+    cleanup_old_logs(&dir, LOG_KEEP_DAYS);
+    let appender = tracing_appender::rolling::daily(&dir, "harnessguard.log");
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info".into());
+    tracing_subscriber::fmt()
+        .with_writer(writer)
+        .with_ansi(false) // 文件输出无 ANSI 转义
+        .with_env_filter(filter)
+        .finish()
+        .init();
+    Some(guard)
+}
+
+/// 日志保留天数（按日轮转，§8.2 自保护目录内；磁盘预算远小于 storage.max_disk_mb）
+const LOG_KEEP_DAYS: i64 = 14;
+
+/// 清理过期轮转日志（按文件名日期判定；非本命名模式的文件不动）。
+fn cleanup_old_logs(dir: &std::path::Path, keep_days: i64) {
+    let today = days_from_civil(today_ymd());
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if log_stale(&name, today, keep_days).unwrap_or(false) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// `harnessguard.log.YYYY-MM-DD` 是否过期（保留窗口外）；非本模式 None。
+fn log_stale(name: &str, today: i64, keep_days: i64) -> Option<bool> {
+    let date = name.strip_prefix("harnessguard.log.")?;
+    let mut it = date.split('-');
+    let y: i64 = it.next()?.parse().ok()?;
+    let m: i64 = it.next()?.parse().ok()?;
+    let d: i64 = it.next()?.parse().ok()?;
+    if it.next().is_some() {
+        return None;
+    }
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(today - days_from_civil((y, m, d)) > keep_days)
+}
+
+/// 今天 (y, m, d)（本地时区；轮转文件名同为本地日期，一致即可）
+fn today_ymd() -> (i64, i64, i64) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // 本地时区偏移：Windows 无 portable 本地化 API 于 std——按 UTC+8 折算会
+    // 引入硬编码；此处取 UTC 日期（与按日轮转的文件名日期可能差一天，
+    // 对保留期清理无影响：窗口 14 天 >> 1 天误差）
+    let days = secs.div_euclid(86_400);
+    civil_from_days(days)
+}
+
+/// 儒略日 → 公历（Howard Hinnant civil_from_days 算法；单测锚定已知日期）
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// 公历 → 儒略日（days_from_civil，Hinnant 算法；与 civil_from_days 互逆）
+fn days_from_civil((y, m, d): (i64, i64, i64)) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// 等待停止信号：控制台模式等 Ctrl+C；服务模式等 SCM Stop（经 watch 通道，
@@ -231,7 +338,8 @@ pub(crate) fn run_server(
         println!(" Web UI： http://{bind}/?token={token}");
         println!("==================================================================");
     } else {
-        tracing::info!("HarnessGuard 服务模式已启动，Web UI：http://{bind}/?token={token}");
+        // token 不落日志（日志文件在未保护目录，防泄漏；token 见 web-token.txt）
+        tracing::info!("HarnessGuard 服务模式已启动，Web UI：http://{bind}/（token 见安装目录 web-token.txt）");
         // 自保护自检（§8.2 / 待修 11）：配置/库/token 未保护则告警并自愈
         // （覆盖 install 后首次启动新建的文件；web-token.txt 每次启动重写）
         let mut guard_files = guard_files_seed.clone();
@@ -400,4 +508,33 @@ fn random_token() -> String {
     let mut b = [0u8; 18];
     rand::thread_rng().fill_bytes(&mut b);
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 儒略日互逆与已知日期锚定() {
+        // 已知锚点：1970-01-01 = 0，2000-03-01 = 11017（Hinnant 算法文献值）
+        assert_eq!(days_from_civil((1970, 1, 1)), 0);
+        assert_eq!(days_from_civil((2000, 3, 1)), 11017);
+        // 互逆：随机取几个日期往返
+        for (y, m, d) in [(2026, 9, 20), (2024, 2, 29), (1999, 12, 31), (2100, 3, 1)] {
+            assert_eq!(civil_from_days(days_from_civil((y, m, d))), (y, m, d));
+        }
+    }
+
+    #[test]
+    fn 日志过期判定矩阵() {
+        let today = days_from_civil((2026, 9, 20));
+        assert_eq!(log_stale("harnessguard.log.2026-09-20", today, 14), Some(false));
+        assert_eq!(log_stale("harnessguard.log.2026-09-06", today, 14), Some(false), "恰好 14 天：保留");
+        assert_eq!(log_stale("harnessguard.log.2026-09-05", today, 14), Some(true), "超过 14 天：清理");
+        // 非本命名模式 / 非法日期：不动
+        assert_eq!(log_stale("harnessguard.log", today, 14), None);
+        assert_eq!(log_stale("other.log.2020-01-01", today, 14), None);
+        assert_eq!(log_stale("harnessguard.log.2026-13-01", today, 14), None);
+        assert_eq!(log_stale("harnessguard.log.2026-09", today, 14), None);
+    }
 }

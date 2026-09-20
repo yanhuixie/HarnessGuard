@@ -3,6 +3,8 @@
 //!
 //! 实机状态：install/uninstall/启停/恢复策略/停机序列已于 2026-09-20 管理员
 //! 实机验证全项通过（M4 第一批复验报告）；后续改动按需复验。
+//! 服务模式日志：滚动文件（exe 目录 logs/，main 在 dispatch 前初始化——
+//! M4 第二批 P1-8，Session 0 的 stderr 已丢弃）。
 //!
 //! 恢复策略：create_service 不覆盖 failure actions，安装时经 `sc.exe failure`
 //! 配置三级重启（5s×3，等效 SCM Recovery 页）；binPath 由 launch_arguments

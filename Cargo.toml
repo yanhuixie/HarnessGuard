@@ -40,6 +40,8 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# M4 第二批 P1-8：服务模式滚动文件日志（按日轮转，无原生依赖）
+tracing-appender = "0.2"
 globset = "0.4"
 rusqlite = { version = "0.37", features = ["bundled"] }
 axum = "0.8"
