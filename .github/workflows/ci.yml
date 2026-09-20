@@ -1,0 +1,51 @@
+# CI（技术设计 §11 里程碑配套）：push/PR 触发
+# - Windows：完整门禁（fmt / clippy -D warnings / 测试 / release 构建）——仓库唯一已验证平台
+# - Linux / macOS：按 crate 编译补盲（hg-plat-linux·macos 代码从未编译，AGENTS.md 平台验证状态）；
+#   不含 hg-app / hg-plat-win（纯 Windows 装配层，模块未做 cfg 门控，跨平台编译属 M2/M3 校准范围）
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  windows:
+    name: Windows（fmt + clippy + 测试 + 构建）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+      - name: clippy 静态检查（警告即失败）
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: 单元测试
+        run: cargo test --workspace --locked
+      - name: release 构建
+        run: cargo build --release --locked
+
+  linux-check:
+    name: Linux 平台 crate 编译补盲
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 编译检查（hg-plat-linux：eBPF/aya 用户态 + fanotify 路径）
+        run: cargo check --locked -p hg-model -p hg-core -p hg-platform -p hg-plat-linux -p hg-store -p hg-notify -p hg-web
+      - name: 纯逻辑单测（hg-model / hg-core 引擎无 IO，可跨平台跑）
+        run: cargo test --locked -p hg-model -p hg-core
+
+  macos-check:
+    name: macOS 平台 crate 编译补盲
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 编译检查（hg-plat-macos：auditpipe/pcap 路径）
+        run: cargo check --locked -p hg-model -p hg-core -p hg-platform -p hg-plat-macos -p hg-store -p hg-notify -p hg-web

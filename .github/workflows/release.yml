@@ -1,0 +1,45 @@
+# 发布流水线：打 v* tag 触发（首次发布 v0.1.0）
+# Windows 是唯一运行验证过的平台，产物仅打 Windows x64 包：
+# harnessguard.exe + LICENSE + 双语 README + installer 脚本（Linux/macOS 安装脚本为 M2/M3 预写，一并附带）
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 发布前全量测试
+        run: cargo test --workspace --locked
+      - name: release 构建
+        run: cargo build --release --locked
+      - name: 打包
+        shell: pwsh
+        run: |
+          $stage = "staging/harnessguard-${{ github.ref_name }}"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item target/release/harnessguard.exe $stage/
+          Copy-Item LICENSE, README.md, README.en.md $stage/
+          Copy-Item installer -Destination $stage -Recurse
+          Compress-Archive -Path $stage -DestinationPath "harnessguard-${{ github.ref_name }}-windows-x64.zip"
+      - name: 生成 SHA256 校验和
+        shell: pwsh
+        run: |
+          (Get-FileHash "harnessguard-${{ github.ref_name }}-windows-x64.zip" -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $([System.IO.Path]::GetFileName($_.Path))" }) |
+          Out-File sha256sums.txt -Encoding ascii
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            harnessguard-*-windows-x64.zip
+            sha256sums.txt
+          generate_release_notes: true
