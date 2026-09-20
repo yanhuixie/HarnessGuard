@@ -118,6 +118,11 @@ pub struct RulesConfig {
     pub sensitive_escalation_divisor: u64,
     pub endpoints_allow: Vec<String>,
     pub git_dir_action: FileAction,
+    /// git-dir 注入面命中 Block 判定时是否连带杀进程（拍板记录 13）。
+    /// 缺省 false：只出 Block 判定 + 通知——ETW 事后语义下杀仅止损，且
+    /// 打包封堵与网络阈值两重兜底仍在，是否升级交给用户。
+    #[serde(default)]
+    pub git_dir_kill: bool,
     pub archive_action: FileAction,
     pub sensitive_patterns: Vec<String>,
     pub archive_patterns: Vec<String>,
@@ -135,6 +140,7 @@ impl Default for RulesConfig {
             sensitive_escalation_divisor: 10,
             endpoints_allow: default_endpoints_allow(),
             git_dir_action: FileAction::Block,
+            git_dir_kill: false,
             archive_action: FileAction::Block,
             sensitive_patterns: vec![
                 ".env".into(),
@@ -186,8 +192,10 @@ pub enum RulesError {
 #[derive(Debug, Clone)]
 struct ToolExemptCompiled {
     exe: String,
-    /// 目录型模式（如 ".git/**" 的 ".git"）：路径任一组件命中即视为目录内访问。
-    exempt_dirs: Vec<String>,
+    /// 目录型模式（如 ".git/**" 的 ".git"）预拆分为小写段序列：路径组件
+    /// 序列中存在连续匹配段即视为目录内访问——单段（".git"）等价原组件
+    /// 匹配，多段（".git/objects"）修复旧实现"组件 eq 永不命中"的静默失效。
+    exempt_dirs: Vec<Vec<String>>,
     /// 其余模式：对规范化完整路径做 glob 匹配。
     allow_globs: globset::GlobSet,
 }
@@ -205,6 +213,8 @@ pub struct RulesSnapshot {
     endpoints_domain: Vec<globset::GlobMatcher>,
     endpoints_ip: Vec<IpAddr>,
     pub git_dir_action: FileAction,
+    /// git-dir 注入面 Block 是否连带杀进程（拍板记录 13，缺省 false）
+    pub git_dir_kill: bool,
     pub archive_action: FileAction,
     pub upload_threshold_bytes: u64,
     pub escalation_divisor: u64,
@@ -245,6 +255,19 @@ fn build_set(patterns: &[String]) -> Result<globset::GlobSet, RulesError> {
 
 impl RulesSnapshot {
     pub fn compile(cfg: &RulesConfig) -> Result<Self, RulesError> {
+        // git 豁免编译期兜底（拍板记录 13 前置防线）：配置中缺失 git 条目时
+        // 注入内置豁免并告警——需求 §3.3 明文"否则 git status/commit 全被打断"，
+        // 空豁免表几乎必是配置链路异常（实测教训：文件与运行时快照可能分裂），
+        // 不允许软状态静默失去兜底。用户自定义 git 条目存在时以用户为准。
+        let mut tool_exempt_cfg = cfg.tool_exempt.clone();
+        if !tool_exempt_cfg.iter().any(|t| t.exe.eq_ignore_ascii_case("git")) {
+            tracing::warn!("tool_exempt 缺少 git 条目，已按需求 §3.3 注入内置豁免（.git/**）");
+            tool_exempt_cfg.push(ToolExemptConf {
+                exe: "git".into(),
+                allow_paths: vec![".git/**".into()],
+            });
+        }
+
         let harness = cfg
             .harness
             .iter()
@@ -252,16 +275,20 @@ impl RulesSnapshot {
             .map(|(p, name)| Ok((build_matcher(p)?, name)))
             .collect::<Result<Vec<_>, RulesError>>()?;
 
-        let tool_exempt = cfg
-            .tool_exempt
+        let tool_exempt = tool_exempt_cfg
             .iter()
             .map(|t| {
-                // 目录型模式（后缀 "/**"）拆出来走组件匹配，其余走完整路径 glob。
+                // 目录型模式（后缀 "/**"）拆出来走段序列匹配，其余走完整路径 glob。
                 let mut exempt_dirs = Vec::new();
                 let mut plain = Vec::new();
                 for p in &t.allow_paths {
                     if let Some(dir) = p.strip_suffix("/**") {
-                        exempt_dirs.push(dir.to_string());
+                        exempt_dirs.push(
+                            dir.split('/')
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.to_ascii_lowercase())
+                                .collect(),
+                        );
                     } else {
                         plain.push(p.clone());
                     }
@@ -306,6 +333,7 @@ impl RulesSnapshot {
             endpoints_domain,
             endpoints_ip,
             git_dir_action: cfg.git_dir_action,
+            git_dir_kill: cfg.git_dir_kill,
             archive_action: cfg.archive_action,
             upload_threshold_bytes: cfg.upload_threshold_mb.saturating_mul(1024 * 1024),
             escalation_divisor: cfg.sensitive_escalation_divisor.max(1),
@@ -335,6 +363,8 @@ impl RulesSnapshot {
     }
 
     /// 身份矩阵豁免判定：豁免工具 × 豁免路径（需求 §3.3）。
+    /// 目录型模式按段序列滑窗匹配（大小写不敏感），支持 ".git" 单段与
+    /// ".git/objects" 等多段前缀；其余模式按完整路径 glob。
     fn tool_exempt_allows(&self, tool: &str, path: &Path) -> bool {
         let Some(t) = self
             .tool_exempt
@@ -343,11 +373,18 @@ impl RulesSnapshot {
         else {
             return false;
         };
-        if path.components().any(|c| {
-            let comp = c.as_os_str().to_string_lossy();
-            t.exempt_dirs.iter().any(|d| comp.eq_ignore_ascii_case(d))
-        }) {
-            return true;
+        let comps: Vec<String> = path
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+            .collect();
+        for segs in &t.exempt_dirs {
+            let n = segs.len();
+            if n == 0 || comps.len() < n {
+                continue;
+            }
+            if (0..=comps.len() - n).any(|i| comps[i..i + n] == segs[..]) {
+                return true;
+            }
         }
         t.allow_globs.is_match(&norm(path))
     }
@@ -428,6 +465,34 @@ pub fn under_git_dir(path: &Path) -> bool {
     })
 }
 
+/// `.git` 触碰是否落入**注入面**（需求 §3.1，拍板记录 12）：
+/// - `hooks/**`：读写皆注入——hook 是 git 操作时的任意命令执行点
+///   （持久化/凭据劫持向量），正常 harness 工作流不触碰；
+/// - `config` / `config.lock`：仅**写**为注入（core.fsmonitor/pager 等
+///   配置项可注入执行）——读是 status/diff 必经路径，放行。
+///
+/// 其余（objects/refs/logs/HEAD/index/各类锁文件等）为工作流面：git
+/// status/commit/checkout 的本职读写，harness 内置 git 库（如 ZCode）
+/// 在进程内直接操作，一并拒会打断全部正常 git 工作流。
+pub fn is_git_injection_touch(path: &Path, access: Access) -> bool {
+    let mut comps = path.components();
+    while let Some(c) = comps.next() {
+        if !c.as_os_str().to_str().is_some_and(|s| s.eq_ignore_ascii_case(".git")) {
+            continue;
+        }
+        let Some(first) = comps.next() else { return false };
+        let first = first.as_os_str().to_string_lossy().to_ascii_lowercase();
+        if first == "hooks" {
+            return true;
+        }
+        if (first == "config" || first == "config.lock") && access == Access::Write {
+            return true;
+        }
+        return false;
+    }
+    false
+}
+
 fn verdict(rule_id: &'static str, action: Action, summary: impl Into<String>) -> Verdict {
     Verdict {
         rule_id: RuleId(rule_id),
@@ -445,13 +510,18 @@ fn verdict(rule_id: &'static str, action: Action, summary: impl Into<String>) ->
 /// 0. 用户白名单短路 → Allow；
 /// 1. 非监控进程（harness_root 为 None）→ Allow（不干预）；
 /// 2. tool_exempt 工具 × 豁免路径 → Allow（需求 §3.3 身份矩阵）；
-/// 3. harness 进程（非豁免工具）触碰 `.git/**` → 按 git_dir_action（默认 Block）；
+/// 3. harness 进程（非豁免工具）触碰 `.git/**` 分面（需求 §3.1，拍板记录 12）：
+///    注入面（hooks/**、config 写）→ 按 git_dir_action（默认 Block）；
+///    工作流面（objects/refs/HEAD/锁文件等本职读写）→ Allow（取证由引擎
+///    按监控根首见补 Audit）；
 /// 4. 敏感文件命中 → Audit（放行不阻断，供取证与评分联动）；
 /// 5. 默认 Allow。
 ///
-/// 说明：规则 3 对读/写一律生效——设计原文为"读 .git 阻断"，但 harness 进程
-/// 无正当直写 .git 的场景（写 .git 走 git 工具的豁免分支），读写一并拒更保守。
-pub fn judge_perm_sync(rules: &RulesSnapshot, id: &Identity, path: &Path, _access: Access) -> Verdict {
+/// 说明：规则 3 的分面依据——实机证实 harness（如 ZCode）内置 git 库在
+/// 进程内直接读写 .git，"harness 不直写 .git、写走 git 工具豁免分支"的
+/// 原假设不成立（拍板记录 12）；工作流面的窃取风险与"读工作区源码"同
+/// 层级，由网络层阈值 + 导出命令封堵 + 归档产物三道兜底（需求 §3.1）。
+pub fn judge_perm_sync(rules: &RulesSnapshot, id: &Identity, path: &Path, access: Access) -> Verdict {
     // 0. 用户白名单短路
     if rules.is_path_whitelisted(path) {
         return verdict("whitelist", Action::Allow, format!("路径在用户白名单：{}", path.display()));
@@ -473,18 +543,25 @@ pub fn judge_perm_sync(rules: &RulesSnapshot, id: &Identity, path: &Path, _acces
         }
     }
 
-    // 3. .git/**（需求 §3.1：窃取 .git = 窃取全仓库历史与凭据配置）
+    // 3. .git/** 分面（需求 §3.1：注入面阻断；工作流面放行，拍板记录 12）
     if under_git_dir(path) {
-        let summary = format!(
-            "[{}] {} 触碰 .git：{}",
-            root.0,
-            id.exe.display(),
-            path.display()
+        if is_git_injection_touch(path, access) {
+            let summary = format!(
+                "[{}] {} 触碰 .git 注入面：{}",
+                root.0,
+                id.exe.display(),
+                path.display()
+            );
+            return match rules.git_dir_action {
+                FileAction::Block => verdict("git-dir", Action::Block, summary),
+                FileAction::Audit => verdict("git-dir", Action::Audit, summary),
+            };
+        }
+        return verdict(
+            "git-dir-workflow",
+            Action::Allow,
+            format!("[{}] {} 访问 .git 工作流面：{}", root.0, id.exe.display(), path.display()),
         );
-        return match rules.git_dir_action {
-            FileAction::Block => verdict("git-dir", Action::Block, summary),
-            FileAction::Audit => verdict("git-dir", Action::Audit, summary),
-        };
     }
 
     // 4. 敏感文件：放行 + Audit（不阻断，读取常见于正常工作流，需求 §3.1）
@@ -532,12 +609,40 @@ mod tests {
     }
 
     #[test]
-    fn 快路径_harness_触碰_git_阻断() {
+    fn 快路径_harness_触碰_git_注入面阻断() {
         let rules = snapshot();
         let id = harness_identity("C:/x/node.exe");
-        let v = judge_perm_sync(&rules, &id, Path::new("D:/repo/.git/config"), Access::Read);
-        assert_eq!(v.rule_id.0, "git-dir");
-        assert_eq!(v.action, Action::Block);
+        // hooks 读写皆注入面
+        for (p, a) in [
+            ("D:/repo/.git/hooks/pre-commit", Access::Read),
+            ("D:/repo/.git/hooks/pre-commit", Access::Write),
+            ("D:/repo/.git/config", Access::Write),
+            ("D:/repo/.git/config.lock", Access::Write),
+        ] {
+            let v = judge_perm_sync(&rules, &id, Path::new(p), a);
+            assert_eq!(v.rule_id.0, "git-dir", "{p}");
+            assert_eq!(v.action, Action::Block, "{p}");
+        }
+    }
+
+    #[test]
+    fn 快路径_harness_触碰_git_工作流面放行() {
+        let rules = snapshot();
+        let id = harness_identity("C:/x/node.exe");
+        // config 读（status 必经）与 objects/HEAD/锁文件读写（commit 必经）
+        // 均为工作流面（拍板记录 12：ZCode 内置 git 库进程内直写 .git）
+        for (p, a) in [
+            ("D:/repo/.git/config", Access::Read),
+            ("D:/repo/.git/objects/1b/bdae00224f257a978f5c7ba86b123dc633642c", Access::Write),
+            ("D:/repo/.git/HEAD.lock", Access::Write),
+            ("D:/repo/.git/HEAD", Access::Read),
+            ("D:/repo/.git/refs/heads/master", Access::Write),
+            ("D:/repo/.git/index", Access::Write),
+        ] {
+            let v = judge_perm_sync(&rules, &id, Path::new(p), a);
+            assert_eq!(v.rule_id.0, "git-dir-workflow", "{p}");
+            assert_eq!(v.action, Action::Allow, "{p}");
+        }
     }
 
     #[test]
@@ -647,5 +752,45 @@ mod tests {
             Some("claude-code")
         );
         assert_eq!(rules.match_harness(Path::new("C:/Windows/system32/cmd.exe")), None);
+    }
+
+    /// 豁免编译期兜底（拍板记录 13 前置防线）：配置丢失 git 条目时，
+    /// 快照仍持有内置 git 豁免——空豁免表不可能是合法运行态。
+    #[test]
+    fn 编译兜底_空豁免表注入内置_git_豁免() {
+        let mut cfg = RulesConfig::default();
+        cfg.tool_exempt = vec![]; // 模拟配置链路异常（缺段/写回丢失）
+        let rules = RulesSnapshot::compile(&cfg).unwrap();
+        let mut id = harness_identity("C:/Program Files/Git/mingw64/bin/git.exe");
+        id.tool_exempt = rules.match_tool_exempt(Path::new("C:/Program Files/Git/mingw64/bin/git.exe")).map(String::from);
+        assert_eq!(id.tool_exempt.as_deref(), Some("git"));
+        let v = judge_perm_sync(&rules, &id, Path::new("D:/repo/.git/objects/ab/cd"), Access::Read);
+        assert_eq!(v.rule_id.0, "tool-exempt");
+        assert_eq!(v.action, Action::Allow);
+    }
+
+    /// 用户自定义 git 条目存在时兜底不介入（以用户为准）
+    #[test]
+    fn 编译兜底_用户自定义条目优先() {
+        let mut cfg = RulesConfig::default();
+        cfg.tool_exempt = vec![ToolExemptConf {
+            exe: "git".into(),
+            allow_paths: vec![".git/objects/**".into()], // 用户收窄
+        }];
+        let rules = RulesSnapshot::compile(&cfg).unwrap();
+        // 收窄生效：objects 内放行
+        assert!(rules.tool_exempt_allows("git", Path::new("D:/repo/.git/objects/ab/cd")));
+        // 收窄生效：objects 外（如 config）不再豁免
+        assert!(!rules.tool_exempt_allows("git", Path::new("D:/repo/.git/config")));
+    }
+
+    /// git_dir_kill 默认 false（拍板记录 13：缺省不杀，处置交用户决定）
+    #[test]
+    fn 处置配置_git_dir_kill_缺省不杀() {
+        let rules = snapshot();
+        assert!(!rules.git_dir_kill);
+        let mut cfg = RulesConfig::default();
+        cfg.git_dir_kill = true;
+        assert!(RulesSnapshot::compile(&cfg).unwrap().git_dir_kill);
     }
 }

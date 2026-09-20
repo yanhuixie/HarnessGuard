@@ -24,9 +24,11 @@ $sseProc = Start-Process "$env:SystemRoot\System32\curl.exe" `
                   "-o","$demo\sse5.log","http://$bind/api/stream" -WindowStyle Hidden -PassThru
 Start-Sleep 2
 
-# 1) 场景 A（修复验证：Read 事件也探测）
+# 1) 场景 A（修复验证：Read 事件也探测；样本用注入面 hooks 读——
+#    config 读已按拍板记录 12 放行，不再是 git-dir 阻断样本）
+New-Item -ItemType File -Force -Path "$demo\repo\.git\hooks\pre-commit" | Out-Null
 Push-Location $demo
-& "$demo\fake_harness.exe" /c "type repo\.git\config" 2>&1 | Out-Null
+& "$demo\fake_harness.exe" /c "type repo\.git\hooks\pre-commit" 2>&1 | Out-Null
 Start-Sleep 2
 & "$demo\fake_harness.exe" /c "type repo\.env" 2>&1 | Out-Null
 Pop-Location

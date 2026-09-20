@@ -129,7 +129,10 @@ pub fn judge_perm_sync(rules: &RulesSnapshot, id: &Identity, path: &Path, access
     // 0. 白名单短路：path/进程在用户白名单 → Allow（需求 §4.3）
     // 1. id.harness_root.is_none() → Allow（非监控进程不干预；审计走 try_send 异步落库）
     // 2. tool_exempt 且路径匹配其豁免模式（如 git × .git/**）→ Allow（需求 §3.3 身份矩阵）
-    // 3. harness 进程（非豁免工具）读 .git/** → Deny（需求 §3.1）
+    // 3. harness 进程（非豁免工具）触碰 .git/** 分面（需求 §3.1，拍板记录 12）：
+    //    注入面（hooks/** 读写、config/config.lock 写）→ Deny；
+    //    工作流面（objects/refs/HEAD/锁文件等本职读写）→ Allow
+    //    （引擎按监控根首见补一条 Audit 取证线索，防高频读写刷库）
     // 4. 敏感文件模式命中 → Allow 放行 + Audit 标记（不阻断，异步落 Verdict(Audit) 供取证）
     // 5. 默认 Allow + try_send 审计事件（满则丢弃计数）
 }
@@ -268,7 +271,8 @@ allow = [                            # 端点白名单：域名优先（经 dns_
 ]
 
 [files]
-git_dir_action     = "block"         # block | audit（需求 §3.1，默认 block 可改）
+git_dir_action     = "block"         # block | audit（需求 §3.1，默认 block 可改；仅作用于 .git 注入面：hooks/** 与 config 写，拍板记录 12）
+git_dir_kill       = false           # 注入面 block 命中是否升级杀进程（拍板记录 13，缺省不杀：判定+通知即止）
 archive_action     = "block"
 sensitive_patterns = [".env", ".env.*", "*_rsa", "*.pem", "*credentials*"]
 archive_patterns   = ["*.zip", "*.tar", "*.tar.gz", "*.tgz", "*.7z", "*.gz", "*.zst"]
@@ -421,7 +425,7 @@ M0 spike 以实测 RSS 为验收项；超支预案：axum 降级 tiny_http、Fil
 | 需求条目 | 设计落点 |
 |----------|----------|
 | §3.1 敏感文件→审计 | 快路径规则 4 + 慢路径 Audit Verdict（§3.3）+ 两级评分联动（§3.3/§6） |
-| §3.1 读 .git / 打包→阻断 | 快路径规则 3（Linux 同步 Deny）/ 慢路径 FileCreate+kill_process（§3.3，含平台阻断实时性差异说明） |
+| §3.1 .git 注入面 / 打包→阻断 | 快路径规则 3（Linux 同步 Deny；工作流面 Allow + 引擎 root 首见 Audit，拍板记录 12）/ 慢路径 FileCreate+kill_process（§3.3，含平台阻断实时性差异说明） |
 | §3.2 网络兜底阈值 | ConnRegistry 累计 + 白名单（§3.3）+ `conns`/`dns_map` 表（§4）+ 三平台 DNS 观测点（§5） |
 | §3.3 身份矩阵/导出封堵 | `tool_exempt`（exe × 路径）+ `[commands].blocked`（§3.2/§3.3/§6） |
 | §3.4 进程身份表/补扫描/短命进程 | ProcTable + 启动补扫描（§3.2）；eBPF 保短命进程可见（§5.2） |
@@ -449,3 +453,5 @@ M0 spike 以实测 RSS 为验收项；超支预案：axum 降级 tiny_http、Fil
 9. **IPv6 断连接降级**（M4 实测，2026-09-19）：§5.1 原文的 `SetTcp6Entry` 为**文档幻影**——Windows SDK 头文件（iphlpapi.h/netioapi.h 及整个 um/）无声明、iphlpapi.lib 无符号、iphlpapi.dll 导出表无此名（Win10 26100 全量导出枚举核对，仅 `SetTcpEntry`/`SetPerTcp(6)ConnectionEStats` 存在），用户态文档化 API 无法实现 v6 连接级断开。拍板：v6 连接处置由引擎侧 Kill（socket 随进程关闭）+ 封 IP（netsh/WFP 均支持 v6）兜底；`MIB_TCP6ROW` 行构造纯函数与单测保留（锚定 MIB 布局），供平台补齐或 NSI 未公开接口评估——后者超出"文档化用户态 API"设计边界，暂不采用。
 10. **FileObject 缓存容量 200k 维持 + §10 预算表修订**（M4 第二批，2026-09-20）：M1 沿袭的 200k 全量约 26–29MB（条目 48B slab + ~16B 索引 + NT 路径字符串均值 ~80B），超原 §10"平台事件源 5–15MB"档。拍板**不核减容量、修订预算表拆列单计**，依据：① M4 复验定案——句柄探测对短命句柄无效（ETW 投递延迟 > 句柄存活期），Name 缓存命中是文件路径解析的唯一现实主路径，容量直接决定 burst（tar 解包/大仓 git）下的 unknown 率；② 核减至 64k 在 monorepo 规模 burst 下将重演 M1"整表清空后 Read/Write 全 unknown"教训，且当前无实测 unknown 率数据支撑核减的安全性；③ 100MB 硬约束仍满足（修订后合计 ~54–83MB，余量 ≥ 17MB；estats 表经 M4 第二批逐轮收敛机制成立硬封顶）。实机 RSS 复验列入 M4 第二批复验清单。
 11. **场景 A 备选通道落地 Security 4663（opt-in）**（M4 第二批，2026-09-20）：复验定案句柄探测对短命句柄无效后评估两条消费路径——① ETW 直连 Security-Auditing provider（{54849625-5478-4994-A5BA-3E3B0328C30D}）为 undocumented 技巧（仅 SYSTEM 身份、搭 OS 的 EventLog-Security 会话，krabsetw 示例实证；MS Learn 无消费文档），不作产品主路径；② 采用文档化的 **EvtSubscribe push 订阅**（winevt）：Security 通道 + XPath 过滤 EventID=4663，管理员/Event Log Readers 权限即可，实时回调。启用端（auditpol 开 File System 成功审计 + 目标目录 Everyone 审计 ACE，SACL 写入需 SeSecurityPrivilege）侵入系统级审计策略且 SACL 命中产生 Security 日志增长——拍板**默认关闭、显式 opt-in**：`enable-file-audit <目录>` / `disable-file-audit <目录>` 子命令管理生命周期（auditpol 子类别用 GUID 形式免本地化差异），事件经 FileOpen 复用引擎判定链（含监控树早过滤与 watch_paths 分量边界前缀过滤）。不进"一键安装"默认路径，M4 验收"≤5 分钟人工步骤"不受累。
+12. **git-dir 规则分面：注入面阻断、工作流面放行**（2026-09-20，实机误杀定案）：原实现按需求 §3.1 旧文"读 .git 阻断"扩展为读写一律拒，其依据是"harness 无正当直写 .git 场景、写 .git 走 git.exe 豁免分支"的假设——ZCode 实机打破该假设：ETW 观测到 ZCode.exe 名下进程创建 `.git/objects/**` 与 `HEAD.lock`，正常 git 工作流被反复 Kill（**2026-09-20 后续调查修正**：ZCode 的 git 层静态证据为 spawn 外部 git.exe 形态（`ZCODE_GIT_BINARY`/dugite 风格调用，无进程内 git 库组件）；当日同时存在豁免失效（见拍板 13 前置防线）与 pid 复用冒名（M4 待修 ①）两个混杂因素，"进程内直写"未定谳——但分面结论不受影响：无论 IO 来自 git.exe 冒名还是进程内路径，按路径分面都是正确对策）。拍板（项目所有者）：`.git` 按**路径 × 读写方向**分面——**注入面**（`hooks/**` 读写；`config`/`config.lock` 写）维持 `git_dir_action` 默认 Block，依据 hook 注入与配置篡改（`core.fsmonitor`/`pager` 等执行注入点）是持久化/凭据劫持向量、正常工作流不触碰（已知 tradeoff：harness 内 `git init`/`clone` 写 `hooks/*.sample`、husky 类工具装 hook 会被拦，低频且方向保守，可配置解除）；**工作流面**（objects/refs/logs/HEAD/index/各类锁文件等读写）放行——进程内 git 库与 harness 任意代码同址不可身份区分，窃取面（读 .git 后外传）与"读工作区源码"同风险层级，由网络层阈值 + 导出命令封堵 + 归档产物三道兜底。引擎对工作流面按监控根首见补一条 Audit 取证线索（防 status/diff 高频读写刷库）。需求 §3.1/§2 已同步修订。
+13. **git 注入面处置去杀化（配置化，缺省不杀）+ git 豁免编译期兜底**（2026-09-20，项目所有者拍板）：注入面命中 Block 判定时**默认不再杀进程**，新增 `[files] git_dir_kill`（缺省 false）交给用户决定是否升级——依据：Windows ETW 事后语义下杀仅止损（实测被"阻断"的 objects 文件实际已落盘），且打包封堵与网络阈值两重兜底仍在，杀进程对正常工作流的误伤代价（实机：ZCode 被杀重启）高于其止损收益。同批落地**豁免兜底**：`RulesSnapshot::compile` 在 tool_exempt 配置缺失 git 条目时注入内置 `.git/**` 豁免并告警（依据当日实测教训——运行实例豁免表为空而配置文件有段，文件与内存软状态可能分裂，git 豁免是需求 §3.3 明文行为、空表必属异常，不允许静默失去；用户自定义 git 条目存在时以用户为准）。附带修复：`allow_paths` 多段目录模式（如 `.git/objects/**`）旧实现在组件级 eq 匹配下静默失效，改为段序列滑窗匹配。测试补齐三层盲区：单测（旧版配置缺字段/缺豁免段的解析与兜底回归）、engine 门控测试、m1-demo 实机正向豁免场景（树内真 git.exe status/commit、绝对路径 git.exe、进程内 IO 形态模拟）。

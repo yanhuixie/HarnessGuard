@@ -27,9 +27,11 @@ Get-Content "$demo\sse2.verbose.log" -ErrorAction SilentlyContinue | Select-Obje
 & $R "[SSE] query token 形式（8s）"
 & "$env:SystemRoot\System32\curl.exe" -s -N --max-time 8 "http://$bind/api/stream?token=$token" -o "$demo\sse3.log"
 & $R ("[SSE] query 形式 body字节={0}" -f (Get-Item "$demo\sse3.log" -ErrorAction SilentlyContinue).Length)
-& $R "[SSE] 期间触发一次判定（type .git\config）供 SSE 推送观测"
+& $R "[SSE] 期间触发一次判定（type .git\hooks\pre-commit，注入面）供 SSE 推送观测"
+# 拍板记录 12：.git 工作流面（config 读等）已放行，场景 A 样本须用注入面
+New-Item -ItemType File -Force -Path "$demo\repo\.git\hooks\pre-commit" | Out-Null
 Push-Location $demo
-& "$demo\fake_harness.exe" /c "type repo\.git\config" 2>&1 | Out-Null
+& "$demo\fake_harness.exe" /c "type repo\.git\hooks\pre-commit" 2>&1 | Out-Null
 Pop-Location
 Start-Sleep 3
 & "$env:SystemRoot\System32\curl.exe" -s -N --max-time 6 -H "Authorization: Bearer $token" "http://$bind/api/stream" -o "$demo\sse4.log"
@@ -38,8 +40,10 @@ try { $sse4 = Get-Content "$demo\sse4.log" -Raw } catch { $sse4 = "" }
 & $R ("[SSE] retry:{0} verdict:{1} audit:{2}" -f ($sse4 -match 'retry: 3000'), ([regex]::Matches($sse4,'event: verdict').Count), ([regex]::Matches($sse4,'event: audit').Count))
 
 # ---------- 2. 场景 A 重测（type 直读，无 certutil 引号坑） ----------
+# 注入面样本（hooks 读）：工作流面（config/objects 等）已按拍板记录 12 放行
+New-Item -ItemType File -Force -Path "$demo\repo\.git\hooks\pre-commit" | Out-Null
 Push-Location $demo
-& "$demo\fake_harness.exe" /c "type repo\.git\config" 2>&1 | Out-Null
+& "$demo\fake_harness.exe" /c "type repo\.git\hooks\pre-commit" 2>&1 | Out-Null
 & "$demo\fake_harness.exe" /c "type repo\.env" 2>&1 | Out-Null
 & "$demo\fake_harness.exe" /c "for /L %i in (1,1,60) do @type repo\src_1.rs" 2>&1 | Out-Null
 Pop-Location

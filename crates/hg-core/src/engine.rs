@@ -91,6 +91,9 @@ pub struct Engine {
     root_bytes: DashMap<(String, IpAddr), u64>,
     /// 已读敏感文件的监控根（两级评分联动，需求 §3.1/技术设计 §3.3）
     root_sensitive: DashSet<String>,
+    /// 已放行 .git 工作流面的监控根（首见 Audit 取证线索；按 root 数天然
+    /// 封顶，与 root_sensitive 同构，需求 §3.1 拍板记录 12）
+    root_git_flow: DashSet<String>,
     /// 已处置连接（防重复处置风暴）
     handled_conns: DashSet<u64>,
     /// 单调毫秒 → UTC 毫秒换算基准
@@ -114,6 +117,7 @@ impl Engine {
             dns: DashMap::new(),
             root_bytes: DashMap::new(),
             root_sensitive: DashSet::new(),
+            root_git_flow: DashSet::new(),
             handled_conns: DashSet::new(),
             base_utc_ms: utc_now_ms(),
         }
@@ -328,14 +332,19 @@ impl Engine {
         let v = judge_perm_sync(&rules, &id, path, access);
         match v.action {
             Action::Block => {
-                // Windows 文件无同步拒绝点：事后杀进程（技术设计 §3.1/拍板 2）
+                // Windows 文件无同步拒绝点，处置语义事后（技术设计 §3.1/拍板 2）。
+                // git-dir 注入面是否升级杀进程由 git_dir_kill 决定（拍板记录 13，
+                // 缺省 false：Block 判定 + 通知即止——ETW 事后杀仅止损，且打包
+                // 封堵与网络阈值两重兜底仍在）。
                 let summary = v.evidence.summary.clone();
                 self.emit_verdict(pid, &id.exe.display().to_string(), v.clone(), Timestamp(0));
-                self.send(EngineOutput::Kill {
-                    pid,
-                    start_time: id.start_time,
-                    reason: summary.clone(),
-                });
+                if v.rule_id.0 != "git-dir" || rules.git_dir_kill {
+                    self.send(EngineOutput::Kill {
+                        pid,
+                        start_time: id.start_time,
+                        reason: summary.clone(),
+                    });
+                }
                 self.send(EngineOutput::Notify {
                     title: "HarnessGuard：已阻断敏感路径访问".into(),
                     body: summary,
@@ -347,7 +356,17 @@ impl Engine {
                 }
                 self.emit_verdict(pid, &id.exe.display().to_string(), v, Timestamp(0));
             }
-            Action::Allow => {}
+            Action::Allow => {
+                // .git 工作流面首见取证（拍板记录 12）：放行不阻断，每个监控根
+                // 留一条线索供事后调查（harness 是否在动 .git）
+                if v.rule_id.0 == "git-dir-workflow" {
+                    if let Some(root) = &id.harness_root {
+                        if self.root_git_flow.insert(root.0.clone()) {
+                            self.emit_verdict(pid, &id.exe.display().to_string(), v, Timestamp(0));
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -356,33 +375,37 @@ impl Engine {
         let Some(id) = self.procs.get(&pid) else { return Ok(()) };
         let Some(root) = &id.harness_root else { return Ok(()) };
         let rules = self.rules.load();
-        // .git 目录下创建文件同样命中 git-dir 规则（Create 事件先于 Read 到达，
-        // Windows 事后处置语义下两者都要拦，防只靠后续事件漏判）
+        // Create 事件先于 Read/Write 到达（Windows 事后处置语义下两者都要判，
+        // 防只靠后续事件漏判）。按写语义复用快路径统一判定，仅注入面 Kill
+        // （hooks/**、config 写，拍板记录 12）；工作流面放行 + root 首见取证。
         if crate::rules::under_git_dir(path) {
-            let summary = format!(
-                "[{}] {} 触碰 .git（创建）：{}（pid {pid}）",
-                root.0,
-                id.exe.display(),
-                path.display()
-            );
-            let v = Verdict {
-                rule_id: RuleId("git-dir"),
-                action: match rules.git_dir_action {
-                    crate::rules::FileAction::Block => Action::Block,
-                    crate::rules::FileAction::Audit => Action::Audit,
-                },
-                evidence: Evidence {
-                    summary: summary.clone(),
-                    detail: serde_json::json!({ "path": path.display().to_string(), "via": "file-create" }),
-                },
-            };
-            self.emit_verdict(pid, &id.exe.display().to_string(), v, ts);
-            if matches!(rules.git_dir_action, crate::rules::FileAction::Block) {
-                self.send(EngineOutput::Kill { pid, start_time: id.start_time, reason: summary.clone() });
-                self.send(EngineOutput::Notify {
-                    title: "HarnessGuard：已阻断敏感路径访问".into(),
-                    body: summary,
-                });
+            let mut v = judge_perm_sync(&rules, &id, path, hg_model::Access::Write);
+            v.evidence.summary = format!("{}（创建，pid {pid}）", v.evidence.summary);
+            v.evidence.detail = serde_json::json!({
+                "path": path.display().to_string(),
+                "via": "file-create",
+            });
+            match v.action {
+                Action::Block => {
+                    let summary = v.evidence.summary.clone();
+                    self.emit_verdict(pid, &id.exe.display().to_string(), v, ts);
+                    // 杀进程升级由 git_dir_kill 决定（拍板记录 13，缺省不杀）
+                    if rules.git_dir_kill {
+                        self.send(EngineOutput::Kill { pid, start_time: id.start_time, reason: summary.clone() });
+                    }
+                    self.send(EngineOutput::Notify {
+                        title: "HarnessGuard：已阻断敏感路径访问".into(),
+                        body: summary,
+                    });
+                }
+                Action::Audit => {
+                    self.emit_verdict(pid, &id.exe.display().to_string(), v, ts);
+                }
+                Action::Allow => {
+                    if self.root_git_flow.insert(root.0.clone()) {
+                        self.emit_verdict(pid, &id.exe.display().to_string(), v, ts);
+                    }
+                }
             }
             return Ok(());
         }
@@ -525,4 +548,251 @@ fn utc_now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proc_table::ProcTable;
+    use crate::rules::{RulesConfig, RulesSnapshot};
+    use std::path::Path;
+
+    fn engine_with(mut cfg: RulesConfig) -> (Arc<Engine>, tokio::sync::mpsc::Receiver<EngineOutput>) {
+        let (tx, rx) = mpsc::channel(64);
+        let procs = Arc::new(ProcTable::new());
+        procs.bootstrap_insert(ProcTable::test_identity(
+            20812,
+            "C:/Program Files/ZCode/ZCode.exe",
+            Some("zcode"),
+        ));
+        let rules = Arc::new(ArcSwap::from_pointee(RulesSnapshot::compile(&cfg).unwrap()));
+        let eng = Engine::new(procs, Arc::new(ConnRegistry::new()), rules, tx, Arc::new(EngineStats::default()));
+        (Arc::new(eng), rx)
+    }
+
+    fn engine() -> (Arc<Engine>, tokio::sync::mpsc::Receiver<EngineOutput>) {
+        engine_with(RulesConfig::default())
+    }
+
+    fn drain(rx: &mut tokio::sync::mpsc::Receiver<EngineOutput>) -> Vec<EngineOutput> {
+        let mut out = Vec::new();
+        while let Ok(o) = rx.try_recv() {
+            out.push(o);
+        }
+        out
+    }
+
+    fn kill_count(out: &[EngineOutput]) -> usize {
+        out.iter().filter(|o| matches!(o, EngineOutput::Kill { .. })).count()
+    }
+
+    fn block_verdict_count(out: &[EngineOutput]) -> usize {
+        out.iter()
+            .filter(|o| matches!(
+                o,
+                EngineOutput::Verdict { verdict: v, .. } if v.rule_id.0 == "git-dir" && v.action == Action::Block
+            ))
+            .count()
+    }
+
+    /// 注入面（hooks 写 / config 写）创建 → Block 判定 + 通知，**默认不杀**
+    /// （拍板记录 13：git_dir_kill 缺省 false，打包与网络两重兜底仍在）
+    #[test]
+    fn 创建_git_注入面_默认阻断不杀() {
+        for p in ["D:/repo/.git/hooks/pre-commit", "D:/repo/.git/config"] {
+            let (eng, mut rx) = engine();
+            eng.on_file_create(20812, Path::new(p), Timestamp(0)).unwrap();
+            let out = drain(&mut rx);
+            assert_eq!(block_verdict_count(&out), 1, "{p}：应有 git-dir Block 判定");
+            assert_eq!(kill_count(&out), 0, "{p}：默认不得杀进程");
+            assert!(out.iter().any(|o| matches!(o, EngineOutput::Notify { .. })), "{p}：应有通知");
+        }
+    }
+
+    /// git_dir_kill=true 时注入面创建升级为杀进程（用户显式开启）
+    #[test]
+    fn 创建_git_注入面_开启kill则杀() {
+        let mut cfg = RulesConfig::default();
+        cfg.git_dir_kill = true;
+        let (eng, mut rx) = engine_with(cfg);
+        eng.on_file_create(20812, Path::new("D:/repo/.git/hooks/pre-commit"), Timestamp(0)).unwrap();
+        let out = drain(&mut rx);
+        assert_eq!(kill_count(&out), 1);
+        assert_eq!(block_verdict_count(&out), 1);
+    }
+
+    /// 打开路径（Read/Write 事件）同样受 git_dir_kill 门控
+    #[test]
+    fn 打开_git_注入面_默认不杀_kil开启则杀() {
+        let (eng, mut rx) = engine();
+        eng.on_file_open(20812, Path::new("D:/repo/.git/hooks/pre-commit"), hg_model::Access::Read).unwrap();
+        let out = drain(&mut rx);
+        assert_eq!(block_verdict_count(&out), 1);
+        assert_eq!(kill_count(&out), 0);
+
+        let mut cfg = RulesConfig::default();
+        cfg.git_dir_kill = true;
+        let (eng, mut rx) = engine_with(cfg);
+        eng.on_file_open(20812, Path::new("D:/repo/.git/hooks/pre-commit"), hg_model::Access::Read).unwrap();
+        let out = drain(&mut rx);
+        assert_eq!(kill_count(&out), 1);
+    }
+
+    /// 工作流面创建（commit 写 objects / HEAD.lock）→ 放行不杀，每 root 首见一条取证
+    #[test]
+    fn 创建_git_工作流面_放行且首见留痕() {
+        let (eng, mut rx) = engine();
+        eng.on_file_create(20812, Path::new("D:/repo/.git/objects/1b/bdae002"), Timestamp(0)).unwrap();
+        let first = drain(&mut rx);
+        assert_eq!(kill_count(&first), 0);
+        assert!(first.iter().any(|o| matches!(
+            o,
+            EngineOutput::Verdict { verdict: v, .. }
+                if v.rule_id.0 == "git-dir-workflow" && v.action == Action::Allow
+        )));
+        // 同 root 第二条工作流面访问：静默（防 status/diff 高频读写刷库）
+        eng.on_file_create(20812, Path::new("D:/repo/.git/HEAD.lock"), Timestamp(0)).unwrap();
+        let second = drain(&mut rx);
+        assert!(second.is_empty());
+    }
+
+    /// 工作流面读（status 读 config）放行且无任何处置
+    #[test]
+    fn 打开_git_工作流面_放行() {
+        let (eng, mut rx) = engine();
+        eng.on_file_open(20812, Path::new("D:/repo/.git/config"), hg_model::Access::Read).unwrap();
+        let out = drain(&mut rx);
+        assert_eq!(kill_count(&out), 0);
+        assert!(out.iter().any(|o| matches!(
+            o,
+            EngineOutput::Verdict { verdict: v, .. }
+                if v.rule_id.0 == "git-dir-workflow" && v.action == Action::Allow
+        )));
+    }
+
+    /// 打包双信号之信号 2（需求 §3.1）：进程内创建归档产物（无独立子进程，
+    /// 模拟 Node archiver 类库）→ archive-create Block + 杀进程。
+    /// 打包封堵不受 git_dir_kill 门控（拍板记录 13 仅作用于 git 注入面）。
+    #[test]
+    fn 创建归档产物_阻断并杀进程() {
+        for name in ["D:/tmp/out2.zip", "D:/tmp/repo.tar.gz", "D:/tmp/x.7z"] {
+            let (eng, mut rx) = engine();
+            eng.on_file_create(20812, Path::new(name), Timestamp(0)).unwrap();
+            let out = drain(&mut rx);
+            assert!(
+                out.iter().any(|o| matches!(
+                    o,
+                    EngineOutput::Verdict { verdict: v, .. }
+                        if v.rule_id.0 == "archive-create" && v.action == Action::Block
+                )),
+                "{name}：应有 archive-create Block 判定"
+            );
+            assert_eq!(kill_count(&out), 1, "{name}：打包封堵应杀进程");
+        }
+    }
+
+    /// 归档产物：archive_action=audit 时不杀只记录
+    #[test]
+    fn 创建归档产物_audit模式不杀() {
+        let mut cfg = RulesConfig::default();
+        cfg.archive_action = crate::rules::FileAction::Audit;
+        let (eng, mut rx) = engine_with(cfg);
+        eng.on_file_create(20812, Path::new("D:/tmp/out.zip"), Timestamp(0)).unwrap();
+        let out = drain(&mut rx);
+        assert_eq!(kill_count(&out), 0);
+        assert!(out.iter().any(|o| matches!(
+            o,
+            EngineOutput::Verdict { verdict: v, .. }
+                if v.rule_id.0 == "archive-create" && v.action == Action::Audit
+        )));
+    }
+
+    // ---------- 网络层（on_conn_tx 阈值路径，需求 §3.2）----------
+
+    use hg_model::HarnessId;
+
+    fn conn_open(eng: &Engine, cid: u64, ip: &str) {
+        eng.conns.on_open(
+            ConnId(cid),
+            crate::conn_registry::ConnEntry {
+                pid: 20812,
+                start_time: StartTime(1),
+                harness_root: Some(HarnessId("zcode".into())),
+                proto: Proto::Tcp,
+                local: "127.0.0.1:50000".parse().unwrap(),
+                remote: ip.parse().unwrap(),
+                bytes_out: 0,
+                opened_ts: Timestamp(0),
+            },
+        );
+    }
+
+    fn net_output_count(out: &[EngineOutput]) -> (usize, usize, usize) {
+        // (net-threshold Block 判定, DropTcp, BlockIp)
+        (
+            out.iter().filter(|o| matches!(o,
+                EngineOutput::Verdict { verdict: v, .. }
+                    if v.rule_id.0 == "net-threshold" && v.action == Action::Block)).count(),
+            out.iter().filter(|o| matches!(o, EngineOutput::DropTcp { .. })).count(),
+            out.iter().filter(|o| matches!(o, EngineOutput::BlockIp { .. })).count(),
+        )
+    }
+
+    /// 累计上行超阈值 → net-threshold Block + 断连接 + 封 IP（需求 §3.2）
+    #[test]
+    fn 上行超阈值_阻断断连封ip() {
+        let mut cfg = RulesConfig::default();
+        cfg.upload_threshold_mb = 1; // 1MB 阈值便于测试
+        let (eng, mut rx) = engine_with(cfg);
+        conn_open(&eng, 7, "8.8.8.8:443");
+        // 两笔累计 1.5MB：第一笔未超，第二笔越线触发
+        eng.on_conn_tx(ConnId(7), 600 * 1024, Timestamp(0));
+        assert_eq!(net_output_count(&drain(&mut rx)), (0, 0, 0), "未超阈值不得处置");
+        eng.on_conn_tx(ConnId(7), 900 * 1024, Timestamp(1));
+        let (v, drop, block) = net_output_count(&drain(&mut rx));
+        assert_eq!((v, drop, block), (1, 1, 1), "超阈值应出判定+断连+封IP");
+    }
+
+    /// 白名单端点不计入阈值（域名经 dns_map 反查命中，需求 §3.2）
+    #[test]
+    fn 白名单端点_不计入阈值() {
+        let mut cfg = RulesConfig::default();
+        cfg.upload_threshold_mb = 1;
+        let (eng, mut rx) = engine_with(cfg);
+        conn_open(&eng, 8, "1.2.3.4:443");
+        eng.dns.insert("1.2.3.4".parse().unwrap(), "api.anthropic.com".into());
+        eng.on_conn_tx(ConnId(8), 5 * 1024 * 1024, Timestamp(0)); // 5MB 远超 1MB
+        let out = drain(&mut rx);
+        assert!(out.is_empty(), "白名单端点大流量也不得触发处置");
+    }
+
+    /// 两级评分联动（需求 §3.1）：监控根读过敏感文件后阈值降为 1/N
+    #[test]
+    fn 敏感降档_阈值十分之一即触发() {
+        let mut cfg = RulesConfig::default();
+        cfg.upload_threshold_mb = 1;
+        cfg.sensitive_escalation_divisor = 10;
+        let (eng, mut rx) = engine_with(cfg);
+        eng.root_sensitive.insert("zcode".into()); // 模拟已读敏感文件
+        conn_open(&eng, 9, "8.8.8.8:443");
+        // 200KB < 1MB 原阈值，但 > 1MB/10 降档阈值 → 触发
+        eng.on_conn_tx(ConnId(9), 200 * 1024, Timestamp(0));
+        let (v, _, _) = net_output_count(&drain(&mut rx));
+        assert_eq!(v, 1, "降档后 200KB 即应触发");
+    }
+
+    /// 已处置连接（handled_conns）不再重复处置（防处置风暴）
+    #[test]
+    fn 已处置连接_不重复处置() {
+        let mut cfg = RulesConfig::default();
+        cfg.upload_threshold_mb = 1;
+        let (eng, mut rx) = engine_with(cfg);
+        conn_open(&eng, 10, "8.8.8.8:443");
+        eng.on_conn_tx(ConnId(10), 2 * 1024 * 1024, Timestamp(0));
+        assert_eq!(net_output_count(&drain(&mut rx)).0, 1);
+        // 同连接继续上行：不再出第二条判定
+        eng.on_conn_tx(ConnId(10), 2 * 1024 * 1024, Timestamp(1));
+        let out = drain(&mut rx);
+        assert!(out.is_empty(), "同连接不得重复处置");
+    }
 }
