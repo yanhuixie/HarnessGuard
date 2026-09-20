@@ -46,6 +46,7 @@ globset = "0.4"
 rusqlite = { version = "0.37", features = ["bundled"] }
 axum = "0.8"
 toml = "0.8"
+toml_edit = "0.22"
 rust-embed = { version = "8", features = ["compression"] }
 rand = "0.8"
 ferrisetw = "1"

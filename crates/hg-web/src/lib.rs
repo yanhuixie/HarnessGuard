@@ -319,7 +319,9 @@ async fn config_put(State(st): State<Arc<AppState>>, body: String) -> Response {
         Ok(c) => c,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("TOML 解析失败: {e}")).into_response(),
     };
-    if let Err(e) = parsed.save(&st.config_path) {
+    // 设置页是"原文件文本→编辑→提交"的往返：校验通过后按提交原文落盘，
+    // 保留文件注释与用户在 UI 里对注释的修改（save() 合并会以旧文件注释为准）。
+    if let Err(e) = std::fs::write(&st.config_path, &body) {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("保存失败: {e}")).into_response();
     }
     *st.config.write().unwrap() = parsed;
