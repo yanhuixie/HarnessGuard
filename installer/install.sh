@@ -30,7 +30,7 @@ WorkingDirectory=$DIR
 ExecStart=$BIN service
 Restart=always
 RestartSec=5
-# 对应 §8.2 自保护：配置/库仅 root 可写（DACl 由 systemd 的 User=root +
+# 对应 §8.2 自保护：配置/库仅 root 可写（DACL 由 systemd 的 User=root +
 # chmod 实现，Linux 侧无 DACL 概念）
 User=root
 
@@ -40,7 +40,9 @@ EOF
 
 systemctl daemon-reload
 systemctl enable "$SERVICE"
-systemctl start "$SERVICE"
+# restart 而非 start：对运行中的旧实例即升级语义（换二进制/unit 后重启生效，
+# 对未运行服务等价 start）——与 Windows install 的版本化升级路径对齐
+systemctl restart "$SERVICE"
 systemctl --no-pager --lines 5 status "$SERVICE" || true
 echo "Web token：$DIR/web-token.txt（服务启动后生成）"
 echo "卸载：./uninstall.sh"

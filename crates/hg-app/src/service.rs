@@ -107,7 +107,8 @@ fn report_state(
 
 /// 一键安装（需管理员提权；M4 验收：全新机器单命令到防护生效 ≤5 分钟人工步骤）。
 ///
-/// 流程：① 前置检查（提权 / Web 端口未占用 / BFE 运行——WFP 封禁依赖）
+/// 流程：① 前置检查（提权 / Web 端口未占用 / BFE 运行——WFP 封禁依赖；
+/// 升级模式跳过端口预检——运行中的旧服务自身占用端口属预期，停服后释放）
 /// ② 配置生成（exe 目录缺省 config.toml 落盘默认配置）③ 自保护 ACL（§8.2）
 /// ④ 服务安装——已存在则版本化升级（停服 + binPath 更新，config/db 保留）
 /// ⑤ 恢复策略 + 启动 + 等待 RUNNING + 生效提示。
@@ -116,7 +117,11 @@ pub fn install() -> anyhow::Result<()> {
     let exe_dir = exe.parent().map(|d| d.to_path_buf());
     let version = env!("CARGO_PKG_VERSION");
 
-    preflight(exe_dir.as_deref())?;
+    // 升级模式预判（评审 H-1）：既有服务运行中会占用 Web 端口，端口预检须跳过
+    let upgrade_mode = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .and_then(|m| m.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS))
+        .is_ok();
+    preflight(exe_dir.as_deref(), upgrade_mode)?;
 
     // 配置生成：服务 CWD 锚定 exe 目录（service_main 切换），缺省则落默认配置
     if let Some(dir) = &exe_dir {
@@ -165,7 +170,9 @@ pub fn install() -> anyhow::Result<()> {
                 );
             }
             stop_and_wait(&service)?;
-            service.change_config(&info)?;
+            service
+                .change_config(&info)
+                .context("升级失败：服务已停止但 binPath 更新未生效——可重跑 install 或手工 sc config")?;
             println!("服务配置已更新到 v{version}");
             service
         }
@@ -187,7 +194,8 @@ pub fn install() -> anyhow::Result<()> {
         }
     }
 
-    // 恢复策略（需求 §6.3/技术设计 §8.2）：三级重启，计数 24h 重置
+    // 恢复策略（需求 §6.3/技术设计 §8.2）：三级重启，计数 24h 重置。
+    // 注：sc.exe 的失败文本输出在 stdout（历史行为），stderr 常为空——合并读取
     let out = std::process::Command::new("sc")
         .args([
             "failure", SERVICE_NAME,
@@ -196,26 +204,41 @@ pub fn install() -> anyhow::Result<()> {
         ])
         .output()?;
     if !out.status.success() {
-        anyhow::bail!("恢复策略配置失败：{}", String::from_utf8_lossy(&out.stderr));
+        let txt = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        anyhow::bail!(
+            "恢复策略配置失败（服务已安装，仅启动受阻）：{txt}——可手工执行上述 sc failure 命令后 sc start {SERVICE_NAME}"
+        );
     }
 
-    // 启动并等待 RUNNING（一键到"防护生效"）
-    service.start(&[OsString::from("service")])?;
+    // 启动并等待 RUNNING（一键到"防护生效"；失败时如实披露半装状态——评审 M-2）。
+    // start 参数只进 ServiceMain argv（本实现忽略），进程命令行由 binPath 决定
+    if let Err(e) = service.start(&[] as &[OsString]) {
+        anyhow::bail!(
+            "服务已安装（或已升级），但启动失败：{e}——可执行 sc start {SERVICE_NAME} 重试，并查看 logs/ 目录"
+        );
+    }
+    let mut started = false;
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         let st = service.query_status()?;
         if st.current_state == ServiceState::Running {
             println!("服务已启动（RUNNING）——防护生效");
+            started = true;
             break;
         }
         if std::time::Instant::now() > deadline {
-            println!("警告：15s 内未达 RUNNING（当前 {:?}），请查 logs/ 或 sc query {SERVICE_NAME}", st.current_state);
+            println!("警告：15s 内未达 RUNNING（当前 {:?}）——安装已完成但启动未确认，请查 logs/ 或 sc query {SERVICE_NAME}", st.current_state);
             break;
         }
         std::thread::sleep(Duration::from_millis(300));
     }
     if let Some(dir) = &exe_dir {
-        println!("Web UI：http://127.0.0.1:8377/（token 见 {}）", dir.join("web-token.txt").display());
+        let sure = if started { "" } else { "（启动未确认）" };
+        println!("Web UI{sure}：http://127.0.0.1:8377/（token 见 {}）", dir.join("web-token.txt").display());
         println!("日志：{}", dir.join("logs").display());
     }
     println!("可选：文件审计通道（场景 A 加强，系统侵入性 opt-in）：harnessguard enable-file-audit <工作区/.git>");
@@ -224,26 +247,42 @@ pub fn install() -> anyhow::Result<()> {
 
 /// 前置检查：提权 / 端口可绑 / BFE 运行。BFE 未运行仅告警（netsh 降级路径
 /// 存在，WFP 为封禁主路径）；提权与端口冲突直接失败（无法继续）。
-fn preflight(exe_dir: Option<&std::path::Path>) -> anyhow::Result<()> {
+/// `upgrade_mode`：既有服务在场——跳过端口预检（运行中的旧服务自身占用端口
+/// 属预期，停服后释放；评审 H-1）。
+fn preflight(exe_dir: Option<&std::path::Path>, upgrade_mode: bool) -> anyhow::Result<()> {
     // ① 提权：安装改 SCM 与 DACL，未提权必失败——显式报错优于半途失败
     if !is_elevated() {
         anyhow::bail!("未以管理员提权运行（服务安装/ACL/BFE 检查均需要）");
     }
-    // ② 端口：读实际配置的 bind（缺省默认），试绑后立即释放
-    let bind = exe_dir
-        .map(|d| d.join("config.toml"))
-        .filter(|p| p.exists())
-        .and_then(|p| hg_core::FileConfig::load(&p).ok())
-        .map(|c| c.web.bind)
-        .unwrap_or_else(|| "127.0.0.1:8377".to_string());
-    match std::net::TcpListener::bind(&bind) {
-        Ok(_) => println!("前置检查：端口 {bind} 可绑定"),
-        Err(e) => anyhow::bail!(
-            "前置检查失败：Web 端口 {bind} 被占用（{e}）——排查：netstat -ano | findstr :{}，或修改 config.toml [web] bind",
-            bind.rsplit(':').next().unwrap_or("8377")
-        ),
+    // ② 端口：读实际配置的 bind（缺省默认），试绑后立即释放。
+    // 配置解析失败按默认端口检查并告警（畸形配置的实际端口可能不同——如实提示）
+    if upgrade_mode {
+        println!("前置检查：升级模式，跳过端口预检（旧服务停服后释放端口）");
+    } else {
+        let cfg_load = exe_dir
+            .map(|d| d.join("config.toml"))
+            .filter(|p| p.exists())
+            .and_then(|p| hg_core::FileConfig::load(&p).ok());
+        if exe_dir.is_some_and(|d| d.join("config.toml").exists()) && cfg_load.is_none() {
+            println!("警告：config.toml 解析失败，按默认端口 8377 预检");
+        }
+        let bind = cfg_load
+            .map(|c| c.web.bind)
+            .unwrap_or_else(|| "127.0.0.1:8377".to_string());
+        // 无端口/畸形 bind：先给出准确报错（bind 试绑失败会被误报为端口占用）
+        let Ok(addr) = bind.parse::<std::net::SocketAddr>() else {
+            anyhow::bail!("前置检查失败：config.toml 的 [web] bind 非法（{bind}，应为 ip:port）");
+        };
+        match std::net::TcpListener::bind(addr) {
+            Ok(_) => println!("前置检查：端口 {} 可绑定", addr.port()),
+            Err(e) => anyhow::bail!(
+                "前置检查失败：Web 端口 {} 被占用（{e}）——排查：netstat -ano | findstr :{}，或修改 config.toml [web] bind",
+                addr.port(),
+                addr.port()
+            ),
+        }
     }
-    // ③ BFE：WFP 封禁依赖（未运行仅告警——netsh 降级路径存在）
+    // ③ BFE：WFP 封禁依赖（未运行/状态未知均仅告警——netsh 降级路径存在）
     let bfe = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .and_then(|m| m.open_service("BFE", ServiceAccess::QUERY_STATUS))
         .and_then(|s| s.query_status());
@@ -251,7 +290,8 @@ fn preflight(exe_dir: Option<&std::path::Path>) -> anyhow::Result<()> {
         Ok(st) if st.current_state == ServiceState::Running => {
             println!("前置检查：BFE（Base Filtering Engine）运行中——WFP 封禁可用")
         }
-        _ => println!("警告：BFE 服务未运行，WFP 封禁将降级为 netsh（可后续启动 bfe 服务）"),
+        Ok(st) => println!("警告：BFE 服务未运行（{:?}），WFP 封禁将降级为 netsh", st.current_state),
+        Err(e) => println!("警告：BFE 状态查询失败（{e}），WFP 封禁可用性未知——未运行时将降级为 netsh"),
     }
     Ok(())
 }
@@ -289,14 +329,30 @@ fn stop_and_wait(service: &windows_service::service::Service) -> anyhow::Result<
 /// [file_audit] 启用时的系统侧残留（auditpol + SACL）提示用 disable-file-audit
 /// 回退——系统级策略不由卸载静默清除。
 pub fn uninstall() -> anyhow::Result<()> {
+    if !is_elevated() {
+        anyhow::bail!("未以管理员提权运行（停服/删除/凭据清理需要）");
+    }
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service =
-        manager.open_service(SERVICE_NAME, ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS | ServiceAccess::STOP)?;
+    // 服务不存在（1060）：如实提示并继续残留清理——凭据文件恰在此时最需要清理
+    // （评审 M-1）
+    let service = match manager.open_service(
+        SERVICE_NAME,
+        ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS | ServiceAccess::STOP,
+    ) {
+        Ok(s) => Some(s),
+        Err(windows_service::Error::Winapi(e)) if e.raw_os_error() == Some(1060) => {
+            println!("服务未安装（1060），跳过停服/删除，仅执行残留清理");
+            None
+        }
+        Err(e) => return Err(e.into()),
+    };
     // 运行中先停（运行中删除只标记，不移除）；轮询至 Stopped——原固定 sleep 2s
     // 在停机序列超过 2s 时仍会撞上"只标记"路径（M4 待修清单 9）
-    stop_and_wait(&service)?;
-    service.delete()?;
-    println!("服务已卸载");
+    if let Some(service) = &service {
+        stop_and_wait(service)?;
+        service.delete()?;
+        println!("服务已卸载");
+    }
 
     // 残留清理（exe 目录侧）
     if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {

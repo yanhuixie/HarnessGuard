@@ -13,6 +13,8 @@
 set -eu
 
 VER="$(cargo metadata --format-version 1 --no-deps 2>/dev/null | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -1)"
+# 注：sed 对单行 JSON 贪婪匹配取到最后一个 version 字段——workspace 统一
+# 版本（workspace.package）下正确；crate 版本分化后需换 cargo pkgid 精确提取（M3 校准项）
 STAGE=dist/stage
 rm -rf "$STAGE" && mkdir -p "$STAGE/Applications/HarnessGuard" "$STAGE/Library/LaunchDaemons"
 
