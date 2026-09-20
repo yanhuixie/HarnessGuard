@@ -563,10 +563,15 @@ impl EtwInner {
     /// 轮询、无计划任务覆盖）。事件语义：106=任务注册，140=任务更新，141=任务删除
     /// ——均属持久化面（141 单列"删除"语义，防误导调查；M4 待修清单 4）。
     /// pid 归因链（事件自身一般不携带）：
-    /// ① 事件 ProcessId 字段（属监控树才采用）→ ② 实时扫描树内 cmdline 含注册
-    /// 工具特征的进程 → ③ Exec 时缓存的候选（发起 cmd 常先于 106 退出，②必 miss
-    /// ——复验竞态修复，detail 附 cmdline 供人工核对）→ ④ 0（未归因，引擎侧仍出
-    /// Audit 判定，证据含 detail）。
+    /// ① 事件 ProcessId 字段——ProcTable 在表即采（事实归因：ProcTable 经
+    ///    apply_exec 全量入表，树外系统进程注册任务也是事实证据；不在表才继续）；
+    /// ② 实时扫描树内（harness_root 非空）cmdline 含注册工具特征的进程；
+    /// ③ Exec 时缓存的候选（发起 cmd 常先于 106 退出，②必 miss——复验竞态修复）。
+    ///    **启发式边界（如实披露）**：候选登记无法限树（Exec 时刻本线程拿不到树
+    ///    身份——树判定在引擎侧规则落地之后），且取最新候选不看任务名；树外
+    ///    进程的注册事件可能被归因到 120s 内最新的树内候选。缓解：detail 附
+    ///    cmdline 供人工核对，且 Persistence 恒为 Audit（不触发 Kill/封禁处置）；
+    /// ④ 0（未归因，引擎侧仍出 Audit 判定，证据含 detail）。
     fn on_sched(&self, record: &EventRecord, loc: &SchemaLocator) {
         if !matches!(record.event_id(), 106 | 140 | 141) {
             return;
@@ -582,6 +587,8 @@ impl EtwInner {
             _ => "删除",
         };
         let event_pid = Self::parse_u32(&p, &["ProcessId", "ProcessID", "Pid"])
+            // ProcTable 在表即采（事实归因，不限树——全表含树外进程）；
+            // 不在表（服务启动前已退出等）继续走扫描/缓存链
             .filter(|v| *v != 0 && self.procs.get(v).is_some());
         let (pid, how) = if let Some(v) = event_pid {
             (v, "已归因".to_string())
@@ -601,7 +608,8 @@ impl EtwInner {
         });
     }
 
-    /// 实时归因扫描：监控树内 cmdline 含注册工具特征的进程（最近一个）。
+    /// 实时归因扫描：监控树内 cmdline 含注册工具特征的进程（迭代序最后一个
+    /// ——snapshot 遍历无时间语义，多命中时取值不保证最新）。
     /// 无时间戳可依（Identity 不含 exec 时刻），属启发式归因——确定性不足时
     /// 返回 None，宁可缺归因不误归因。
     fn scan_task_registrar(&self) -> Option<Pid> {

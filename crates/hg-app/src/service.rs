@@ -103,7 +103,7 @@ fn report_state(
 }
 
 /// 安装服务（需管理员）：LocalSystem 自启动 + `service` 启动参数 + 三级失败重启。
-/// **本会话未执行**——复验时由管理员运行（M4 报告有完整命令清单）。
+/// 已于 2026-09-20 实机验证（M4 第一批复验报告）；升级重装前先 uninstall。
 pub fn install() -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     let manager = ServiceManager::local_computer(
@@ -142,7 +142,7 @@ pub fn install() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 卸载服务（需管理员）。**本会话未执行**。
+/// 卸载服务（需管理员，先停后删）。已于 2026-09-20 实机验证（复验报告）。
 pub fn uninstall() -> anyhow::Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service =

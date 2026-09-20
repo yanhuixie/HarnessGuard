@@ -8,9 +8,12 @@
 //!
 //! 本机降级（复验定案 2）：Win 26100 实测 `SetPerTcpConnectionEStats` 即
 //! rc=50（ERROR_NOT_SUPPORTED），estats Data 集合整体不可用。处理：Set 失败的
-//! 连接标记"estats 不可用"并**跳过后续轮询**（不逐秒空调用刷 rc 日志）；连接
-//! 移除时清除标记（同四元组复用的新连接会重新尝试一次）。字节计数不受影响
-//! （send 事件为主路径）。Linux/macOS 无此路径。
+//! 连接标记"estats 不可用"并**跳过后续轮询**（不逐秒空调用刷 rc 日志）。
+//! 标记清理由逐轮收敛完成：被降级的连接走 Skip 路径后**看不到 Gone**
+//! （ETW disconnect 侧移除 monitored_quads 时本线程不可达），因此每轮按
+//! monitored_quads 快照收敛三张私有表（sampler/gate）——同四元组复用的新连接
+//! 在旧条目被收敛清掉后会重新尝试一次。字节计数不受影响（send 事件为主路径）。
+//! Linux/macOS 无此路径。
 //!
 //! 机制（M4 第一批沿用）：
 //! - 首见连接 SetPerTcpConnectionEStats 开启 Data 类采集（每连接一次）；
@@ -79,6 +82,14 @@ impl EstatsGate {
     fn on_transient(&mut self, conn: u64) {
         self.enabled.remove(&conn);
     }
+
+    /// 逐轮收敛：按 monitored_quads 快照清理已消失连接的全部标记。
+    /// 被降级（Skip）的连接永远走不到 Gone 分支，disconnect 侧的移除事件
+    /// 对本线程不可达——不收敛则 unavailable 无界增长（评审 M1）。
+    fn retain_live(&mut self, live: &std::collections::HashSet<u64>) {
+        self.enabled.retain(|k| live.contains(k));
+        self.unavailable.retain(|k| live.contains(k));
+    }
 }
 
 /// 累计值差分器（纯逻辑，单测覆盖）。
@@ -103,6 +114,12 @@ impl EstatsSampler {
     fn forget(&mut self, conn: u64) {
         self.last.remove(&conn);
     }
+
+    /// 逐轮收敛：按 monitored_quads 快照清理已消失连接的基线
+    /// （disconnect 侧移除对本线程不可达，否则 last 无界增长——评审 M3）。
+    fn retain_live(&mut self, live: &std::collections::HashSet<u64>) {
+        self.last.retain(|k, _| live.contains(k));
+    }
 }
 
 /// 启动 estats 轮询线程（由 hg-app 装配，紧随 ETW 源之后）。
@@ -121,6 +138,13 @@ pub fn spawn_estats_poll(inner: std::sync::Arc<EtwInner>) {
                     .iter()
                     .map(|e| (*e.key(), e.value().0, e.value().1))
                     .collect();
+                // 收敛清理（评审 M1/M3）：ETW disconnect 侧移除的连接对 Skip
+                // 路径不可达，按快照收敛三张私有表，防无界增长；四元组复用的
+                // 新连接在旧标记被清掉后重新走首见路径
+                let live: std::collections::HashSet<u64> =
+                    quads.iter().map(|(c, _, _)| *c).collect();
+                gate.retain_live(&live);
+                sampler.retain_live(&live);
                 for (conn, local, remote) in quads {
                     let enable_first = match gate.plan(conn) {
                         PollPlan::Skip => continue,
@@ -326,5 +350,29 @@ mod tests {
         g.on_transient(1);
         assert!(matches!(g.plan(1), PollPlan::EnableAndRead), "Set 重开而非直接读");
         assert!(!matches!(g.plan(1), PollPlan::Skip), "暂时性失败不降级");
+    }
+
+    #[test]
+    fn 门控_逐轮收敛清理已消失连接() {
+        let mut g = EstatsGate::default();
+        g.on_set_failed(1); // Skip 路径：看不到 Gone，只能靠收敛清标记
+        g.on_read_ok(2);
+        g.on_set_failed(3);
+        let live: std::collections::HashSet<u64> = [2u64, 3u64].into_iter().collect();
+        g.retain_live(&live);
+        assert!(matches!(g.plan(1), PollPlan::EnableAndRead), "已消失连接的降级标记被清，复用重试");
+        assert!(matches!(g.plan(2), PollPlan::Read), "存活连接不受影响");
+        assert!(matches!(g.plan(3), PollPlan::Skip), "存活且降级的连接保持 Skip");
+    }
+
+    #[test]
+    fn 采样器_逐轮收敛清理已消失连接基线() {
+        let mut s = EstatsSampler::default();
+        s.on_sample(1, 1000);
+        s.on_sample(2, 500);
+        let live: std::collections::HashSet<u64> = [2u64].into_iter().collect();
+        s.retain_live(&live);
+        s.on_sample(1, 2000); // 已被收敛：视作首见重建基线
+        assert_eq!(s.on_sample(1, 3000), Some(1000));
     }
 }
