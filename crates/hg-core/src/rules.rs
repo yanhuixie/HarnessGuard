@@ -31,6 +31,28 @@ pub struct HarnessFeature {
     pub path_globs: Vec<String>,
 }
 
+/// 默认 harness 特征库（需求 §3.4 路径 glob；ProcessesConf 与 RulesConfig 的
+/// Default 共用此单一来源）。匹配大小写不敏感（见 build_matcher），glob 用小写。
+/// 覆盖各工具 CLI / IDE / 桌面形态；纯 VS Code 扩展形态（roo-code、cline/kilo-code
+/// 扩展）无独立 exe，路径特征不可达。autoclaw/workbuddy 的 exe 名来自第三方
+/// 资料（官方未文档化），待实机确认。
+pub fn default_harness_features() -> Vec<HarnessFeature> {
+    vec![
+        HarnessFeature { name: "claude-code".into(), path_globs: vec!["**/claude*".into()] },
+        HarnessFeature { name: "zcode".into(), path_globs: vec!["**/zcode*".into()] },
+        HarnessFeature { name: "codex".into(), path_globs: vec!["**/codex*".into()] },
+        HarnessFeature { name: "cursor".into(), path_globs: vec!["**/cursor*".into()] },
+        HarnessFeature { name: "autoclaw".into(), path_globs: vec!["**/autoclaw*".into()] },
+        HarnessFeature { name: "workbuddy".into(), path_globs: vec!["**/workbuddy*".into()] },
+        HarnessFeature { name: "codebuddy".into(), path_globs: vec!["**/codebuddy*".into()] },
+        HarnessFeature { name: "qoder".into(), path_globs: vec!["**/qoder*".into()] },
+        HarnessFeature { name: "trae".into(), path_globs: vec!["**/trae*".into()] },
+        HarnessFeature { name: "cline".into(), path_globs: vec!["**/cline*".into()] },
+        HarnessFeature { name: "opencode".into(), path_globs: vec!["**/opencode*".into()] },
+        HarnessFeature { name: "kilo-code".into(), path_globs: vec!["**/kilocode*".into()] },
+    ]
+}
+
 /// 身份矩阵豁免条目（需求 §3.3：工具 × 路径模式）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolExemptConf {
@@ -95,10 +117,7 @@ impl Default for RulesConfig {
                 "gzip *".into(),
                 "zstd *".into(),
             ],
-            harness: vec![HarnessFeature {
-                name: "claude-code".into(),
-                path_globs: vec!["**/node_modules/.bin/claude*".into(), "**/claude*".into()],
-            }],
+            harness: default_harness_features(),
             tool_exempt: vec![ToolExemptConf {
                 exe: "git".into(),
                 allow_paths: vec![".git/**".into()],

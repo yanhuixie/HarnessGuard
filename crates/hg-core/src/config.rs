@@ -137,12 +137,7 @@ impl Default for CommandsConf {
 }
 impl Default for ProcessesConf {
     fn default() -> Self {
-        Self {
-            harness: vec![HarnessFeature {
-                name: "claude-code".into(),
-                path_globs: vec!["**/node_modules/.bin/claude*".into(), "**/claude*".into()],
-            }],
-        }
+        Self { harness: crate::rules::default_harness_features() }
     }
 }
 impl Default for StorageConf {
