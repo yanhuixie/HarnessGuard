@@ -95,14 +95,7 @@ impl Default for NetworkConf {
 }
 impl Default for EndpointsConf {
     fn default() -> Self {
-        Self {
-            allow: vec![
-                "api.anthropic.com".into(),
-                "api.openai.com".into(),
-                "*.github.com".into(),
-                "*.googleapis.com".into(),
-            ],
-        }
+        Self { allow: crate::rules::default_endpoints_allow() }
     }
 }
 impl Default for FilesConf {
@@ -321,14 +314,57 @@ sensitive_escalation_divisor = 10
 
 [endpoints]
 # 端点白名单（域名 glob，支持 *）：发往这些端点的上行不计入外传阈值
-# （模型 API 等合法大流量端点）。
+# ——各 harness 的官方模型 API 与常见 LLM router（国内外端点均已覆盖）。
+# 自建/私有模型网关请按此格式追加。
 # Endpoint allowlist (domain globs, * supported): upstream traffic to these
-# endpoints is exempt from the threshold (legitimate model APIs etc.).
+# endpoints is exempt from the threshold — official model APIs of the
+# monitored harnesses plus common LLM routers (mainland & overseas).
+# Append self-hosted/private model gateways here.
 allow = [
+    # Claude Code
     "api.anthropic.com",
+    # codex：API key 模式 / ChatGPT 登录模式（后端与授权）
+    # codex: API-key mode / ChatGPT-login mode (backend & auth)
     "api.openai.com",
+    "chatgpt.com",
+    "auth.openai.com",
+    # GitHub Copilot / Gemini
     "*.github.com",
     "*.googleapis.com",
+    # zcode / autoclaw（智谱）：海外 / 大陆
+    # zcode / autoclaw (Z.ai): overseas / mainland
+    "api.z.ai",
+    "open.bigmodel.cn",
+    # cursor（官方企业网络文档）
+    # cursor (official enterprise network docs)
+    "*.cursor.sh",
+    # codebuddy / workbuddy（腾讯）：大陆 / 国际
+    # codebuddy / workbuddy (Tencent): mainland / international
+    "copilot.tencent.com",
+    "*.codebuddy.cn",
+    "*.codebuddy.ai",
+    # qoder（阿里）：IDE 网关；订阅模型 API 国内 / 国际
+    # qoder (Alibaba): IDE gateway; coding-plan model API cn / intl
+    "*.qoder.sh",
+    "coding.dashscope.aliyuncs.com",
+    "coding-intl.dashscope.aliyuncs.com",
+    # trae（字节）：大陆 / 国际
+    # trae (ByteDance): mainland / international
+    "*.trae.com.cn",
+    "*.trae.ai",
+    "*.traeapi.us",
+    # cline
+    "api.cline.bot",
+    # opencode：Zen 网关 / 模型目录
+    # opencode: Zen gateway / model catalog
+    "opencode.ai",
+    "models.dev",
+    # kilo code
+    "api.kilo.ai",
+    # 常见 LLM router / common LLM routers
+    "openrouter.ai",
+    "api.siliconflow.cn",
+    "api.siliconflow.com",
 ]
 
 [files]
@@ -468,6 +504,7 @@ mod tests {
         let mut cfg = FileConfig::load(&path).unwrap();
         cfg.network.upload_threshold_mb = 50;
         cfg.storage.retention_days = 7;
+        let allow_len_before = cfg.endpoints.allow.len();
         cfg.endpoints.allow.pop();
         cfg.processes.harness[0].path_globs = vec!["**/my-claude*".into()];
         cfg.save(&path).unwrap();
@@ -477,11 +514,12 @@ mod tests {
         assert!(text.contains("外传阈值（MB）"), "中文注释丢失");
         assert!(text.contains("Upload threshold (MB)"), "英文注释丢失");
         assert!(text.contains("harness 特征库"), "表数组区注释丢失");
+        assert!(text.contains("Endpoint allowlist"), "端点区注释丢失");
 
         let re = FileConfig::load(&path).unwrap();
         assert_eq!(re.network.upload_threshold_mb, 50);
         assert_eq!(re.storage.retention_days, 7);
-        assert_eq!(re.endpoints.allow.len(), 3);
+        assert_eq!(re.endpoints.allow.len(), allow_len_before - 1);
         assert_eq!(re.processes.harness.len(), 12);
         assert_eq!(re.processes.harness[0].path_globs, vec!["**/my-claude*"]);
         // 未改动项保持默认

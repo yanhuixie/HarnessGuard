@@ -31,6 +31,56 @@ pub struct HarnessFeature {
     pub path_globs: Vec<String>,
 }
 
+/// 默认端点白名单（EndpointsConf 与 RulesConfig 的 Default 共用此单一来源）。
+/// 语义：发往这些端点的上行不计入外传阈值——各 harness 官方模型 API 与常见
+/// LLM router（2026-09 调查；官方文档优先，trae 国际域与腾讯国际 API 域来自
+/// 社区逆向资料、未经官方确认）。裸域名精确匹配，`*` 通配子域（build_matcher
+/// 与 endpoint_allowed）。各工具均无出厂自带的远程 MCP 服务器，故无 MCP 预设。
+pub fn default_endpoints_allow() -> Vec<String> {
+    [
+        // Claude Code
+        "api.anthropic.com",
+        // codex：API key 模式 / ChatGPT 登录模式（后端与授权）
+        "api.openai.com",
+        "chatgpt.com",
+        "auth.openai.com",
+        // GitHub Copilot / Gemini
+        "*.github.com",
+        "*.googleapis.com",
+        // zcode / autoclaw（智谱）：海外 / 大陆
+        "api.z.ai",
+        "open.bigmodel.cn",
+        // cursor（官方企业网络文档）
+        "*.cursor.sh",
+        // codebuddy / workbuddy（腾讯）：大陆 / 国际
+        "copilot.tencent.com",
+        "*.codebuddy.cn",
+        "*.codebuddy.ai",
+        // qoder（阿里）：IDE 网关；订阅模型 API 国内 / 国际
+        "*.qoder.sh",
+        "coding.dashscope.aliyuncs.com",
+        "coding-intl.dashscope.aliyuncs.com",
+        // trae（字节）：大陆 / 国际
+        "*.trae.com.cn",
+        "*.trae.ai",
+        "*.traeapi.us",
+        // cline
+        "api.cline.bot",
+        // opencode：Zen 网关 / 模型目录
+        "opencode.ai",
+        "models.dev",
+        // kilo code
+        "api.kilo.ai",
+        // 常见 LLM router
+        "openrouter.ai",
+        "api.siliconflow.cn",
+        "api.siliconflow.com",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
 /// 默认 harness 特征库（需求 §3.4 路径 glob；ProcessesConf 与 RulesConfig 的
 /// Default 共用此单一来源）。匹配大小写不敏感（见 build_matcher），glob 用小写。
 /// 覆盖各工具 CLI / IDE / 桌面形态；纯 VS Code 扩展形态（roo-code、cline/kilo-code
@@ -83,12 +133,7 @@ impl Default for RulesConfig {
         Self {
             upload_threshold_mb: 100,
             sensitive_escalation_divisor: 10,
-            endpoints_allow: vec![
-                "api.anthropic.com".into(),
-                "api.openai.com".into(),
-                "*.github.com".into(),
-                "*.googleapis.com".into(),
-            ],
+            endpoints_allow: default_endpoints_allow(),
             git_dir_action: FileAction::Block,
             archive_action: FileAction::Block,
             sensitive_patterns: vec![
@@ -582,6 +627,14 @@ mod tests {
         assert!(rules.endpoint_allowed(Some("api.anthropic.com"), "1.2.3.4".parse().unwrap()));
         assert!(rules.endpoint_allowed(Some("api.github.com"), "1.2.3.4".parse().unwrap()));
         assert!(!rules.endpoint_allowed(Some("evil.example.com"), "1.2.3.4".parse().unwrap()));
+        // 扩容后的通配条目：智谱大陆、cursor/trae 子域、LLM router
+        assert!(rules.endpoint_allowed(Some("open.bigmodel.cn"), "1.2.3.4".parse().unwrap()));
+        assert!(rules.endpoint_allowed(Some("api2.cursor.sh"), "1.2.3.4".parse().unwrap()));
+        assert!(rules.endpoint_allowed(Some("api.trae.com.cn"), "1.2.3.4".parse().unwrap()));
+        assert!(rules.endpoint_allowed(Some("api.siliconflow.cn"), "1.2.3.4".parse().unwrap()));
+        // 通配不越界：根域本身与无关子域不得命中
+        assert!(!rules.endpoint_allowed(Some("cursor.sh"), "1.2.3.4".parse().unwrap()));
+        assert!(!rules.endpoint_allowed(Some("trae.com.cn.evil.com"), "1.2.3.4".parse().unwrap()));
         // DoH 退化：无域名时按 IP 判
         assert!(!rules.endpoint_allowed(None, "1.2.3.4".parse().unwrap()));
     }
