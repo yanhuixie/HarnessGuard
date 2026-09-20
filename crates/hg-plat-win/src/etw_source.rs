@@ -34,9 +34,9 @@ use crate::probe;
 pub use hg_core::health::SourceStats;
 
 /// 文件 opcode（M0 实测）：64=Create 67=Read 68=Write
-const FILE_OP_CREATE: u8 = 64;
-const FILE_OP_READ: u8 = 67;
-const FILE_OP_WRITE: u8 = 68;
+pub(crate) const FILE_OP_CREATE: u8 = 64;
+pub(crate) const FILE_OP_READ: u8 = 67;
+pub(crate) const FILE_OP_WRITE: u8 = 68;
 /// 网络 opcode：16=connect 10=send 18=disconnect（M0 实测分布）
 const NET_OP_CONNECT: u8 = 16;
 const NET_OP_SEND: u8 = 10;
@@ -364,7 +364,9 @@ impl EtwInner {
         }
     }
 
-    fn emit_file_event(&self, pid: Pid, op: u8, raw: &str) {
+    /// 文件事件入引擎（含监控树早过滤与路径归一）。pub(crate)：sec_audit 的
+    /// 4663 消费复用此管线（与 ETW 文件事件同构）。
+    pub(crate) fn emit_file_event(&self, pid: Pid, op: u8, raw: &str) {
         let Some(id) = self.procs.get(&pid) else { return };
         let path = self.resolve_file_name(pid, raw);
         tracing::debug!("[file] pid={pid} op={op} root={:?} raw={raw:?} -> {}", id.harness_root.as_ref().map(|r| r.0.clone()), path.display());

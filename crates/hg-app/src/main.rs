@@ -38,7 +38,27 @@ fn main() -> anyhow::Result<()> {
         Some("install") => service::install(),
         #[cfg(windows)]
         Some("uninstall") => service::uninstall(),
-        other => anyhow::bail!("未知参数 {other:?}；用法：harnessguard [run|service|install|uninstall]"),
+        #[cfg(windows)]
+        Some("enable-file-audit") => {
+            let path = std::env::args()
+                .nth(2)
+                .ok_or_else(|| anyhow::anyhow!("用法：harnessguard enable-file-audit <目录>（需管理员，如工作区 .git）"))?;
+            hg_plat_win::audit_setup::enable_file_audit(
+                PathBuf::from(&path).as_path(),
+                &hg_plat_win::audit_setup::cli_config_path(),
+            )
+        }
+        #[cfg(windows)]
+        Some("disable-file-audit") => {
+            let path = std::env::args()
+                .nth(2)
+                .ok_or_else(|| anyhow::anyhow!("用法：harnessguard disable-file-audit <目录>（需管理员）"))?;
+            hg_plat_win::audit_setup::disable_file_audit(
+                PathBuf::from(&path).as_path(),
+                &hg_plat_win::audit_setup::cli_config_path(),
+            )
+        }
+        other => anyhow::bail!("未知参数 {other:?}；用法：harnessguard [run|service|install|uninstall|enable-file-audit <目录>|disable-file-audit <目录>]"),
     }
 }
 
@@ -108,6 +128,15 @@ pub(crate) fn run_server(
         .expect("spawn ETW");
     std::thread::sleep(Duration::from_millis(800)); // 等 ETW 线程注入 tx 后再起轮询
     hg_plat_win::runkey::spawn_runkey_poll(inner.clone());
+    // 场景 A opt-in 备选通道（拍板记录 11）：Security 4663 订阅。默认关——
+    // 启用端需系统侧配置（auditpol + SACL，enable-file-audit 子命令）
+    if cfg.file_audit.enabled {
+        hg_plat_win::sec_audit::spawn_sec_audit(inner.clone(), cfg.file_audit.watch_paths.clone());
+    } else if !cfg.file_audit.watch_paths.is_empty() {
+        tracing::info!(
+            "[file-audit] watch_paths 已配置但 enabled=false（enable-file-audit 子命令可开启系统侧与消费侧）"
+        );
+    }
     // 场景 C 字节计数补充路径（M4 复验定案：ETW send 事件为主路径；本机 estats
     // Set rc=50 不可用——轮询线程逐连接降级跳过，不影响主路径）：
     // estats 轮询按 monitored_quads 差分 DataBytesOut 补喂 ConnTx

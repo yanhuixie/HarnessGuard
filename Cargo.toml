@@ -64,6 +64,10 @@ windows = { version = "0.61", features = [
     # M4 P2.6：WFP FwpmFilterAdd0 封禁（System_Rpc 为 FwpmEngineOpen0 签名依赖）
     "Win32_NetworkManagement_WindowsFilteringPlatform",
     "Win32_System_Rpc",
+    # M4 第二批 P1-5/P1-7：Security 4663 订阅（EvtSubscribe）+ SACL/DACL
+    # （SetEntriesInAclW / SetNamedSecurityInfoW）
+    "Win32_System_EventLog",
+    "Win32_Security_Authorization",
 ] }
 
 # 平台专属依赖声明（cargo 不允许 virtual workspace 里放 [target] 段——

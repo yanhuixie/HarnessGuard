@@ -24,6 +24,8 @@ pub struct FileConfig {
     pub storage: StorageConf,
     #[serde(default)]
     pub web: WebConf,
+    #[serde(default)]
+    pub file_audit: FileAuditConf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +72,20 @@ fn default_db_path() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebConf {
     pub bind: String,
+}
+
+/// Security 4663 文件审计通道（场景 A opt-in 备选；技术设计拍板记录 11）。
+/// 启用端需系统侧配置（auditpol + SACL，经 enable-file-audit 子命令管理），
+/// 本配置仅控制消费端。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FileAuditConf {
+    /// 消费开关（默认关：Security 通道订阅与系统审计策略均不启动）
+    #[serde(default)]
+    pub enabled: bool,
+    /// 监听路径前缀（工作区绝对路径，如 D:/repo/.git；NT 路径归一后按
+    /// 路径分量边界匹配，详见 hg-plat-win sec_audit 模块）
+    #[serde(default)]
+    pub watch_paths: Vec<String>,
 }
 
 impl Default for NetworkConf {
@@ -153,6 +169,7 @@ impl Default for FileConfig {
             }],
             storage: Default::default(),
             web: Default::default(),
+            file_audit: Default::default(),
         }
     }
 }

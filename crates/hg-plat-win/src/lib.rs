@@ -10,9 +10,12 @@
 //! - [`peb`]：PEB 命令行读取（内核 ETW 无命令行的降级链）
 //! - [`lru`]：FileObject 缓存的 O(1) LRU 封顶（M4 场景 A 缓解）
 //! - [`probe`]：unknown Create 事件的同对象句柄探测补名（M4 场景 A 缓解）
-//! - [`estats`]：GetPerTcpConnectionEStats 轮询补连接字节计数（M4 场景 C 替代路径）
+//! - [`estats`]：GetPerTcpConnectionEStats 轮询补连接字节计数（M4 场景 C 补充路径）
 //! - [`wfp`]：用户态 WFP 临时封禁（M4 偏差归位，netsh 为降级兜底）
+//! - [`sec_audit`]：Security 通道 4663 文件审计消费（场景 A opt-in 备选通道，M4 第二批）
+//! - [`audit_setup`]：上述通道的系统侧启用/停用（auditpol + SACL，opt-in）
 
+pub mod audit_setup;
 pub mod bootstrap;
 pub mod enforcer;
 pub mod estats;
@@ -23,6 +26,7 @@ pub mod notify;
 pub mod peb;
 pub mod probe;
 pub mod runkey;
+pub mod sec_audit;
 pub mod wfp;
 
 pub use enforcer::WinEnforcer;
