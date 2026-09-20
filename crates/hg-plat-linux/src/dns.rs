@@ -5,7 +5,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use hg_model::{Envelope, Pid, RawEvent, Timestamp};
+use hg_model::{Envelope, RawEvent, Timestamp};
 use tokio::sync::mpsc;
 
 pub struct DnsSource {
@@ -80,7 +80,7 @@ impl DnsSource {
                 continue;
             }
             // Ethernet(14) + IPv4(20)/IPv6(40) + UDP(8) + DNS
-            if let Some((_, payload)) = parse_eth_udp_port53(&buf[..n as usize]) {
+            if let Some((payload, _)) = parse_eth_udp_port53(&buf[..n as usize]) {
                 if let Some((qname, answers, is_response)) = parse_dns(payload) {
                     if is_response {
                         // pid 归因：DNS 由 stub resolver（systemd-resolved）代发，

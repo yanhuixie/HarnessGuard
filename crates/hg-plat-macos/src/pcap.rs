@@ -7,10 +7,10 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hg_model::{ConnId, Envelope, Pid, Proto, RawEvent, Timestamp};
+use hg_model::{ConnId, Envelope, Pid, Proto, RawEvent, StartTime, Timestamp};
 use tokio::sync::mpsc;
 
 // libpcap FFI
@@ -50,8 +50,8 @@ extern "C" {
 pub struct PcapSource {
     tx: mpsc::Sender<Envelope>,
     base: std::time::Instant,
-    /// quad → pid 采样（lsof 周期刷新）
-    quad_pid: Mutex<HashMap<(SocketAddr, SocketAddr), Pid>>,
+    /// quad → pid 采样（lsof 周期刷新）；Arc 使刷新线程可不借用 self 运行
+    quad_pid: Arc<Mutex<HashMap<(SocketAddr, SocketAddr), Pid>>>,
     emitted: dashmap_like::DashSetU64,
 }
 
@@ -74,7 +74,7 @@ impl PcapSource {
         Self {
             tx,
             base: std::time::Instant::now(),
-            quad_pid: Mutex::new(HashMap::new()),
+            quad_pid: Arc::new(Mutex::new(HashMap::new())),
             emitted: dashmap_like::DashSetU64::new(),
         }
     }
@@ -156,7 +156,7 @@ impl PcapSource {
                         self.now(),
                         RawEvent::ConnOpen {
                             pid,
-                            start_time: Default::default(),
+                            start_time: StartTime(0), // lsof 采样无启动时刻，0=未知（引擎侧已容忍）
                             conn_id: ConnId(id),
                             proto: Proto::Tcp,
                             local,
@@ -192,8 +192,9 @@ impl PcapSource {
         }
     }
 
-    fn refresh_quad_pid_loop(self: &Self) -> impl Fn() + Send + Sync + 'static {
-        let this: &Self = self;
+    fn refresh_quad_pid_loop(&self) -> impl Fn() + Send + Sync + 'static {
+        // 闭包只持有 quad_pid 的 Arc（不借用 self），'static 才成立
+        let quad_pid = Arc::clone(&self.quad_pid);
         move || loop {
             if let Ok(out) = std::process::Command::new("lsof")
                 .args(["-nP", "-i4TCP", "-i6TCP", "-Fpcn"])
@@ -224,7 +225,7 @@ impl PcapSource {
                         _ => {}
                     }
                 }
-                *this.quad_pid.lock().unwrap() = map;
+                *quad_pid.lock().unwrap() = map;
             }
             std::thread::sleep(Duration::from_secs(2));
         }

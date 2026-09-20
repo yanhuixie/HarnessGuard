@@ -56,7 +56,7 @@ impl EbpfSource {
     pub fn run(&self) -> anyhow::Result<()> {
         let obj_path = std::env::var("HG_BPF_OBJ")
             .unwrap_or_else(|_| "/usr/lib/harnessguard/harnessguard.bpf.o".into());
-        let mut bpf = match aya::Bpf::load_file(&obj_path) {
+        let mut bpf = match aya::Ebpf::load_file(&obj_path) {
             Ok(b) => b,
             Err(e) => {
                 tracing::error!(
@@ -87,12 +87,14 @@ impl EbpfSource {
         kp.load()?;
         kp.attach("tcp_sendmsg", 0)?;
 
-        // RingBuf 事件消费（aya RingBuf API 版本差异在 Linux 首编时校准）
-        let mut ring = bpf
-            .take_ring_buf("events")
+        // RingBuf 事件消费（aya 0.13：map_mut 取 &mut Map 后 try_into 为 RingBuf）
+        let map = bpf
+            .map_mut("events")
             .ok_or_else(|| anyhow::anyhow!("BPF map 缺失：events"))?;
+        let mut ring: aya::maps::RingBuf<_> = map.try_into()?;
         loop {
-            while let Some(buf) = ring.next() {
+            while let Some(item) = ring.next() {
+                let buf: &[u8] = &item;
                 if buf.len() >= std::mem::size_of::<BpfEvent>() {
                     let ev = unsafe { &*(buf.as_ptr() as *const BpfEvent) };
                     self.dispatch(ev);

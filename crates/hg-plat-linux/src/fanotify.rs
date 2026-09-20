@@ -10,7 +10,6 @@
 //! 路径获取：legacy fd 模式（事件携带 fd）→ `readlink /proc/self/fd/<n>`。
 //! 停机：drain 未决权限事件统一 FAN_ALLOW（§9.3，宁放勿卡）。
 
-use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
@@ -78,8 +77,12 @@ impl FanotifySource {
         rules: Arc<ArcSwap<RulesSnapshot>>,
         tx: mpsc::Sender<Envelope>,
     ) -> anyhow::Result<Self> {
-        let fd =
-            unsafe { libc::fanotify_init(FAN_CLASS_CONTENT | FAN_CLOEXEC, O_RDONLY_LARGEFILE) };
+        let fd = unsafe {
+            libc::fanotify_init(
+                (FAN_CLASS_CONTENT | FAN_CLOEXEC) as libc::c_uint,
+                O_RDONLY_LARGEFILE as libc::c_uint,
+            )
+        };
         if fd < 0 {
             return Err(anyhow::anyhow!(
                 "fanotify_init 失败 errno={}（需 root）",

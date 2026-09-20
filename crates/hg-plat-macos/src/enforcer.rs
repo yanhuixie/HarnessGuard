@@ -108,7 +108,7 @@ fn kinfo_starttime(pid: Pid) -> Option<u64> {
         start_sec: u64,
         start_usec: u64,
     }
-    let name: [libc::c_int; 4] = [
+    let mut name: [libc::c_int; 4] = [
         libc::CTL_KERN,
         libc::KERN_PROC,
         libc::KERN_PROC_PID,
@@ -118,11 +118,11 @@ fn kinfo_starttime(pid: Pid) -> Option<u64> {
     let mut len = std::mem::size_of::<KInfoProc>();
     let rc = unsafe {
         libc::sysctl(
-            name.as_ptr(),
+            name.as_mut_ptr(),
             4,
             &mut kp as *mut _ as *mut core::ffi::c_void,
             &mut len,
-            std::ptr::null(),
+            std::ptr::null_mut(),
             0,
         )
     };

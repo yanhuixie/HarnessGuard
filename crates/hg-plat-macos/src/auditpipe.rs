@@ -36,10 +36,13 @@ const AUT_PATH: u8 = 0x12;
 const AUT_SUBJECT32: u8 = 0x0c;
 const AUT_SUBJECT64: u8 = 0x76;
 const AUT_EXEC_ARGS: u8 = 0x0b;
-// bsm/audit_uevents / kevents.h 常用事件号
+// bsm/audit_uevents / kevents.h 常用事件号（数值来源 OpenBSM audit_kevents.h；
+// macOS 实测 emit 分布与 Darwin 变体差异仍属 M3 校准，见文件头声明）
 const AUE_EXECVE: u16 = 23;
-const AUE_OPEN_R: u16 = 0x1003_0013; // 因 Darwin 版本而异，M3 首编校准（见文件头声明）
-const AUE_CREATE: u16 = 0x1003_0096;
+const AUE_OPEN_R: u16 = 72;
+// 造文件的两个常见事件：open(O_CREAT) 写族 + creat() 旧接口
+const AUE_OPEN_WC: u16 = 77;
+const AUE_CREAT: u16 = 4;
 
 pub struct AuditPipeSource {
     procs: Arc<ProcTable>,
@@ -94,7 +97,7 @@ impl AuditPipeSource {
 
     /// 事件循环（专属线程阻塞读；正常不返回）。
     pub fn run(&self, fd: i32) -> anyhow::Result<()> {
-        let mut buf = Vec::with_capacity(8192);
+        let mut buf: Vec<u8> = Vec::with_capacity(8192);
         loop {
             let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.capacity()) };
             if n < 0 {
@@ -216,7 +219,7 @@ impl AuditPipeSource {
                     },
                 ));
             }
-            e if e == AUE_CREATE => {
+            e if e == AUE_CREAT || e == AUE_OPEN_WC => {
                 if id.as_ref().is_some_and(|i| i.harness_root.is_some()) {
                     let _ = self.tx.try_send(Envelope::new(
                         self.now(),
