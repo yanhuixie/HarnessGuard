@@ -29,9 +29,10 @@ use windows::Win32::System::EventLog::{
 use crate::etw_source::{EtwInner, FILE_OP_READ, FILE_OP_WRITE};
 use crate::ntpath::nt_to_win32;
 
-/// FILE_WRITE_DATA(0x2) | GENERIC_WRITE(0x40000000)：任一写位即按写访问处理，
-/// 其余（读/删除等）按读——场景 A 规则（.git 读取）以读为主
-const WRITE_MASK: u32 = 0x0000_0002 | 0x4000_0000;
+/// FILE_WRITE_DATA(0x2) | FILE_APPEND_DATA(0x4) | GENERIC_WRITE(0x40000000)
+/// | DELETE(0x10000)：任一写/删位即按写访问处理，其余（读等）按读——
+/// 场景 A 规则（.git 读取）以读为主
+const WRITE_MASK: u32 = 0x0000_0002 | 0x0000_0004 | 0x0001_0000 | 0x4000_0000;
 
 /// 订阅上下文（EvtSubscribe 回调经裸指针携带；进程生命周期持有，不释放）
 struct SecAuditCtx {
@@ -83,6 +84,8 @@ pub fn spawn_sec_audit(inner: Arc<EtwInner>, watch_paths: Vec<String>) {
                     }
                 }
                 Err(e) => {
+                    // 订阅失败：回收回调上下文（线程即将退出——评审 L-7）
+                    drop(unsafe { Box::from_raw(ctx as *mut SecAuditCtx) });
                     tracing::error!("[file-audit] Security 订阅失败（需管理员或 Event Log Readers）：{e}");
                 }
             }
@@ -93,10 +96,15 @@ pub fn spawn_sec_audit(inner: Arc<EtwInner>, watch_paths: Vec<String>) {
 /// EvtSubscribe push 回调（EventLog 服务线程上下文；处理须非阻塞——emit 为
 /// try_send，慢消费走通道满丢弃计数，技术设计 §9.2）。
 unsafe extern "system" fn on_event(
-    _action: EVT_SUBSCRIBE_NOTIFY_ACTION,
+    action: EVT_SUBSCRIBE_NOTIFY_ACTION,
     context: *const core::ffi::c_void,
     event: EVT_HANDLE,
 ) -> u32 {
+    // 错误通知：Event 参数实为 DWORD 错误码而非句柄（MSDN），不可走渲染
+    if action.0 == 0 {
+        tracing::warn!("[file-audit] 订阅链路错误通知：code={}", event.0 as u32);
+        return 0;
+    }
     let ctx = &*(context as *const SecAuditCtx);
     if let Some(xml) = render_xml(event) {
         handle_4663(ctx, &xml);

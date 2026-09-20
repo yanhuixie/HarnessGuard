@@ -1,17 +1,21 @@
 //! Security 4663 文件审计通道的系统侧启用/停用（auditpol + SACL；opt-in，
 //! 技术设计拍板记录 11）。由 `enable-file-audit` / `disable-file-audit` 子命令
-//! 调用，需管理员：auditpol 改审计策略需 SeSecurityPrivilege（或审计策略对象
-//! 写权限），SACL 写入（SetNamedSecurityInfoW 带 SACL_SECURITY_INFORMATION）
-//! 需已启用的 SeSecurityPrivilege。
+//! 调用，需管理员提权：SACL 读写要求 SeSecurityPrivilege **已启用**（提权令牌
+//! 默认 disabled，本模块经 AdjustTokenPrivileges 显式启用——评审 M-1），
+//! auditpol 走子进程自行处理特权。
 //!
-//! 启用 = ① auditpol 开 File System 成功审计（子类别用 GUID 形式，免本地化
-//! 名称差异）② 目标目录追加 Everyone 审计 ACE（FILE_GENERIC_READ|WRITE，
-//! 子容器与子对象继承）③ 更新 config.toml [file_audit]。停用对称。
+//! 启用 = ① 显式启用 SeSecurityPrivilege ② 对目标目录追加 Everyone 审计 ACE
+//! （FILE_GENERIC_READ|WRITE，子容器与子对象继承）③ auditpol 开 File System
+//! 成功审计（子类别用 GUID 形式，免本地化名称差异）④ 更新 config.toml
+//! [file_audit]。步骤按"最难先做 + 失败回滚"排序（SACL 先于 auditpol——
+//! SACL 失败时系统审计策略未动；auditpol 失败回滚 SACL——评审 M-2）。
 //!
 //! 系统代价（如实披露）：SACL 命中后每次访问产生 4663（伴随 4656/4658），
 //! Security 日志增长量级取决于 watch 目录访问频率——watch 应收敛到 .git 级
-//! 目录而非盘根。停用只撤销本工具写入的 Everyone 审计 ACE 与子类别开关，
-//! 系统原有审计配置若被覆盖请以 `auditpol /backup` 预留底自行核对。
+//! 目录而非盘根。停用撤销说明：SetEntriesInAclW 的 REVOKE_ACCESS 会移除
+//! Everyone 的**全部** ACE（含既有允许型，非仅本工具写入的审计 ACE——若目录
+//! 曾由其他工具配过 Everyone 访问 ACE，请先 `auditpol /backup` / 记录原状；
+//! 评审 L-4 披露）；auditpol 子类别关闭同样可能覆盖系统原有审计配置。
 //!
 //! 验证级：编译级 + 路径归一/配置更新单测；auditpol/SACL 系统效果待实机复验。
 
@@ -35,26 +39,38 @@ const EVERYONE_SID: &str = "S-1-1-0";
 /// {GUID} 形式，MSDN Audit File System 文档）
 const FILE_SYSTEM_SUBCATALOG_GUID: &str = "{0CCE9216-69AE-11D9-BED3-505054503030}";
 
-/// 启用文件审计（需管理员）：auditpol + SACL + 配置。
+/// 启用文件审计（需管理员提权）：特权 → SACL → auditpol（失败回滚 SACL）→
+/// 配置。配置更新失败不影响已完成的系统侧（提示手工补配置，不回滚——
+/// 用户意图是启用，回滚会造成三步反复）。
 pub fn enable_file_audit(path: &Path, config_path: &Path) -> Result<()> {
     let dir = canonical_dir(path)?;
-    auditpol_set(true)?;
+    enable_security_privilege().context("启用 SeSecurityPrivilege 失败（需管理员提权）")?;
     apply_audit_ace(&dir, true).with_context(|| format!("SACL 配置失败：{}", dir.display()))?;
-    let cfg = config_update(config_path, &dir.display().to_string(), true)?;
+    if let Err(e) = auditpol_set(true) {
+        // 回滚已写入的 SACL，不留半启用残留（评审 M-2）
+        let _ = apply_audit_ace(&dir, false);
+        return Err(e).context("auditpol 设置失败（SACL 已回滚）");
+    }
+    let cfg = config_update(config_path, &dir.display().to_string(), true)
+        .context("系统侧已启用，但配置更新失败——请手工在 [file_audit] 设 enabled=true 并加入 watch_paths")?;
     println!("文件审计已启用：{}", dir.display());
     println!(
-        "config.toml [file_audit] enabled={}，watch_paths={:?}",
-        cfg.file_audit.enabled, cfg.file_audit.watch_paths
+        "config.toml [file_audit] enabled={}，watch_paths={:?}（配置文件：{}，请核对非预期目录）",
+        cfg.file_audit.enabled,
+        cfg.file_audit.watch_paths,
+        config_path.display()
     );
     println!("重启 HarnessGuard 后消费端生效（服务：sc stop HarnessGuard && sc start HarnessGuard）");
     Ok(())
 }
 
-/// 停用文件审计（需管理员）：对称回退。watch_paths 清空后消费开关一并关闭。
+/// 停用文件审计（需管理员提权）：SACL 撤销 → auditpol 关（失败提示手工回退）→
+/// 配置回退。watch_paths 清空后消费开关一并关闭。
 pub fn disable_file_audit(path: &Path, config_path: &Path) -> Result<()> {
     let dir = canonical_dir(path)?;
+    enable_security_privilege().context("启用 SeSecurityPrivilege 失败（需管理员提权）")?;
     apply_audit_ace(&dir, false).with_context(|| format!("SACL 撤销失败：{}", dir.display()))?;
-    auditpol_set(false)?;
+    auditpol_set(false).context("SACL 已撤销，但 auditpol 关闭失败——请手工执行 auditpol /set /subcategory:{FILE_SYSTEM_SUBCATALOG_GUID} /success:disable")?;
     let cfg = config_update(config_path, &dir.display().to_string(), false)?;
     println!("文件审计已停用：{}", dir.display());
     println!(
@@ -62,6 +78,41 @@ pub fn disable_file_audit(path: &Path, config_path: &Path) -> Result<()> {
         cfg.file_audit.enabled, cfg.file_audit.watch_paths
     );
     Ok(())
+}
+
+/// 显式启用当前进程令牌的 SeSecurityPrivilege（SACL 读写要求"已启用"；
+/// 管理员提权令牌默认 disabled——评审 M-1）。
+fn enable_security_privilege() -> Result<()> {
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, LUID};
+    use windows::Win32::Security::{
+        AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = HANDLE(std::ptr::null_mut());
+        OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token)
+            .context("OpenProcessToken 失败（需管理员）")?;
+        let r = (|| -> Result<()> {
+            let name: Vec<u16> = "SeSecurityPrivilege\u{0}".encode_utf16().collect();
+            let mut luid = LUID::default();
+            LookupPrivilegeValueW(None, PCWSTR(name.as_ptr()), &mut luid)
+                .context("LookupPrivilegeValue(SeSecurityPrivilege) 失败")?;
+            let tp = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+            };
+            AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None)
+                .context("AdjustTokenPrivileges 失败（需管理员）")?;
+            // 返回 TRUE 但 GetLastError=ERROR_NOT_ALL_ASSIGNED(1300)：令牌无此特权
+            if GetLastError().0 == 1300 {
+                bail!("令牌不含 SeSecurityPrivilege（需管理员提权运行）");
+            }
+            Ok(())
+        })();
+        let _ = CloseHandle(token);
+        r
+    }
 }
 
 /// 归一到绝对原生路径（fs::canonicalize 的 \\?\ 前缀剥除；目录不存在报错）。

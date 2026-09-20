@@ -30,6 +30,9 @@ use windows::Win32::Security::{
 /// ACE 类型 0 = ACCESS_ALLOWED_ACE（winnt.h；windows crate 该常量在
 /// Win32_System_SystemServices feature，为一个字节值引整个 feature 不值）
 const ACE_TYPE_ALLOWED: u8 = 0;
+/// AceFlags 位 0x10 = INHERITED_ACE（继承来的 ACE：非本工具产物，且会随
+/// 父目录 ACL 放宽自动传播——按未保护处理；评审 M-3）
+const ACE_FLAG_INHERITED: u8 = 0x10;
 
 /// 文件完全控制（读写删改 ACL）
 const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
@@ -49,6 +52,10 @@ pub fn apply_dacl(path: &Path, sids: &[(&str, u32)]) -> Result<()> {
         let mut sid_ptrs: Vec<PSID> = Vec::with_capacity(sids.len());
         for (sid_str, mask) in sids {
             let Some(sid) = sid_from_str(sid_str) else {
+                // 先释放已转换的 SID 再报错（防泄漏——评审 L-3）
+                for p in sid_ptrs {
+                    let _ = LocalFree(Some(HLOCAL(p.0.cast())));
+                }
                 bail!("SID 构造失败：{sid_str}");
             };
             sid_ptrs.push(sid);
@@ -176,8 +183,10 @@ unsafe fn dacl_is_protected(dacl: *mut ACL) -> bool {
             break;
         }
         let header = &*(ace as *const ACE_HEADER);
-        if header.AceType != ACE_TYPE_ALLOWED {
-            saw_trusted = false; // 拒绝/审计/复合 ACE：非本工具产物，按未保护处理
+        if header.AceType != ACE_TYPE_ALLOWED || header.AceFlags & ACE_FLAG_INHERITED != 0 {
+            // 拒绝/审计/复合 ACE 或继承 ACE：非本工具产物（protect_file 产出
+            // 受保护 DACL，不继承不混合）——按未保护处理（fail-closed）
+            saw_trusted = false;
             break;
         }
         let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);

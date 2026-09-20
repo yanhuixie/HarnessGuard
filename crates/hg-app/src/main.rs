@@ -78,12 +78,24 @@ fn init_service_logging() -> Option<tracing_appender::non_blocking::WorkerGuard>
     let dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("logs")));
+    let fallback_stderr = || {
+        // 日志目录不可用不得阻断服务启动：回落 stderr subscriber（前台调试
+        // service 模式时仍可见；Session 0 下丢弃——评审 L-1，注释如实）
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "info".into()),
+            )
+            .init();
+    };
     let Some(dir) = dir else {
-        eprintln!("[日志] 无法定位 exe 目录，回落 stderr");
+        eprintln!("[日志] 无法定位 exe 目录，日志回落 stderr（Session 0 下不可见）");
+        fallback_stderr();
         return None;
     };
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("[日志] 创建日志目录失败（{}）：{e}，回落 stderr", dir.display());
+        eprintln!("[日志] 创建日志目录失败（{}）：{e}，日志回落 stderr", dir.display());
+        fallback_stderr();
         return None;
     }
     cleanup_old_logs(&dir, LOG_KEEP_DAYS);
@@ -125,21 +137,19 @@ fn log_stale(name: &str, today: i64, keep_days: i64) -> Option<bool> {
     if it.next().is_some() {
         return None;
     }
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    if !(1970..=9999).contains(&y) || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return None;
     }
     Some(today - days_from_civil((y, m, d)) > keep_days)
 }
 
-/// 今天 (y, m, d)（本地时区；轮转文件名同为本地日期，一致即可）
+/// 今天 (y, m, d)（UTC——与 tracing-appender rolling::daily 的文件名同为 UTC
+/// 日期，天然一致；14 天窗口 >> 潜在本地时区 1 天偏差，不影响清理语义）
 fn today_ymd() -> (i64, i64, i64) {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    // 本地时区偏移：Windows 无 portable 本地化 API 于 std——按 UTC+8 折算会
-    // 引入硬编码；此处取 UTC 日期（与按日轮转的文件名日期可能差一天，
-    // 对保留期清理无影响：窗口 14 天 >> 1 天误差）
     let days = secs.div_euclid(86_400);
     civil_from_days(days)
 }
@@ -367,9 +377,9 @@ pub(crate) fn run_server(
     // ④ writer 汇合冲刷（限时，防 SQLite 卡死阻塞停机）
     tracing::info!("停机序列：回收 ETW 会话");
     hg_plat_win::stop_etw_sessions();
-    tracing::info!("停机序列：事件通道已关闭（引擎排水中）");
     inner_shutdown.close_channel();
     drop(etw_tx);
+    tracing::info!("停机序列：事件通道已关闭（引擎排水中）");
     drop(store_tx);
     rt.shutdown_timeout(Duration::from_secs(3));
     tracing::info!("停机序列：运行时已收尾（引擎/执行器排水完成或超时兜底）");
@@ -536,5 +546,6 @@ mod tests {
         assert_eq!(log_stale("other.log.2020-01-01", today, 14), None);
         assert_eq!(log_stale("harnessguard.log.2026-13-01", today, 14), None);
         assert_eq!(log_stale("harnessguard.log.2026-09", today, 14), None);
+        assert_eq!(log_stale("harnessguard.log.0000-01-01", today, 14), None, "年份越界不动");
     }
 }
