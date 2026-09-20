@@ -44,7 +44,7 @@ fn build_device_map() -> Vec<(String, String)> {
         }
     }
     // 长前缀优先（如 HarddiskVolume10 先于 HarddiskVolume1）
-    out.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    out.sort_by_key(|e| std::cmp::Reverse(e.0.len()));
     out
 }
 

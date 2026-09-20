@@ -425,12 +425,12 @@ impl RulesSnapshot {
                 return true;
             }
         }
-        t.allow_globs.is_match(&norm(path))
+        t.allow_globs.is_match(norm(path))
     }
 
     /// 用户路径白名单（快路径规则 0 短路，需求 §4.3）。
     pub fn is_path_whitelisted(&self, path: &Path) -> bool {
-        self.whitelist_paths.is_match(&norm(path))
+        self.whitelist_paths.is_match(norm(path))
     }
 
     /// 敏感文件命中（文件名级 glob，需求 §3.1 规则 1）。
@@ -760,8 +760,10 @@ mod tests {
 
     #[test]
     fn 快路径_白名单短路() {
-        let mut cfg = RulesConfig::default();
-        cfg.whitelist_paths = vec!["D:/safe/**".into()];
+        let cfg = RulesConfig {
+            whitelist_paths: vec!["D:/safe/**".into()],
+            ..Default::default()
+        };
         let rules = RulesSnapshot::compile(&cfg).unwrap();
         let id = harness_identity("C:/x/node.exe");
         let v = judge_perm_sync(&rules, &id, Path::new("D:/safe/.git/config"), Access::Read);
@@ -838,8 +840,11 @@ mod tests {
     /// 快照仍持有内置 git 豁免——空豁免表不可能是合法运行态。
     #[test]
     fn 编译兜底_空豁免表注入内置_git_豁免() {
-        let mut cfg = RulesConfig::default();
-        cfg.tool_exempt = vec![]; // 模拟配置链路异常（缺段/写回丢失）
+        // 模拟配置链路异常（缺段/写回丢失）
+        let cfg = RulesConfig {
+            tool_exempt: vec![],
+            ..Default::default()
+        };
         let rules = RulesSnapshot::compile(&cfg).unwrap();
         let mut id = harness_identity("C:/Program Files/Git/mingw64/bin/git.exe");
         id.tool_exempt = rules
@@ -859,11 +864,13 @@ mod tests {
     /// 用户自定义 git 条目存在时兜底不介入（以用户为准）
     #[test]
     fn 编译兜底_用户自定义条目优先() {
-        let mut cfg = RulesConfig::default();
-        cfg.tool_exempt = vec![ToolExemptConf {
-            exe: "git".into(),
-            allow_paths: vec![".git/objects/**".into()], // 用户收窄
-        }];
+        let cfg = RulesConfig {
+            tool_exempt: vec![ToolExemptConf {
+                exe: "git".into(),
+                allow_paths: vec![".git/objects/**".into()], // 用户收窄
+            }],
+            ..Default::default()
+        };
         let rules = RulesSnapshot::compile(&cfg).unwrap();
         // 收窄生效：objects 内放行
         assert!(rules.tool_exempt_allows("git", Path::new("D:/repo/.git/objects/ab/cd")));
@@ -876,8 +883,10 @@ mod tests {
     fn 处置配置_git_dir_kill_缺省不杀() {
         let rules = snapshot();
         assert!(!rules.git_dir_kill);
-        let mut cfg = RulesConfig::default();
-        cfg.git_dir_kill = true;
+        let cfg = RulesConfig {
+            git_dir_kill: true,
+            ..Default::default()
+        };
         assert!(RulesSnapshot::compile(&cfg).unwrap().git_dir_kill);
     }
 }

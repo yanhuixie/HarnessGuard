@@ -283,6 +283,8 @@ impl Engine {
         }
     }
 
+    // 事件字段天然多参（pid/ppid/启动时刻/exe/cmdline/cwd/ts），形态由平台 trait 约定
+    #[allow(clippy::too_many_arguments)]
     fn on_exec(
         &self,
         pid: Pid,
@@ -617,9 +619,7 @@ mod tests {
     use crate::rules::{RulesConfig, RulesSnapshot};
     use std::path::Path;
 
-    fn engine_with(
-        mut cfg: RulesConfig,
-    ) -> (Arc<Engine>, tokio::sync::mpsc::Receiver<EngineOutput>) {
+    fn engine_with(cfg: RulesConfig) -> (Arc<Engine>, tokio::sync::mpsc::Receiver<EngineOutput>) {
         let (tx, rx) = mpsc::channel(64);
         let procs = Arc::new(ProcTable::new());
         procs.bootstrap_insert(ProcTable::test_identity(
@@ -686,8 +686,10 @@ mod tests {
     /// git_dir_kill=true 时注入面创建升级为杀进程（用户显式开启）
     #[test]
     fn 创建_git_注入面_开启kill则杀() {
-        let mut cfg = RulesConfig::default();
-        cfg.git_dir_kill = true;
+        let cfg = RulesConfig {
+            git_dir_kill: true,
+            ..Default::default()
+        };
         let (eng, mut rx) = engine_with(cfg);
         eng.on_file_create(
             20812,
@@ -714,8 +716,10 @@ mod tests {
         assert_eq!(block_verdict_count(&out), 1);
         assert_eq!(kill_count(&out), 0);
 
-        let mut cfg = RulesConfig::default();
-        cfg.git_dir_kill = true;
+        let cfg = RulesConfig {
+            git_dir_kill: true,
+            ..Default::default()
+        };
         let (eng, mut rx) = engine_with(cfg);
         eng.on_file_open(
             20812,
@@ -795,8 +799,10 @@ mod tests {
     /// 归档产物：archive_action=audit 时不杀只记录
     #[test]
     fn 创建归档产物_audit模式不杀() {
-        let mut cfg = RulesConfig::default();
-        cfg.archive_action = crate::rules::FileAction::Audit;
+        let cfg = RulesConfig {
+            archive_action: crate::rules::FileAction::Audit,
+            ..Default::default()
+        };
         let (eng, mut rx) = engine_with(cfg);
         eng.on_file_create(20812, Path::new("D:/tmp/out.zip"), Timestamp(0))
             .unwrap();
@@ -851,8 +857,11 @@ mod tests {
     /// 累计上行超阈值 → net-threshold Block + 断连接 + 封 IP（需求 §3.2）
     #[test]
     fn 上行超阈值_阻断断连封ip() {
-        let mut cfg = RulesConfig::default();
-        cfg.upload_threshold_mb = 1; // 1MB 阈值便于测试
+        // 1MB 阈值便于测试
+        let cfg = RulesConfig {
+            upload_threshold_mb: 1,
+            ..Default::default()
+        };
         let (eng, mut rx) = engine_with(cfg);
         conn_open(&eng, 7, "8.8.8.8:443");
         // 两笔累计 1.5MB：第一笔未超，第二笔越线触发
@@ -870,8 +879,10 @@ mod tests {
     /// 白名单端点不计入阈值（域名经 dns_map 反查命中，需求 §3.2）
     #[test]
     fn 白名单端点_不计入阈值() {
-        let mut cfg = RulesConfig::default();
-        cfg.upload_threshold_mb = 1;
+        let cfg = RulesConfig {
+            upload_threshold_mb: 1,
+            ..Default::default()
+        };
         let (eng, mut rx) = engine_with(cfg);
         conn_open(&eng, 8, "1.2.3.4:443");
         eng.dns
@@ -884,9 +895,11 @@ mod tests {
     /// 两级评分联动（需求 §3.1）：监控根读过敏感文件后阈值降为 1/N
     #[test]
     fn 敏感降档_阈值十分之一即触发() {
-        let mut cfg = RulesConfig::default();
-        cfg.upload_threshold_mb = 1;
-        cfg.sensitive_escalation_divisor = 10;
+        let cfg = RulesConfig {
+            upload_threshold_mb: 1,
+            sensitive_escalation_divisor: 10,
+            ..Default::default()
+        };
         let (eng, mut rx) = engine_with(cfg);
         eng.root_sensitive.insert("zcode".into()); // 模拟已读敏感文件
         conn_open(&eng, 9, "8.8.8.8:443");
@@ -899,8 +912,10 @@ mod tests {
     /// 已处置连接（handled_conns）不再重复处置（防处置风暴）
     #[test]
     fn 已处置连接_不重复处置() {
-        let mut cfg = RulesConfig::default();
-        cfg.upload_threshold_mb = 1;
+        let cfg = RulesConfig {
+            upload_threshold_mb: 1,
+            ..Default::default()
+        };
         let (eng, mut rx) = engine_with(cfg);
         conn_open(&eng, 10, "8.8.8.8:443");
         eng.on_conn_tx(ConnId(10), 2 * 1024 * 1024, Timestamp(0));

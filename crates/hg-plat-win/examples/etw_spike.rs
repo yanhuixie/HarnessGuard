@@ -284,8 +284,10 @@ fn print_rss() {
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     unsafe {
-        let mut pmc = PROCESS_MEMORY_COUNTERS::default();
-        pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let mut pmc = PROCESS_MEMORY_COUNTERS {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            ..Default::default()
+        };
         let h: HANDLE = GetCurrentProcess();
         if GetProcessMemoryInfo(h, &mut pmc, pmc.cb) != 0 {
             println!(
@@ -384,7 +386,7 @@ fn run_manifest_spike(secs: u64, kernel_session: bool) {
             DNS_QUERY_OK.load(Relaxed)
         );
     }
-    let _ = trace.stop();
+    trace.stop();
     std::thread::sleep(Duration::from_millis(800));
     let total = start.elapsed().as_secs_f64();
     println!("\n===== manifest 模式汇总（{total:.0}s）=====");
@@ -447,8 +449,9 @@ fn run_kernel_spike(secs: u64) {
     println!("KernelTrace（Process/File/TCP-IP）已启动");
 
     let dns_trace = match Provider::by_name("Microsoft-Windows-Dns-Client") {
-        Ok(b) => match b.add_callback(on_dns).build() {
-            provider => match UserTrace::new()
+        Ok(b) => {
+            let provider = b.add_callback(on_dns).build();
+            match UserTrace::new()
                 .named("HgSpikeDns".into())
                 .enable(provider)
                 .start_and_process()
@@ -461,8 +464,8 @@ fn run_kernel_spike(secs: u64) {
                     eprintln!("UserTrace(Dns-Client) 启动失败：{e:?}");
                     None
                 }
-            },
-        },
+            }
+        }
         Err(e) => {
             eprintln!("Dns-Client provider 解析失败：{e:?}");
             None

@@ -113,12 +113,9 @@ unsafe fn probe_with_handle(hproc: HANDLE, pid: u32, file_object: u64) -> Option
     let base = 16; // NumberOfHandles(8) + Reserved(8)
                    // 条目数来自内核返回的缓冲首字段：异常值经 checked_mul/checked_add 防回绕
                    // 越过长度检查（M4 待修清单 1），溢出视同检索失败
-    let Some(total) = n
+    let total = n
         .checked_mul(HANDLE_ENTRY_SIZE)
-        .and_then(|x| x.checked_add(base))
-    else {
-        return None;
-    };
+        .and_then(|x| x.checked_add(base))?;
     if total > buf.len() {
         return None;
     }

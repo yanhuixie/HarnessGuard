@@ -235,7 +235,7 @@ impl FileConfig {
     pub fn to_rules_config(&self, whitelist_paths: Vec<String>) -> RulesConfig {
         let parse_action = |s: &str| match s {
             "audit" => FileAction::Audit,
-            "block" | _ => {
+            _ => {
                 if s != "block" {
                     tracing::warn!("非法动作字符串 {s:?}，按 block 处理");
                 }

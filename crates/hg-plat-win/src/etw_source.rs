@@ -4,6 +4,7 @@
 //! - 文件：`EVENT_TRACE_FLAG_FILE_IO(_INIT)`，FileObject→Name 缓存，按 harness 身份早过滤；
 //! - 网络：`EVENT_TRACE_FLAG_NETWORK_TCPIP`（connect/send/disconnect）；
 //! - DNS：Dns-Client 按 GUID 挂独立 UserTrace（by_name 本机 NotFound，M0 轮 1）。
+//!
 //! manifest 版 Kernel-Process 在本机不出事件（M0 轮 2–4），弃用。
 
 use std::collections::{HashMap, VecDeque};
@@ -30,6 +31,12 @@ use crate::probe;
 
 /// 事件源健康统计（定义于 hg-core::health，供 Web 状态页共享；技术设计 §9.1/§9.2）。
 pub use hg_core::health::SourceStats;
+
+/// TCP owner 表状态：上次刷新时刻 + 四元组→归属 pid 映射（见 tcp_owner 字段）
+type TcpOwnerState = (
+    std::time::Instant,
+    HashMap<(std::net::SocketAddr, std::net::SocketAddr), Pid>,
+);
 
 /// 文件 opcode（M0 实测）：64=Create 67=Read 68=Write
 pub(crate) const FILE_OP_CREATE: u8 = 64;
@@ -93,10 +100,7 @@ pub struct EtwInner {
     probe_last: Mutex<Instant>,
     /// TCP owner 表（GetExtendedTcpTable）：四元组 → 归属 pid。
     /// 实测教训：本机 TCP-IP 经典事件 PID 字段恒为 -1，归因只能走 owner 表。
-    tcp_owner: Mutex<(
-        std::time::Instant,
-        HashMap<(std::net::SocketAddr, std::net::SocketAddr), Pid>,
-    )>,
+    tcp_owner: Mutex<TcpOwnerState>,
     /// 已发 ConnOpen 的连接（send/connect 任一先到都确保登记——实测 connect 事件
     /// 在部分路径缺失，send 带有效 pid 时补登记，防孤儿 send）
     emitted_conns: dashmap::DashSet<u64>,
@@ -505,27 +509,25 @@ impl EtwInner {
                 if pid != u32::MAX
                     && self.emitted_conns_guard()
                     && self.emitted_conns.insert(conn_id.0)
-                {
-                    if self
+                    && self
                         .procs
                         .get(&pid)
                         .is_some_and(|id| id.harness_root.is_some())
-                    {
-                        let st = self
-                            .procs
-                            .get(&pid)
-                            .map(|i| i.start_time)
-                            .unwrap_or(StartTime(0));
-                        self.monitored_quads.insert(conn_id.0, (local, remote));
-                        self.emit(RawEvent::ConnOpen {
-                            pid,
-                            start_time: st,
-                            conn_id,
-                            proto: Proto::Tcp,
-                            local,
-                            remote,
-                        });
-                    }
+                {
+                    let st = self
+                        .procs
+                        .get(&pid)
+                        .map(|i| i.start_time)
+                        .unwrap_or(StartTime(0));
+                    self.monitored_quads.insert(conn_id.0, (local, remote));
+                    self.emit(RawEvent::ConnOpen {
+                        pid,
+                        start_time: st,
+                        conn_id,
+                        proto: Proto::Tcp,
+                        local,
+                        remote,
+                    });
                 }
                 self.emit(RawEvent::ConnTx {
                     conn_id,
