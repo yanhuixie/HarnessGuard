@@ -50,8 +50,8 @@ const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC0000004u32 as i32;
 /// x64 布局：Object(8) + UniqueProcessId(8) + HandleValue(8) + GrantedAccess(4)
 /// + CreatorBackTraceIndex(2) + ObjectTypeIndex(2) + HandleAttributes(4) + Reserved(4)
 const HANDLE_ENTRY_SIZE: usize = 40;
-/// 文件对象查询权限：GetFinalPathNameByHandleW 所需的最小访问掩码
-const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+/// 按源句柄既有权限复制（第一批实证可命中的方式）
+const DUPLICATE_SAME_ACCESS: u32 = 2;
 
 /// 探测决策（纯函数，单测覆盖）：仅 Create/Read 事件（实机复验修正：cmd `type`
 /// 等读路径的首个事件常是 Read（op=67）而非 Create，仅限 Create 会漏掉全部读
@@ -74,7 +74,11 @@ pub(crate) fn probe_file_name(pid: u32, file_object: u64) -> Option<String> {
             false,
             pid,
         )
-        .ok()?;
+        .ok();
+        if hproc.is_none() {
+            tracing::debug!("[probe] OpenProcess({pid}) 失败（复验诊断）");
+        }
+        let hproc = hproc?;
         let r = probe_with_handle(hproc, pid, file_object);
         let _ = CloseHandle(hproc);
         r
@@ -100,6 +104,7 @@ unsafe fn probe_with_handle(hproc: HANDLE, pid: u32, file_object: u64) -> Option
             || (need as usize) > 64 * 1024 * 1024
             || buf.len() >= 64 * 1024 * 1024
         {
+            tracing::debug!("[probe] 句柄快照失败 st={st:#x} need={need}（复验诊断）");
             return None;
         }
         let next = (need as usize).max(buf.len() * 2).min(64 * 1024 * 1024);
@@ -129,25 +134,34 @@ unsafe fn probe_with_handle(hproc: HANDLE, pid: u32, file_object: u64) -> Option
             break;
         }
     }
-    let src = found?;
+    let Some(src) = found else {
+        tracing::debug!("[probe] pid={pid} obj={file_object:x} 句柄表无匹配（复验诊断：句柄已关或对象地址不符）");
+        return None;
+    };
     // 3. 复制进本进程 → 4. 查询最终路径（含卷解析，等价 NtQueryInformationFile 链）。
-    // 显式 FILE_READ_ATTRIBUTES 而非 DUPLICATE_SAME_ACCESS：原句柄继承的访问掩码
-    // 可能不含查询权限，复制等权限会使 GetFinalPathNameByHandleW 失败、探测命中率
-    // 打折（M4 待修清单 6）
+    // 复制方式实机定案（M4 第二批复验）：DUPLICATE_SAME_ACCESS——跨进程显式请求
+    // 源句柄掩码之外的权限会被拒（FILE_READ_ATTRIBUTES 显式请求实测
+    // STATUS_ACCESS_DENIED=0xC0000022，源句柄 GrantedAccess 不含 0x80 时必败，
+    // certutil 场景两轮 0 命中）；同权限复制保留源的读掩码
+    // （GENERIC_READ 映射含 FILE_READ_ATTRIBUTES），GetFinalPathNameByHandleW 可用
     let mut dup = HANDLE(std::ptr::null_mut());
     let st = NtDuplicateObject(
         hproc,
         src,
         GetCurrentProcess(),
         &mut dup,
-        FILE_READ_ATTRIBUTES,
         0,
         0,
+        DUPLICATE_SAME_ACCESS,
     );
     if st < 0 {
+        tracing::debug!("[probe] NtDuplicateObject st={st:#x}（复验诊断）");
         return None;
     }
     let name = final_path(dup);
+    if name.is_none() {
+        tracing::debug!("[probe] GetFinalPathNameByHandleW 失败 gle={}（复验诊断）", std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+    }
     let _ = CloseHandle(dup);
     name
 }

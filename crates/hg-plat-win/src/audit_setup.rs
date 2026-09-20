@@ -37,7 +37,7 @@ use windows::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE}
 const EVERYONE_SID: &str = "S-1-1-0";
 /// 审计子类别 "File System" 的 GUID（本地化无关；auditpol /set /subcategory:
 /// {GUID} 形式，MSDN Audit File System 文档）
-const FILE_SYSTEM_SUBCATALOG_GUID: &str = "{0CCE9216-69AE-11D9-BED3-505054503030}";
+const FILE_SYSTEM_SUBCATALOG_GUID: &str = "{0CCE921D-69AE-11D9-BED3-505054503030}";
 
 /// 启用文件审计（需管理员提权）：特权 → SACL → auditpol（失败回滚 SACL）→
 /// 配置。配置更新失败不影响已完成的系统侧（提示手工补配置，不回滚——
@@ -70,7 +70,11 @@ pub fn disable_file_audit(path: &Path, config_path: &Path) -> Result<()> {
     let dir = canonical_dir(path)?;
     enable_security_privilege().context("启用 SeSecurityPrivilege 失败（需管理员提权）")?;
     apply_audit_ace(&dir, false).with_context(|| format!("SACL 撤销失败：{}", dir.display()))?;
-    auditpol_set(false).context("SACL 已撤销，但 auditpol 关闭失败——请手工执行 auditpol /set /subcategory:{FILE_SYSTEM_SUBCATALOG_GUID} /success:disable")?;
+    auditpol_set(false).with_context(|| {
+        format!(
+            "SACL 已撤销，但 auditpol 关闭失败——请手工执行 auditpol /set /subcategory:{FILE_SYSTEM_SUBCATALOG_GUID} /success:disable"
+        )
+    })?;
     let cfg = config_update(config_path, &dir.display().to_string(), false)?;
     println!("文件审计已停用：{}", dir.display());
     println!(

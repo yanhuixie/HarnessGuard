@@ -144,9 +144,15 @@ unsafe fn render_xml(event: EVT_HANDLE) -> Option<String> {
 
 /// 4663 事件处理：解析 → 前缀过滤 → 复用 ETW 文件管线入引擎。
 fn handle_4663(ctx: &SecAuditCtx, xml: &str) {
-    let Some((pid, op, path)) = parse_4663(xml) else { return };
+    let Some((pid, op, path)) = parse_4663(xml) else {
+        tracing::debug!("[file-audit] 4663 解析失败：{}", &xml[..xml.len().min(300)]);
+        return;
+    };
     let path_str = path.display().to_string().to_lowercase().replace('\\', "/");
     if !ctx.watch.iter().any(|w| path_watch_hit(&path_str, w)) {
+        // 复验诊断：watch 外事件量可能极大（全系统文件审计开启时），
+        // 采样输出首条不匹配路径定位前缀归一问题
+        tracing::debug!("[file-audit] 4663 前缀不匹配：{path_str}（watch={:?}）", ctx.watch);
         return;
     }
     ctx.inner.emit_file_event(pid, op, &path.display().to_string());
@@ -177,11 +183,18 @@ fn parse_4663(xml: &str) -> Option<(u32, u8, std::path::PathBuf)> {
 
 /// 从事件 XML 提取 `<Data Name="xxx">值</Data>`（最小实现：固定 schema 子串
 /// 定位 + 实体解码，避免引入 XML 依赖；单测覆盖）。
+/// 引号兼容（复验定案）：EvtRender 真实输出属性用**单引号**（`Name='xxx'`），
+/// 手写/文档样例常用双引号——两种都匹配（首版只匹配双引号导致解析全败）。
 pub(crate) fn xml_field(xml: &str, name: &str) -> Option<String> {
-    let pat = format!("<Data Name=\"{name}\">");
-    let start = xml.find(&pat)? + pat.len();
-    let end = xml[start..].find("</Data>")? + start;
-    Some(xml_decode(&xml[start..end]))
+    for q in ['"', '\''] {
+        let pat = format!("<Data Name={q}{name}{q}>");
+        if let Some(start) = xml.find(&pat) {
+            let s = start + pat.len();
+            let end = s + xml[s..].find("</Data>")?;
+            return Some(xml_decode(&xml[s..end]));
+        }
+    }
+    None
 }
 
 /// 五个预定义 XML 实体解码（文件名中 `&` 合法出现，必须处理）。
@@ -209,10 +222,18 @@ mod tests {
 <Data Name="AccessMask">0x2</Data>\
 </EventData></Event>"#;
 
+    /// 真实 EvtRender 输出格式（属性单引号——复验定案；截自实机 4663）。
+    const SAMPLE_REAL: &str = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Security-Auditing' Guid='{54849625-5478-4994-a5ba-3e3b0328c30d}'/><EventID>4663</EventID></System><EventData><Data Name='SubjectUserSid'>S-1-5-18</Data><Data Name='ObjectName'>\Device\HarddiskVolume4\work\repo\.git\config</Data><Data Name='ProcessId'>0x1a2b</Data><Data Name='AccessMask'>0x2</Data></EventData></Event>"#;
+
     #[test]
     fn xml字段提取与实体解码() {
         assert_eq!(xml_field(SAMPLE, "ObjectName").unwrap(), r"\Device\HarddiskVolume4\work\repo\.git\config");
         assert_eq!(xml_field(SAMPLE, "ProcessId").unwrap(), "0x1a2b");
+        // 真实格式（单引号属性）双兼容——首版只匹配双引号，实机解析全败的回归锚定
+        assert_eq!(xml_field(SAMPLE_REAL, "ObjectName").unwrap(), r"\Device\HarddiskVolume4\work\repo\.git\config");
+        assert_eq!(xml_field(SAMPLE_REAL, "ProcessId").unwrap(), "0x1a2b");
+        assert_eq!(xml_field(SAMPLE_REAL, "AccessMask").unwrap(), "0x2");
+        assert!(parse_4663(SAMPLE_REAL).is_some(), "真实格式完整解析");
         // 实体解码（含双重解码防护：&amp;lt; 不得变成 <）
         let xml = r#"<Data Name="ObjectName">C:/a &amp; b/&amp;lt;x&gt;</Data>"#;
         assert_eq!(xml_field(xml, "ObjectName").unwrap(), "C:/a & b/&lt;x>");
