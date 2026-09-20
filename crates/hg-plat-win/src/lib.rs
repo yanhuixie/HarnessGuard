@@ -14,7 +14,9 @@
 //! - [`wfp`]：用户态 WFP 临时封禁（M4 偏差归位，netsh 为降级兜底）
 //! - [`sec_audit`]：Security 通道 4663 文件审计消费（场景 A opt-in 备选通道，M4 第二批）
 //! - [`audit_setup`]：上述通道的系统侧启用/停用（auditpol + SACL，opt-in）
+//! - [`acl`]：自保护 DACL（§8.2：配置/库/token 仅 SYSTEM/Administrators）
 
+pub mod acl;
 pub mod audit_setup;
 pub mod bootstrap;
 pub mod enforcer;

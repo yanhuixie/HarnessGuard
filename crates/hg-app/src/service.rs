@@ -106,6 +106,7 @@ fn report_state(
 /// 已于 2026-09-20 实机验证（M4 第一批复验报告）；升级重装前先 uninstall。
 pub fn install() -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
+    let exe_dir = exe.parent().map(|d| d.to_path_buf());
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CREATE_SERVICE | ServiceManagerAccess::CONNECT,
@@ -136,6 +137,20 @@ pub fn install() -> anyhow::Result<()> {
         .output()?;
     if !out.status.success() {
         anyhow::bail!("恢复策略配置失败：{}", String::from_utf8_lossy(&out.stderr));
+    }
+    // 自保护 ACL（§8.2 / 待修 11）：安装时对已存在的三件套应用保护 DACL；
+    // 安装后首次启动新建的文件（config/db/token 生成时机不同）由服务启动
+    // 自检覆盖（run_server 服务模式）
+    if let Some(dir) = exe_dir {
+        for name in ["config.toml", "harnessguard.db", "web-token.txt"] {
+            let p = dir.join(name);
+            if p.exists() {
+                match hg_plat_win::acl::protect_file(&p) {
+                    Ok(()) => println!("已应用保护 ACL（仅 SYSTEM/Administrators）：{}", p.display()),
+                    Err(e) => println!("保护 ACL 应用失败（{}）：{e:#}", p.display()),
+                }
+            }
+        }
     }
     println!("服务已安装（LocalSystem 自启动，失败三级重启）");
     println!("启动：sc start {SERVICE_NAME}（需管理员）");

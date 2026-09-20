@@ -197,7 +197,11 @@ pub(crate) fn run_server(
             }
         }
     }
-    let bind = cfg.web.bind.clone();    let state = Arc::new(hg_web::AppState {
+    let bind = cfg.web.bind.clone();
+    // 自保护自检目标（cfg_path 随 AppState 移动，先克隆；db 取实际配置路径）
+    let guard_files_seed: Vec<PathBuf> =
+        vec![cfg_path.clone(), PathBuf::from(&db_path)];
+    let state = Arc::new(hg_web::AppState {
         expected_host: bind.clone(),
         token: token.clone(),
         rules: rules.clone(),
@@ -228,6 +232,15 @@ pub(crate) fn run_server(
         println!("==================================================================");
     } else {
         tracing::info!("HarnessGuard 服务模式已启动，Web UI：http://{bind}/?token={token}");
+        // 自保护自检（§8.2 / 待修 11）：配置/库/token 未保护则告警并自愈
+        // （覆盖 install 后首次启动新建的文件；web-token.txt 每次启动重写）
+        let mut guard_files = guard_files_seed.clone();
+        if let Some(dir) =
+            std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        {
+            guard_files.push(dir.join("web-token.txt"));
+        }
+        hg_plat_win::acl::startup_selfcheck(&guard_files);
     }
 
     // 初始化完成（装配 + Web 监听就绪）：通知宿主（服务模式上报 RUNNING，
