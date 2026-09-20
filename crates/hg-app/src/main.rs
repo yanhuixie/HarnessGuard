@@ -309,7 +309,15 @@ pub(crate) fn run_server(
         {
             let p = dir.join("web-token.txt");
             match std::fs::write(&p, format!("{token}\n")) {
-                Ok(()) => tracing::info!("服务模式：Web token 已写入 {}", p.display()),
+                Ok(()) => {
+                    // 写后立即应用拍板 14 DACL（管理员全控 + Users 只读）：
+                    // 覆盖旧版仅管理员收紧态（特权进程持 WRITE_DAC），
+                    // 非提权用户可直接读取取用
+                    if let Err(e) = hg_plat_win::acl::protect_file(&p) {
+                        tracing::error!("web-token.txt DACL 应用失败：{e:#}（文件可能仅管理员可读）");
+                    }
+                    tracing::info!("服务模式：Web token 已写入 {}（Users 可读）", p.display());
+                }
                 Err(e) => tracing::error!("Web token 写盘失败（{}）：{e}", p.display()),
             }
         }
@@ -351,9 +359,12 @@ pub(crate) fn run_server(
     } else {
         // token 不落日志（日志文件在未保护目录，防泄漏；token 见 web-token.txt）
         tracing::info!("HarnessGuard 服务模式已启动，Web UI：http://{bind}/（token 见安装目录 web-token.txt）");
-        // 自保护自检（§8.2 / 待修 11）：配置/库/token 未保护则告警并自愈
-        // （覆盖 install 后首次启动新建的文件；web-token.txt 每次启动重写）
+        // 自保护自检（§8.2 / 待修 11）：配置/库/token（含 db WAL 衍生文件）
+        // 未保护则告警并自愈应用（拍板 14 口径：管理员全控 + Users 只读，
+        // 覆盖 install 后首次启动新建的文件与旧版仅管理员收紧态）
         let mut guard_files = guard_files_seed.clone();
+        guard_files.push(PathBuf::from(format!("{db_path}-wal")));
+        guard_files.push(PathBuf::from(format!("{db_path}-shm")));
         if let Some(dir) =
             std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()))
         {

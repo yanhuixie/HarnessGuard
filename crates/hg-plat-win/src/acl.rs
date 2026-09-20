@@ -1,11 +1,15 @@
 //! 自保护 DACL（技术设计 §8.2；M4 待修清单 11 前半）：config.toml /
-//! harnessguard.db / web-token.txt 置为仅 SYSTEM/Administrators 完全控制
-//! （受保护 DACL，切断父目录继承），防非管理员用户或被攻陷的 harness 进程
-//! 直接改配置、注入白名单或读 Web token。
+//! harnessguard.db / web-token.txt 统一为 SYSTEM/Administrators 全控 +
+//! BUILTIN\Users 只读（拍板记录 14：普通用户需读配置/token/审计数据，
+//! 仅管理员收紧实机使用过于麻烦；写权限仍仅特权进程，防篡改）。
 //!
 //! 应用时机：install 时对已存在文件应用；服务启动自检（未保护则告警并自愈
-//! 应用，覆盖安装后首次启动新建的文件——web-token.txt 每次服务启动重写，
-//! 亦由此覆盖）。控制台模式不启用（调试形态）。
+//! 应用，覆盖安装后首次启动新建的文件——web-token.txt 每次服务启动重写并
+//! 主动设 DACL，亦由此覆盖）。控制台模式不启用（调试形态）。
+//!
+//! 验证级：编译级 + apply/check 往返单测（本机非提权进程对自建临时文件可设
+//! DACL——文件 owner 恒有隐式 WRITE_DAC）；LocalSystem 服务下的部署形态
+//! 待实机复验。
 //!
 //! 验证级：编译级 + apply/check 往返单测（本机非提权进程对自建临时文件可设
 //! DACL——文件 owner 恒有隐式 WRITE_DAC）；LocalSystem 服务下的部署形态
@@ -36,10 +40,19 @@ const ACE_FLAG_INHERITED: u8 = 0x10;
 
 /// 文件完全控制（读写删改 ACL）
 const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+/// 文件读（winnt.h FILE_GENERIC_READ：READ_CONTROL | FILE_READ_DATA |
+/// FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE）
+const FILE_GENERIC_READ: u32 = 0x0012_0089;
+/// 写相关权限位（winnt.h：FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA |
+/// FILE_DELETE_CHILD | FILE_WRITE_ATTRIBUTES | DELETE | WRITE_DAC | WRITE_OWNER）
+/// ——Users 只读 ACE（拍板 14）含任一位即判外泄、未保护
+const FILE_WRITE_BITS: u32 = 0x000D_0156;
 /// LocalSystem 账户
 pub const SID_SYSTEM: &str = "S-1-5-18";
 /// BUILTIN\Administrators
 pub const SID_ADMINS: &str = "S-1-5-32-544";
+/// BUILTIN\Users（只读受托者，拍板记录 14）
+pub const SID_USERS: &str = "S-1-5-32-545";
 /// Everyone（单测还原用；SET_ACCESS 语义下与生产无交集）
 pub const SID_EVERYONE: &str = "S-1-1-0";
 
@@ -97,14 +110,25 @@ pub fn apply_dacl(path: &Path, sids: &[(&str, u32)]) -> Result<()> {
     Ok(())
 }
 
-/// 自保护：仅 SYSTEM + Administrators 完全控制。
+/// 自保护（拍板 14）：SYSTEM/Administrators 全控 + Users 只读（config/db/
+/// token 统一口径——普通用户可读取配置与审计数据、取用 token；写仅特权进程，
+/// 防篡改配置/白名单/审计记录）。已被旧版"仅管理员"收紧的文件由本函数直接
+/// 覆盖（特权进程持 WRITE_DAC）。
 pub fn protect_file(path: &Path) -> Result<()> {
-    apply_dacl(path, &[(SID_SYSTEM, FILE_ALL_ACCESS), (SID_ADMINS, FILE_ALL_ACCESS)])
+    apply_dacl(
+        path,
+        &[
+            (SID_SYSTEM, FILE_ALL_ACCESS),
+            (SID_ADMINS, FILE_ALL_ACCESS),
+            (SID_USERS, FILE_GENERIC_READ),
+        ],
+    )
 }
 
-/// 自检：DACL 是否"仅 SYSTEM/Administrators 可写"——存在允许型 ACE 授予其他
-/// 受托者，或混入非允许型 ACE（拒绝/审计——非本工具产物），或无 DACL（继承
-/// 父目录），均判未保护。文件不存在返回 Ok(false)（调用方跳过）。
+/// 自检：DACL 是否满足拍板 14 口径——允许型 ACE 的受托者为 SYSTEM/
+/// Administrators（任意权限，至少其一在场）或 Users（**仅读**，含写位判外泄）；
+/// 其他受托者、非允许型 ACE（拒绝/审计）、继承 ACE、无 DACL 均判未保护。
+/// 文件不存在返回 Ok(false)（调用方跳过）。
 pub fn check_protected(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
@@ -141,7 +165,7 @@ pub fn startup_selfcheck(files: &[std::path::PathBuf]) {
             Ok(false) if !p.exists() => {} // 尚未生成，下次启动覆盖
             Ok(false) => {
                 tracing::warn!(
-                    "[自保护] {} 未受保护，应用 DACL（仅 SYSTEM/Administrators）",
+                    "[自保护] {} 未受保护，应用 DACL（SYSTEM/Administrators 全控 + Users 只读，拍板 14）",
                     p.display()
                 );
                 if let Err(e) = protect_file(p) {
@@ -153,8 +177,8 @@ pub fn startup_selfcheck(files: &[std::path::PathBuf]) {
     }
 }
 
-/// DACL 判定：所有允许型 ACE 的受托者均须为 SYSTEM/Administrators 且至少
-/// 其一在场（protect_file 保证双受托者；此处校验"无外泄面"）。
+/// DACL 判定（拍板 14 口径）：允许型 ACE 受托者须为 SYSTEM/Administrators
+/// （至少其一在场）或 Users（仅读，mask 含写位判外泄）；其余情况未保护。
 unsafe fn dacl_is_protected(dacl: *mut ACL) -> bool {
     if dacl.is_null() {
         return false;
@@ -175,6 +199,7 @@ unsafe fn dacl_is_protected(dacl: *mut ACL) -> bool {
         let _ = LocalFree(Some(HLOCAL(sys.0.cast())));
         return false;
     };
+    let users = sid_from_str(SID_USERS);
     let mut saw_trusted = false;
     for i in 0..info.AceCount {
         let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
@@ -194,6 +219,15 @@ unsafe fn dacl_is_protected(dacl: *mut ACL) -> bool {
         // EqualSid：相等返回 Ok(())，不等/版本不匹配返回 Err
         let is_sys = EqualSid(sid, sys).is_ok();
         let is_adm = EqualSid(sid, admins).is_ok();
+        let is_users = users.map(|u| EqualSid(sid, u).is_ok()).unwrap_or(false);
+        if is_users {
+            // 拍板 14：Users 只读 ACE 合法；含任一写位即外泄
+            if allowed.Mask & FILE_WRITE_BITS != 0 {
+                saw_trusted = false;
+                break;
+            }
+            continue;
+        }
         if !is_sys && !is_adm {
             saw_trusted = false; // 外来受托者的允许 ACE：未保护
             break;
@@ -202,6 +236,9 @@ unsafe fn dacl_is_protected(dacl: *mut ACL) -> bool {
     }
     let _ = LocalFree(Some(HLOCAL(sys.0.cast())));
     let _ = LocalFree(Some(HLOCAL(admins.0.cast())));
+    if let Some(u) = users {
+        let _ = LocalFree(Some(HLOCAL(u.0.cast())));
+    }
     saw_trusted
 }
 
@@ -219,8 +256,9 @@ fn wide(s: &str) -> Vec<u16> {
 mod tests {
     use super::*;
 
-    /// apply/check 往返：默认继承 DACL 与 Everyone DACL 均未保护；
-    /// protect 后保护成立；还原后失效（owner 恒有隐式 WRITE_DAC，非提权可设）。
+    /// apply/check 往返（拍板 14 口径）：默认继承 DACL 与 Everyone DACL 均未
+    /// 保护；protect 后（SYSTEM/Admins 全控 + Users 只读）保护成立；还原后失效
+    /// （owner 恒有隐式 WRITE_DAC，非提权可设）。
     #[test]
     fn dac保护往返() {
         let dir = std::env::temp_dir().join("hg-acl-test");
@@ -231,7 +269,7 @@ mod tests {
         apply_dacl(&f, &[(SID_EVERYONE, FILE_ALL_ACCESS)]).unwrap();
         assert!(!check_protected(&f).unwrap(), "Everyone 允许 ACE 未保护");
         protect_file(&f).unwrap();
-        assert!(check_protected(&f).unwrap(), "仅 SYSTEM/Admins → 保护成立");
+        assert!(check_protected(&f).unwrap(), "管理员全控+Users 只读 → 保护成立");
         // 还原以便清理（验证 DACL 可再次改写）
         apply_dacl(&f, &[(SID_EVERYONE, FILE_ALL_ACCESS)]).unwrap();
         assert!(!check_protected(&f).unwrap(), "还原后未保护");
@@ -242,5 +280,27 @@ mod tests {
     #[test]
     fn 不存在文件按未保护跳过() {
         assert!(!check_protected(Path::new("Z:/definitely/not/exist")).unwrap());
+    }
+
+    /// 拍板 14 口径细分：Users 只读合法，Users 带写位判外泄（自检自愈收紧），
+    /// 仅 Users（无 SYSTEM/Admins）不算保护。
+    #[test]
+    fn users只读合法_带写位或独占均判未保护() {
+        let dir = std::env::temp_dir().join("hg-acl-users-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("t.txt");
+        std::fs::write(&f, "x").unwrap();
+        apply_dacl(&f, &[(SID_USERS, FILE_GENERIC_READ)]).unwrap();
+        assert!(!check_protected(&f).unwrap(), "仅 Users 无 SYSTEM/Admins：未保护");
+        apply_dacl(
+            &f,
+            &[(SID_SYSTEM, FILE_ALL_ACCESS), (SID_USERS, FILE_ALL_ACCESS)],
+        )
+        .unwrap();
+        assert!(!check_protected(&f).unwrap(), "Users 带写位：未保护");
+        protect_file(&f).unwrap();
+        assert!(check_protected(&f).unwrap(), "管理员全控 + Users 纯读：保护成立");
+        std::fs::remove_file(&f).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 }

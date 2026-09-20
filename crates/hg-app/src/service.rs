@@ -12,6 +12,7 @@
 
 use anyhow::Context;
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -180,14 +181,19 @@ pub fn install() -> anyhow::Result<()> {
     };
     service.set_description("ETW 事件源 + 规则引擎 + 处置（需求 §6.1 单特权服务）")?;
 
-    // 自保护 ACL（§8.2 / 待修 11）：对已存在的三件套应用（含刚生成的 config；
-    // 首次启动新建的 db/token 由服务启动自检覆盖）
+    // 自保护 ACL（§8.2 / 拍板 14）：对已存在的 config/db/token（含 db WAL
+    // 衍生文件）统一应用——SYSTEM/Administrators 全控 + Users 只读；旧版仅
+    // 管理员收紧过的文件在此覆盖为可读态。首次启动新建的文件由服务启动自检覆盖
     if let Some(dir) = &exe_dir {
-        for name in ["config.toml", "harnessguard.db", "web-token.txt"] {
-            let p = dir.join(name);
+        let db = dir.join("harnessguard.db");
+        let mut files = vec![dir.join("config.toml"), db.clone()];
+        files.push(PathBuf::from(format!("{}-wal", db.display())));
+        files.push(PathBuf::from(format!("{}-shm", db.display())));
+        files.push(dir.join("web-token.txt"));
+        for p in files {
             if p.exists() {
                 match hg_plat_win::acl::protect_file(&p) {
-                    Ok(()) => println!("已应用保护 ACL（仅 SYSTEM/Administrators）：{}", p.display()),
+                    Ok(()) => println!("已应用保护 ACL（SYSTEM/Administrators 全控 + Users 只读，拍板 14）：{}", p.display()),
                     Err(e) => println!("保护 ACL 应用失败（{}）：{e:#}", p.display()),
                 }
             }
