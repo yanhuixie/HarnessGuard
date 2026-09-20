@@ -16,8 +16,10 @@
   .card { background:var(--panel); border-radius:8px; padding:12px 16px; min-width:150px; }
   .card .n { font-size:22px; font-weight:600; }
   .card .l { color:var(--dim); font-size:12px; }
-  table { width:100%; border-collapse:collapse; background:var(--panel); border-radius:8px; overflow:hidden; }
-  th,td { text-align:left; padding:7px 10px; border-bottom:1px solid #2a3542; font-size:13px; }
+  /* fixed 布局 + 显式列宽（各表 th 内联 width）：长命令行/路径/JSON 不可断，
+     auto 布局按 min-content 计算会把表格撑出容器产生横向滚动 */
+  table { width:100%; table-layout:fixed; border-collapse:collapse; background:var(--panel); border-radius:8px; overflow:hidden; }
+  th,td { text-align:left; padding:7px 10px; border-bottom:1px solid #2a3542; font-size:13px; overflow-wrap:anywhere; }
   th { color:var(--dim); font-weight:500; }
   .tag { padding:1px 8px; border-radius:10px; font-size:12px; }
   .tag.block { background:#3d1b1b; color:var(--bad); }
@@ -61,19 +63,19 @@
   <section id="p-dash">
     <div class="cards" id="cards"></div>
     <h3>最近判定（点击行查看证据）</h3>
-    <table><thead><tr><th>时间</th><th>动作</th><th>规则</th><th>进程</th><th>摘要</th></tr></thead>
+    <table><thead><tr><th style="width:90px">时间</th><th style="width:70px">动作</th><th style="width:150px">规则</th><th style="width:190px">进程</th><th>摘要</th></tr></thead>
     <tbody id="vrows"></tbody></table>
   </section>
 
   <section id="p-events" style="display:none">
     <h3>审计事件流</h3>
-    <table><thead><tr><th>时间</th><th>类型</th><th>PID</th><th>详情</th></tr></thead>
+    <table><thead><tr><th style="width:90px">时间</th><th style="width:70px">类型</th><th style="width:80px">PID</th><th>详情</th></tr></thead>
     <tbody id="erows"></tbody></table>
   </section>
 
   <section id="p-procs" style="display:none">
     <h3>进程身份表（监控树内）</h3>
-    <table><thead><tr><th>PID</th><th>可执行</th><th>命令行</th><th>监控根</th><th>豁免</th></tr></thead>
+    <table><thead><tr><th style="width:70px">PID</th><th style="width:240px">可执行</th><th>命令行</th><th style="width:90px">监控根</th><th style="width:60px">豁免</th></tr></thead>
     <tbody id="prows"></tbody></table>
   </section>
 
@@ -83,7 +85,7 @@
     <input id="wl-value" placeholder="值（域名 glob / 路径 / 进程名）" style="width:300px">
     <input id="wl-note" placeholder="备注" style="width:180px">
     <button class="act" onclick="wlAdd()">添加</button></p>
-    <table><thead><tr><th>ID</th><th>类型</th><th>值</th><th>备注</th><th></th></tr></thead>
+    <table><thead><tr><th style="width:60px">ID</th><th style="width:90px">类型</th><th>值</th><th style="width:220px">备注</th><th style="width:70px"></th></tr></thead>
     <tbody id="wrows"></tbody></table>
   </section>
 

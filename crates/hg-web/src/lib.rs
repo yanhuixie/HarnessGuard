@@ -292,14 +292,18 @@ async fn wl_add(State(st): State<Arc<AppState>>, Json(body): Json<WlAdd>) -> Res
     }
 }
 
-async fn wl_del(State(st): State<Arc<AppState>>, Query(p): Query<serde_json::Value>) -> Response {
-    let Some(id) = p.get("id").and_then(|v| v.as_i64()) else {
-        return (StatusCode::BAD_REQUEST, "缺 id").into_response();
-    };
+/// query 值经 serde_urlencoded 进 struct 时自动 parse 成目标类型；
+/// 不能用 serde_json::Value 承接（值恒为 String，数字提取必失败）
+#[derive(Deserialize)]
+struct WlDelQ {
+    id: i64,
+}
+
+async fn wl_del(State(st): State<Arc<AppState>>, Query(p): Query<WlDelQ>) -> Response {
     let Ok(conn) = hg_store::open(&st.db_path) else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "打开数据库失败").into_response();
     };
-    match conn.execute("DELETE FROM whitelist WHERE id = ?1", [id]) {
+    match conn.execute("DELETE FROM whitelist WHERE id = ?1", [p.id]) {
         Ok(_) => {
             if let Err(e) = st.rebuild_rules() {
                 tracing::error!("白名单热更新失败：{e:#}");
@@ -559,6 +563,47 @@ mod tests {
         assert_eq!((v, w), (0, 1));
         drop(st); // 通道唯一发送端随 state 释放，写入线程退出
         let _ = writer.join();
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// 白名单删除回归：UI 经 `?id=N` 删除。曾用 serde_json::Value 承接 query，
+    /// 值恒为字符串致 as_i64 必失败、删除按钮从未生效（400 缺 id）。
+    #[tokio::test]
+    async fn 白名单删除_query数字id生效() {
+        let dir = std::env::temp_dir().join("hg-web-wldel-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        let _ = std::fs::remove_file(&db);
+        let db_path = db.display().to_string();
+        {
+            let conn = hg_store::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO whitelist(kind, value, note, created_ts) VALUES ('endpoint','api.openai.com','n',1)",
+                [],
+            )
+            .unwrap();
+        }
+        let st = test_state_with_db(&db_path);
+        let call_del = |st: Arc<AppState>, uri: &'static str| async move {
+            let req = axum::http::Request::builder()
+                .method("DELETE")
+                .uri(uri)
+                .header("host", "127.0.0.1:18099")
+                .header("authorization", "Bearer t123")
+                .body(Body::empty())
+                .unwrap();
+            router(st).oneshot(req).await.unwrap()
+        };
+        let res = call_del(st.clone(), "/api/whitelist?id=1").await;
+        assert_eq!(res.status(), StatusCode::OK, "数字 id 应解析成功");
+        let conn = hg_store::open(&db_path).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM whitelist", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "条目应被删除");
+        // 缺 id → 400（Query 提取失败）
+        let r2 = call_del(st, "/api/whitelist").await;
+        assert_eq!(r2.status(), StatusCode::BAD_REQUEST);
         let _ = std::fs::remove_file(&db);
     }
 

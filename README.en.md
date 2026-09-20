@@ -23,6 +23,30 @@ AI coding tools run with enormous local privileges — full read/write access to
 - **Response actions**: alerting (OS notifications) + blocking (network/file interception)
 - **Web UI**: background service with a browser-based management console
 
+## Web UI
+
+The service ships a localhost-only management console (token auth + Host check). Live screenshots:
+
+**Dashboard — live metrics & recent verdicts**
+
+![Dashboard: live metrics & recent verdicts](docs/images/dashboard.png)
+
+**Event stream — real-time audit (process spawns / file / network / DNS)**
+
+![Event stream: real-time audit](docs/images/events.png)
+
+**Processes — identity table of monitored process trees**
+
+![Processes: identity table of monitored process trees](docs/images/processes.png)
+
+**Allowlist — endpoint / path / process exemptions, hot-reloaded**
+
+![Allowlist: endpoint/path/process exemptions](docs/images/whitelist.png)
+
+**Settings — in-browser config.toml editing, hot-reloaded on save**
+
+![Settings: in-browser config.toml editing](docs/images/settings.png)
+
 ## Architecture
 
 Rust workspace with layered crates (dependencies flow downward, acyclic):

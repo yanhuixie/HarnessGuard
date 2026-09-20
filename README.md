@@ -23,6 +23,30 @@ AI 编程工具在本地拥有极高的权限——读写整个代码仓库、�
 - **响应动作**：告警（OS 通知）+ 阻断（拦截网络/文件操作）
 - **Web UI**：后台服务 + 浏览器访问的管理界面
 
+## Web UI 界面
+
+服务内置仅本机可达的管理界面（token 鉴权 + Host 校验），以下为运行实况：
+
+**Dashboard — 运行指标与最近判定**
+
+![Dashboard：运行指标与最近判定](docs/images/dashboard.png)
+
+**事件流 — 实时审计（进程启动 / 文件 / 网络 / DNS）**
+
+![事件流：实时审计](docs/images/events.png)
+
+**进程 — 监控树内进程身份表**
+
+![进程：监控树内进程身份表](docs/images/processes.png)
+
+**白名单 — 端点 / 路径 / 进程豁免，热生效**
+
+![白名单：端点/路径/进程豁免](docs/images/whitelist.png)
+
+**设置 — config.toml 在线编辑，保存后热生效**
+
+![设置：config.toml 在线编辑](docs/images/settings.png)
+
 ## 架构
 
 Rust workspace，多 crate 分层（依赖方向自上而下，无环）：
