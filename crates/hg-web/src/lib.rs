@@ -19,7 +19,7 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use hg_core::conn_registry::ConnRegistry;
 use hg_core::health::{EngineStats, SourceStats};
@@ -55,6 +55,9 @@ pub struct AppState {
     pub conns: Arc<ConnRegistry>,
     pub src_stats: Arc<SourceStats>,
     pub eng_stats: Arc<EngineStats>,
+    /// 存储写入通道（执行器落库同一通道）：手动清理经 StoreOp::Purge
+    /// 转入写入线程执行（技术设计 §4：唯一 DELETE 路径）
+    pub store_tx: std::sync::mpsc::Sender<hg_store::writer::StoreOp>,
     /// SSE 多播通道（执行器喂入，/api/stream 订阅）
     pub sse: tokio::sync::broadcast::Sender<SseEvent>,
     pub started: Instant,
@@ -80,6 +83,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/whitelist", get(wl_list).post(wl_add))
         .route("/api/whitelist", delete(wl_del))
         .route("/api/config", get(config_get).put(config_put))
+        .route("/api/data/clear", post(data_clear))
         .route("/api/stream", get(stream));
     Router::new()
         .route("/", get(index))
@@ -335,6 +339,21 @@ fn toml_parse(s: &str) -> anyhow::Result<FileConfig> {
     Ok(toml::from_str(s)?)
 }
 
+/// 手动清空审计数据（技术设计 §4：与每日清理同一路径——经写入线程
+/// StoreOp::Purge 执行，临时禁用触发器；范围 events/verdicts/conns/
+/// dns_map 全量 + processes 已退出，白名单与配置不动）。
+async fn data_clear(State(st): State<Arc<AppState>>) -> Response {
+    let (ack_tx, ack_rx) = std::sync::mpsc::channel::<u64>();
+    if st.store_tx.send(hg_store::writer::StoreOp::Purge { ack: ack_tx }).is_err() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "存储写入线程未运行").into_response();
+    }
+    // 写入线程 200ms 批量窗口 + 全表 DELETE，正常毫秒级返回；超时按 504 上报
+    match ack_rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(n) => (StatusCode::OK, Json(json!({ "deleted": n }))).into_response(),
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, "清理超时").into_response(),
+    }
+}
+
 /// SSE 帧编码（event + data 各一行，空行结尾）。
 fn sse_frame(ev: &SseEvent) -> axum::body::Bytes {
     axum::body::Bytes::from(format!("event: {}\ndata: {}\n\n", ev.event, ev.data))
@@ -394,6 +413,15 @@ mod tests {
     }
 
     fn test_state_with_db(db_path: &str) -> Arc<AppState> {
+        // 悬空通道：data_clear 的 Purge 发送失败路径（503）用
+        let (dead_tx, _keep_rx) = std::sync::mpsc::channel();
+        state_with(db_path, dead_tx)
+    }
+
+    fn state_with(
+        db_path: &str,
+        store_tx: std::sync::mpsc::Sender<hg_store::writer::StoreOp>,
+    ) -> Arc<AppState> {
         let (sse_tx, _keep) = tokio::sync::broadcast::channel(64);
         let cfg = FileConfig::default();
         let snap = RulesSnapshot::compile(&cfg.to_rules_config(vec![])).expect("编译规则");
@@ -408,6 +436,7 @@ mod tests {
             conns: Arc::new(ConnRegistry::new()),
             src_stats: Arc::new(SourceStats::default()),
             eng_stats: Arc::new(EngineStats::default()),
+            store_tx,
             sse: sse_tx,
             started: Instant::now(),
         })
@@ -436,6 +465,70 @@ mod tests {
             .oneshot(b.body(Body::empty()).unwrap())
             .await
             .unwrap()
+    }
+
+    async fn call_post(state: &Arc<AppState>, uri: &str) -> axum::response::Response {
+        let b = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("host", "127.0.0.1:18099")
+            .header("authorization", "Bearer t123");
+        router(state.clone())
+            .oneshot(b.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// 写入线程不在（通道闭合）时清理端点应 503 而非静默成功。
+    #[tokio::test]
+    async fn 手动清理_写入线程不在_返回503() {
+        let st = test_state();
+        let r = call_post(&st, "/api/data/clear").await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// 手动清理端到端：经完整 router 发 Purge → 写入线程清库 → 回删除条数；
+    /// 白名单不动（技术设计 §4 清理范围回归）。
+    #[tokio::test]
+    async fn 手动清理_经写入线程清库并回条数() {
+        let dir = std::env::temp_dir().join("hg-web-purge-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        let _ = std::fs::remove_file(&db);
+        let db_path = db.display().to_string();
+        // 铺数据：2 条判定 + 1 条白名单
+        {
+            let conn = hg_store::open(&db_path).unwrap();
+            for i in 0..2i64 {
+                conn.execute(
+                    "INSERT INTO verdicts(ts, rule_id, action, pid, exe, evidence_json, notified) VALUES (?1,'r','block',1,'e','{}',0)",
+                    [i],
+                ).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO whitelist(kind, value, note, created_ts) VALUES ('path','C:/ok','',1)",
+                [],
+            ).unwrap();
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<hg_store::writer::StoreOp>();
+        let writer = hg_store::writer::spawn_writer(&db_path, rx, 30);
+        let st = state_with(&db_path, tx);
+        let r = call_post(&st, "/api/data/clear").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = axum::Json::<serde_json::Value>::from_bytes(
+            &r.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(body["deleted"], 2, "应删 2 条 verdicts：{body:?}");
+        // 库内验证：判定已清、白名单保留
+        let conn = hg_store::open(&db_path).unwrap();
+        let (v, w): (i64, i64) = conn
+            .query_row("SELECT (SELECT COUNT(*) FROM verdicts), (SELECT COUNT(*) FROM whitelist)", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((v, w), (0, 1));
+        drop(st); // 通道唯一发送端随 state 释放，写入线程退出
+        let _ = writer.join();
+        let _ = std::fs::remove_file(&db);
     }
 
     #[test]

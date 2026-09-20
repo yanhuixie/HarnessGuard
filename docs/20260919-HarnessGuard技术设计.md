@@ -203,8 +203,8 @@ CREATE TABLE whitelist(
 
 - **时间戳**：统一 UTC 毫秒整数存储；各平台源时基（ETW QPC、eBPF ktime、BSM 时间戳、fanotify 事件时钟）在事件源层用 `(boot_time, monotonic)` 对齐换算，UI 按本地时区渲染。
 - **写入策略**：异步路径批量 flush（每 200ms 或 500 条）；审计流与判定解耦，SQLite 慢不拖累检测。
-- **追加写与滚动清理的矛盾拍板**：运行期只追加——SQLite 触发器拦截对 `events/conns/verdicts/processes` 的 `UPDATE/DELETE`；唯一删除路径是每日清理任务（清理连接持有内部标记，临时禁用触发器执行 `DELETE`）。满足需求"审计日志只能追加"，同时保留保留期清理能力。
-- **滚动清理范围**：`events`、`conns`、`verdicts`、`processes`（已退出进程）、`dns_map` 全部纳入，按 `min(保留天数, 磁盘上限)` 双条件（默认 30 天 / 500MB）。
+- **追加写与滚动清理的矛盾拍板**：运行期只追加——SQLite 触发器拦截对 `events/conns/verdicts/processes` 的 `UPDATE/DELETE`；唯一删除路径是每日清理任务（清理连接持有内部标记，临时禁用触发器执行 `DELETE`）。满足需求"审计日志只能追加"，同时保留保留期清理能力。Web UI"清空审计数据"（`POST /api/data/clear`，2026-09-20 补）复用同一路径：`StoreOp::Purge` 经写入通道转入写入线程执行，不看保留期，白名单与运行中进程身份不在清理范围。
+- **滚动清理范围**：`events`、`conns`、`verdicts`、`processes`（已退出进程）、`dns_map` 全部纳入，按 `min(保留天数, 磁盘上限)` 双条件（默认 30 天 / 500MB）。conns 表无 `ts` 列，按 `opened_ts` 判期（实现首版误按 `ts` 删致恒失败，已修正）。
 - **防篡改**：库文件 ACL 仅管理员可写；不做链式哈希（威胁模型为被动外传，需求 §1.1）。
 
 ---
@@ -447,7 +447,7 @@ M0 spike 以实测 RSS 为验收项；超支预案：axum 降级 tiny_http、Fil
 3. 豁免矩阵显式配置化（`tool_exempt`：exe × 路径模式），归档工具不入豁免表。
 4. 前端**无构建静态资源**（无 node 工具链依赖）。
 5. 里程碑 **Windows 优先**（M1 主平台先获防护），Linux M2 引入同步快路径，macOS M3。
-6. **追加写 vs 滚动清理**的矛盾拍板：运行期触发器禁改、唯一 DELETE 来自每日清理任务（§4）。
+6. **追加写 vs 滚动清理**的矛盾拍板：运行期触发器禁改、唯一 DELETE 来自每日清理任务（§4；2026-09-20 补：Web UI 手动清空经写入线程同路径执行，仍满足"唯一删除路径"）。
 7. 通知经**会话桥**投递（Win 一次性代理 / Linux 会话 bus 遍历 / Mac per-user LaunchAgent）。
 8. token 经 query 传递仅限 SSE 端点（EventSource 无 header 能力），其余 API 仅 Bearer header。
 9. **IPv6 断连接降级**（M4 实测，2026-09-19）：§5.1 原文的 `SetTcp6Entry` 为**文档幻影**——Windows SDK 头文件（iphlpapi.h/netioapi.h 及整个 um/）无声明、iphlpapi.lib 无符号、iphlpapi.dll 导出表无此名（Win10 26100 全量导出枚举核对，仅 `SetTcpEntry`/`SetPerTcp(6)ConnectionEStats` 存在），用户态文档化 API 无法实现 v6 连接级断开。拍板：v6 连接处置由引擎侧 Kill（socket 随进程关闭）+ 封 IP（netsh/WFP 均支持 v6）兜底；`MIB_TCP6ROW` 行构造纯函数与单测保留（锚定 MIB 布局），供平台补齐或 NSI 未公开接口评估——后者超出"文档化用户态 API"设计边界，暂不采用。

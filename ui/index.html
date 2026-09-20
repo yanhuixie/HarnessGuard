@@ -39,8 +39,8 @@
 </head>
 <body>
 <div id="token-setup">
-  <h2>HarnessGuard 需要访问令牌</h2>
-  <small class="dim">请使用服务启动时打印的带 token 的 URL 打开，或粘贴 token：</small>
+  <h2 id="setup-title">HarnessGuard 需要访问令牌</h2>
+  <small class="dim" id="setup-hint">请使用服务启动时打印的带 token 的 URL 打开，或粘贴 token：</small>
   <input id="token-input" placeholder="粘贴 token" style="width:320px">
   <button class="act" onclick="saveToken()">进入</button>
 </div>
@@ -92,6 +92,9 @@
     <p><button class="act" onclick="cfgSave()">保存并应用</button>
     <button class="mini" onclick="cfgReload()">放弃修改重新加载</button></p>
     <textarea id="cfg-text" spellcheck="false"></textarea>
+    <h3>数据维护</h3>
+    <p><button class="mini" style="color:var(--bad)" onclick="dataClear()">清空审计数据</button>
+    <small class="dim">清空事件 / 判定 / 连接 / DNS 映射及已退出进程记录；白名单与配置不受影响。保留策略（默认 30 天）仍在每日自动清理。</small></p>
   </section>
 </main>
 
@@ -103,11 +106,26 @@ const $ = id => document.getElementById(id);
 let TOKEN = localStorage.getItem('hg_token') || new URLSearchParams(location.search).get('token');
 if (TOKEN) localStorage.setItem('hg_token', TOKEN);
 if (!TOKEN) { $('token-setup').style.display = 'flex'; }
-function saveToken(){ TOKEN = $('token-input').value.trim(); localStorage.setItem('hg_token', TOKEN); location.search=''; location.reload(); }
+// replaceState 同步清掉 URL 中的 token 再 reload（location.search 赋值与 reload 有竞态，
+// 旧 query 会残留在地址栏/历史；token 只留 localStorage）
+function saveToken(){ TOKEN = $('token-input').value.trim(); localStorage.setItem('hg_token', TOKEN); history.replaceState(null,'',location.pathname); location.reload(); }
+
+// token 失效统一处置（token 轮换/服务重启后自动登出）：清本地凭据、
+// 停掉 SSE 无效重连、回到 token 输入界面要求重新输入
+function logout(){
+  TOKEN = null;
+  localStorage.removeItem('hg_token');
+  if (window.__es) { window.__es.close(); window.__es = null; }
+  $('err').className = 'bar';
+  $('setup-title').textContent = 'token 已失效';
+  $('setup-hint').textContent = 'token 可能已轮换或服务已重启，请粘贴新的访问令牌：';
+  $('token-input').value = '';
+  $('token-setup').style.display = 'flex';
+}
 
 async function api(path, opts={}) {
   const r = await fetch(path, Object.assign(opts, {headers:{Authorization:'Bearer '+TOKEN}}));
-  if (r.status === 401) { $('err').textContent='token 失效'; $('err').className='bar err'; throw 0; }
+  if (r.status === 401) { logout(); throw 0; }
   $('conn-dot').style.color = '#5dd97c';
   return r;
 }
@@ -186,14 +204,31 @@ async function cfgSave(){
 }
 async function cfgReload(){ cfgLoad(); }
 
+// 清空审计数据：经写入线程执行（服务端与每日清理同一路径），回删除条数
+async function dataClear(){
+  if (!confirm('确定清空全部审计数据？\n\n事件、判定、连接、DNS 映射及已退出进程记录将被删除，不可恢复；白名单与配置不受影响。')) return;
+  const r = await api('/api/data/clear', {method:'POST'});
+  if (!r.ok) { alert('清理失败：' + await r.text()); return; }
+  alert('已清理 ' + (await r.json()).deleted + ' 条记录');
+  loadStatus(); loadVerdicts();
+}
+
 
 loadStatus(); loadVerdicts();
 // SSE 实时推送（M4 替换 M1 的 3s 轮询）：verdict/audit 事件驱动刷新，
 // 状态卡片保留 30s 慢刷兜底（uptime 等非事件型指标）
 try {
   const es = new EventSource('/api/stream?token='+encodeURIComponent(TOKEN));
+  window.__es = es;
   es.onopen = () => { $('conn-dot').style.color = '#5dd97c'; };
-  es.onerror = () => { $('conn-dot').style.color = '#ff5d5d'; };  // EventSource 自动重连
+  // EventSource 自动重连但读不到响应状态码：连接失败时探测一次 API，
+  // 确认 401 则关闭重连、走 logout 重新认证，避免无限 401 重连循环
+  es.onerror = () => {
+    $('conn-dot').style.color = '#ff5d5d';
+    if (!TOKEN) return;
+    fetch('/api/status', {headers:{Authorization:'Bearer '+TOKEN}})
+      .then(r => { if (r.status === 401) logout(); }).catch(()=>{});
+  };
   es.addEventListener('verdict', () => { loadVerdicts(); loadStatus(); });
   es.addEventListener('audit', () => {
     const cur = document.querySelector('nav button.on');

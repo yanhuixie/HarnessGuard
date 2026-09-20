@@ -329,6 +329,7 @@ pub(crate) fn run_server(
         conns: conns.clone(),
         src_stats: src_stats.clone(),
         eng_stats: eng_stats.clone(),
+        store_tx: store_tx.clone(),
         sse: sse_tx,
         started: std::time::Instant::now(),
     });
