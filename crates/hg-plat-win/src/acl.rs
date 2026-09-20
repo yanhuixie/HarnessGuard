@@ -10,10 +10,6 @@
 //! 验证级：编译级 + apply/check 往返单测（本机非提权进程对自建临时文件可设
 //! DACL——文件 owner 恒有隐式 WRITE_DAC）；LocalSystem 服务下的部署形态
 //! 待实机复验。
-//!
-//! 验证级：编译级 + apply/check 往返单测（本机非提权进程对自建临时文件可设
-//! DACL——文件 owner 恒有隐式 WRITE_DAC）；LocalSystem 服务下的部署形态
-//! 待实机复验。
 
 use std::path::Path;
 
@@ -126,8 +122,10 @@ pub fn protect_file(path: &Path) -> Result<()> {
 }
 
 /// 自检：DACL 是否满足拍板 14 口径——允许型 ACE 的受托者为 SYSTEM/
-/// Administrators（任意权限，至少其一在场）或 Users（**仅读**，含写位判外泄）；
-/// 其他受托者、非允许型 ACE（拒绝/审计）、继承 ACE、无 DACL 均判未保护。
+/// Administrators（任意权限，至少其一在场）**且 Users 只读 ACE 在场**
+/// （**仅读**，含写位判外泄；缺 Users ACE 的旧版"仅管理员"收紧态未达标，
+/// 由启动自检自愈放宽，否则普通用户无法读取）；其他受托者、非允许型
+/// ACE（拒绝/审计）、继承 ACE、无 DACL 均判未保护。
 /// 文件不存在返回 Ok(false)（调用方跳过）。
 pub fn check_protected(path: &Path) -> Result<bool> {
     if !path.exists() {
@@ -165,7 +163,7 @@ pub fn startup_selfcheck(files: &[std::path::PathBuf]) {
             Ok(false) if !p.exists() => {} // 尚未生成，下次启动覆盖
             Ok(false) => {
                 tracing::warn!(
-                    "[自保护] {} 未受保护，应用 DACL（SYSTEM/Administrators 全控 + Users 只读，拍板 14）",
+                    "[自保护] {} DACL 未达拍板 14 口径（未保护或旧收紧态），应用 DACL（SYSTEM/Administrators 全控 + Users 只读）",
                     p.display()
                 );
                 if let Err(e) = protect_file(p) {
@@ -178,7 +176,8 @@ pub fn startup_selfcheck(files: &[std::path::PathBuf]) {
 }
 
 /// DACL 判定（拍板 14 口径）：允许型 ACE 受托者须为 SYSTEM/Administrators
-/// （至少其一在场）或 Users（仅读，mask 含写位判外泄）；其余情况未保护。
+/// （至少其一在场）且 Users 只读 ACE 在场（缺 Users 的旧收紧态同样未达标，
+/// 触发自愈放宽；mask 含写位判外泄）；其余情况未保护。
 unsafe fn dacl_is_protected(dacl: *mut ACL) -> bool {
     if dacl.is_null() {
         return false;
@@ -203,6 +202,7 @@ unsafe fn dacl_is_protected(dacl: *mut ACL) -> bool {
     };
     let users = sid_from_str(SID_USERS);
     let mut saw_trusted = false;
+    let mut saw_users = false;
     for i in 0..info.AceCount {
         let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
         if GetAce(dacl, i, &mut ace).is_err() || ace.is_null() {
@@ -223,11 +223,13 @@ unsafe fn dacl_is_protected(dacl: *mut ACL) -> bool {
         let is_adm = EqualSid(sid, admins).is_ok();
         let is_users = users.map(|u| EqualSid(sid, u).is_ok()).unwrap_or(false);
         if is_users {
-            // 拍板 14：Users 只读 ACE 合法；含任一写位即外泄
+            // 拍板 14：Users 只读 ACE 合法且必须在场（缺 Users 的旧收紧态
+            // 未达标，须自愈放宽）；含任一写位即外泄
             if allowed.Mask & FILE_WRITE_BITS != 0 {
                 saw_trusted = false;
                 break;
             }
+            saw_users = true;
             continue;
         }
         if !is_sys && !is_adm {
@@ -241,7 +243,7 @@ unsafe fn dacl_is_protected(dacl: *mut ACL) -> bool {
     if let Some(u) = users {
         let _ = LocalFree(Some(HLOCAL(u.0.cast())));
     }
-    saw_trusted
+    saw_trusted && saw_users
 }
 
 unsafe fn sid_from_str(s: &str) -> Option<PSID> {
@@ -290,9 +292,10 @@ mod tests {
     }
 
     /// 拍板 14 口径细分：Users 只读合法，Users 带写位判外泄（自检自愈收紧），
-    /// 仅 Users（无 SYSTEM/Admins）不算保护。
+    /// 仅 Users（无 SYSTEM/Admins）或仅 SYSTEM/Admins（无 Users，旧版"仅
+    /// 管理员"收紧态）均不算达标——后者须由自检自愈放宽。
     #[test]
-    fn users只读合法_带写位或独占均判未保护() {
+    fn users只读合法_带写位或独占或旧收紧态均判未达标() {
         let dir = std::env::temp_dir().join("hg-acl-users-test");
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("t.txt");
@@ -300,14 +303,23 @@ mod tests {
         apply_dacl(&f, &[(SID_USERS, FILE_GENERIC_READ)]).unwrap();
         assert!(
             !check_protected(&f).unwrap(),
-            "仅 Users 无 SYSTEM/Admins：未保护"
+            "仅 Users 无 SYSTEM/Admins：未达标"
         );
         apply_dacl(
             &f,
             &[(SID_SYSTEM, FILE_ALL_ACCESS), (SID_USERS, FILE_ALL_ACCESS)],
         )
         .unwrap();
-        assert!(!check_protected(&f).unwrap(), "Users 带写位：未保护");
+        assert!(!check_protected(&f).unwrap(), "Users 带写位：未达标");
+        apply_dacl(
+            &f,
+            &[(SID_SYSTEM, FILE_ALL_ACCESS), (SID_ADMINS, FILE_ALL_ACCESS)],
+        )
+        .unwrap();
+        assert!(
+            !check_protected(&f).unwrap(),
+            "仅 SYSTEM/Admins 无 Users（旧收紧态）：未达标，须自愈放宽"
+        );
         protect_file(&f).unwrap();
         assert!(
             check_protected(&f).unwrap(),
