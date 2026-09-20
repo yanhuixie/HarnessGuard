@@ -21,7 +21,7 @@ use ferrisetw::schema_locator::SchemaLocator;
 use ferrisetw::trace::{KernelTrace, UserTrace};
 use ferrisetw::EventRecord;
 use hg_core::ProcTable;
-use hg_model::{Access, ConnId, Envelope, Pid, Proto, RawEvent, StartTime, Timestamp};
+use hg_model::{Access, ConnId, Envelope, Identity, Pid, Proto, RawEvent, StartTime, Timestamp};
 use tokio::sync::mpsc;
 
 use crate::lru;
@@ -696,16 +696,11 @@ impl EtwInner {
     /// TaskScheduler 持久化检测（技术设计 §5.1 原文；M1 偏差表归位：原仅 RunKey
     /// 轮询、无计划任务覆盖）。事件语义：106=任务注册，140=任务更新，141=任务删除
     /// ——均属持久化面（141 单列"删除"语义，防误导调查；M4 待修清单 4）。
-    /// pid 归因链（事件自身一般不携带）：
-    /// ① 事件 ProcessId 字段——ProcTable 在表即采（事实归因：ProcTable 经
-    ///    apply_exec 全量入表，树外系统进程注册任务也是事实证据；不在表才继续）；
-    /// ② 实时扫描树内（harness_root 非空）cmdline 含注册工具特征的进程；
-    /// ③ Exec 时缓存的候选（发起 cmd 常先于 106 退出，②必 miss——复验竞态修复）。
-    ///    **启发式边界（如实披露）**：候选登记无法限树（Exec 时刻本线程拿不到树
-    ///    身份——树判定在引擎侧规则落地之后），且取最新候选不看任务名；树外
-    ///    进程的注册事件可能被归因到 120s 内最新的树内候选。缓解：detail 附
-    ///    cmdline 供人工核对，且 Persistence 恒为 Audit（不触发 Kill/封禁处置）；
-    /// ④ 0（未归因，引擎侧仍出 Audit 判定，证据含 detail）。
+    /// **告警口径（拍板记录 15，2026-09-20）**：仅存在 harness 关联的事件出
+    /// `RawEvent::Persistence`；无关联（树外进程注册 / 全链未命中未归因）不 emit、
+    /// 仅 debug 留痕——Windows 系统计划任务自注册/自更新（svchost 发起，事件常无
+    /// pid/UserContext）是高频常态噪声，与需求 §3.5「harness 注册计划任务」的
+    /// 范围限定一致。归因决策见 [`sched_attribution`]。
     fn on_sched(&self, record: &EventRecord, loc: &SchemaLocator) {
         if !matches!(record.event_id(), 106 | 140 | 141) {
             return;
@@ -725,19 +720,17 @@ impl EtwInner {
             140 => "更新",
             _ => "删除",
         };
-        let event_pid = Self::parse_u32(&p, &["ProcessId", "ProcessID", "Pid"])
-            // ProcTable 在表即采（事实归因，不限树——全表含树外进程）；
-            // 不在表（服务启动前已退出等）继续走扫描/缓存链
-            .filter(|v| *v != 0 && self.procs.get(v).is_some());
-        let (pid, how) = if let Some(v) = event_pid {
-            (v, "已归因".to_string())
-        } else if let Some(v) = self.scan_task_registrar() {
-            (v, "已归因（实时扫描）".to_string())
-        } else if let Some((v, cmdline)) = self.cached_task_registrar() {
-            let brief: String = cmdline.chars().take(80).collect();
-            (v, format!("缓存归因（进程已退出）：{brief}"))
-        } else {
-            (0, "未归因（无匹配注册进程）".to_string())
+        // 事件携带的注册进程 pid 及其在表身份（不在表 → None，走扫描/缓存链）
+        let event = Self::parse_u32(&p, &["ProcessId", "ProcessID", "Pid"])
+            .filter(|v| *v != 0)
+            .map(|v| (v, self.procs.get(&v)));
+        let Some((pid, how)) = sched_attribution(
+            event.as_ref().map(|(v, id)| (*v, id.as_ref())),
+            self.scan_task_registrar(),
+            self.cached_task_registrar(),
+        ) else {
+            tracing::debug!("[持久化] 忽略无 harness 关联的计划任务{kind}：{task}（user={user}）");
+            return;
         };
         tracing::warn!("[持久化] 计划任务{kind}：{task}（user={user}，pid={pid}，{how}）");
         self.emit(RawEvent::Persistence {
@@ -809,6 +802,37 @@ fn is_task_registrar_cmdline(cmdline: &[std::ffi::OsString]) -> bool {
         .collect::<Vec<_>>()
         .join(" ");
     SCHED_MARKERS.iter().any(|m| joined.contains(m))
+}
+
+/// 计划任务事件归因决策（纯函数，单测覆盖；拍板记录 15）：仅存在 harness
+/// 关联时返回 `Some((pid, how))`，否则 `None`（抑制，不 emit）。
+/// ① 事件 pid 在表：树内 → 事实归因；树外 → 已知非 harness，直接抑制——
+///    不落启发式链，防树外注册被误挂到树内候选（宁可缺归因不产假证据）；
+/// ② 事件 pid 缺省或不在表（已退出/早于服务启动）：树内注册工具实时扫描 →
+///    Exec 时缓存的注册工具候选。**启发式边界（如实披露）**：候选登记无法
+///    限树（Exec 时刻本线程拿不到树身份——树判定在引擎侧规则落地之后），
+///    取最新候选不看任务名，树外注册可能被归因到 120s 内最新的树内候选；
+///    缓解：detail 附 cmdline 供人工核对，且 Persistence 恒为 Audit（不触发
+///    Kill/封禁处置）；
+/// ③ 均未命中 → 抑制（系统任务自注册/自更新是高频常态噪声）。
+fn sched_attribution(
+    event: Option<(Pid, Option<&Identity>)>,
+    scan: Option<Pid>,
+    cache: Option<(Pid, String)>,
+) -> Option<(Pid, String)> {
+    if let Some((pid, Some(id))) = event {
+        return id
+            .harness_root
+            .is_some()
+            .then(|| (pid, "已归因（树内）".to_string()));
+    }
+    if let Some(v) = scan {
+        return Some((v, "已归因（树内实时扫描）".to_string()));
+    }
+    cache.map(|(pid, cmdline)| {
+        let brief: String = cmdline.chars().take(80).collect();
+        (pid, format!("缓存归因（进程已退出，启发式）：{brief}"))
+    })
 }
 
 /// QueryResults 形如 `type: 5 name; type: 1 1.2.3.4;`——提取其中的 IP。
@@ -1048,5 +1072,50 @@ mod tests {
         inner.remember_task_registrar(102, &args(&["cmd", "/c", "dir"]));
         let (pid3, _) = inner.cached_task_registrar().expect("应有候选");
         assert_eq!(pid3, 100);
+    }
+
+    /// 归因决策测试用表内身份（仅 harness_root 参与判定）。
+    fn ident(root: Option<&str>) -> Identity {
+        Identity {
+            pid: 0,
+            start_time: StartTime(0),
+            exe: PathBuf::new(),
+            cmdline: vec![],
+            harness_root: root.map(|r| hg_model::HarnessId(r.into())),
+            tool_exempt: None,
+        }
+    }
+
+    #[test]
+    fn 计划任务归因_树内事实归因_树外抑制不落启发式链() {
+        // 事件 pid 在表且属监控树 → 事实归因
+        let got = sched_attribution(Some((10, Some(&ident(Some("zcode"))))), None, None);
+        assert_eq!(got, Some((10, "已归因（树内）".to_string())));
+        // 事件 pid 在表但树外 → 直接抑制（拍板记录 15）：
+        // 即使扫描/缓存有命中也不得把树外注册误挂到树内候选
+        let got = sched_attribution(
+            Some((20, Some(&ident(None)))),
+            Some(30),
+            Some((40, "schtasks /create".into())),
+        );
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn 计划任务归因_扫描优先_缓存兜底_全链未命中抑制() {
+        // 事件 pid 不在表（已退出/早于服务启动）→ 落扫描/缓存链，扫描命中优先
+        let got = sched_attribution(Some((50, None)), Some(30), Some((40, "schtasks".into())));
+        assert_eq!(got, Some((30, "已归因（树内实时扫描）".to_string())));
+        // 扫描 miss → 缓存候选兜底，how 附 cmdline 且截断 80 字符
+        let long = "x".repeat(200);
+        let got = sched_attribution(None, None, Some((40, long)));
+        let (_, how) = got.expect("缓存命中应告警");
+        assert!(how.contains("启发式"));
+        assert!(
+            how.chars().count() <= "缓存归因（进程已退出，启发式）：".chars().count() + 80,
+            "cmdline 应截断"
+        );
+        // 全链未命中 → 抑制（系统任务自更新噪声，拍板记录 15）
+        assert_eq!(sched_attribution(None, None, None), None);
     }
 }
