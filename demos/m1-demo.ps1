@@ -100,17 +100,19 @@ if (-not $token) { "!! 服务未产出 token："; Get-Content "$demo\svc.out.log
 $H = @{ Authorization = "Bearer $token" }
 
 # ---------- 4. 场景 A：注入面读（hooks）→ Block 判定 + 通知（默认不杀） ----------
-"[场景 A] fake_harness(cmd) 读 repo\.git\hooks\pre-commit（期望：git-dir Block 判定 + 通知，默认不杀，拍板记录 12/13）"
+"[场景 A] fake_harness(cmd) 读 repo\.git\hooks\pre-commit（期望：git-dir Block 判定 + 通知，默认不杀——Create 打开出 Audit，Block 由真实 Read 事件出，拍板记录 12/13/16）"
 Push-Location $demo
 & "$demo\fake_harness.exe" /c "type repo\.git\hooks\pre-commit" 2>&1 | Out-Null
 Pop-Location
 Start-Sleep 2
 
-# 判定断言辅助：按 rule_id 统计 verdicts 总数（limit 200）
-function Get-RuleCount($h, $ruleId) {
+# 判定断言辅助：按 rule_id + action 统计 verdicts 总数（limit 200）。
+# 默认只数 block（拍板记录 16：.git 的 Create 打开出 Audit 不出 Block，
+# Block 由携带真实 access 的 Read/Write 事件出——断言须按 action 区分）。
+function Get-RuleCount($h, $ruleId, $action = "block") {
   try {
     $vs = Invoke-RestMethod -Headers $h "http://127.0.0.1:8377/api/verdicts?limit=200"
-    return @($vs | Where-Object { $_.rule_id -eq $ruleId }).Count
+    return @($vs | Where-Object { $_.rule_id -eq $ruleId -and $_.action -eq $action }).Count
   } catch { return -1 }
 }
 $aBlocks = Get-RuleCount $H "git-dir"
@@ -196,7 +198,7 @@ else { "[断言 C] FAIL：未见 net-threshold（外传阈值未触发？检查�
 "[场景 D] 写入 HKCU RunKey（期望：persistence Audit 告警，~30s 内）"
 reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v HgDemo /d "cmd /c echo hi" /f | Out-Null
 Start-Sleep 35
-$dPers = Get-RuleCount $H "persistence"
+$dPers = Get-RuleCount $H "persistence" "audit"
 if ($dPers -ge 1) { "[断言 D] PASS：persistence Audit 告警 {0} 条" -f $dPers }
 else { "[断言 D] FAIL：未见 persistence（轮询窗口内未检出？）" }
 

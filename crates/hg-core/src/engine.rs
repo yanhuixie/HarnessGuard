@@ -430,40 +430,56 @@ impl Engine {
         };
         let rules = self.rules.load();
         // Create 事件先于 Read/Write 到达（Windows 事后处置语义下两者都要判，
-        // 防只靠后续事件漏判）。按写语义复用快路径统一判定，仅注入面 Kill
-        // （hooks/**、config 写，拍板记录 12）；工作流面放行 + root 首见取证。
+        // 防只靠后续事件漏判）。但 ETW FileIo/Create 对应 IRP_MJ_CREATE——
+        // 任何 CreateFile 打开都触发（含纯读打开，如 Git Bash __git_ps1 读
+        // .git/config），**无法区分读写意图**（拍板记录 14）：注入面按写判
+        // 会把正常读打开误报为写触碰。故注入面的 Create 只出 Audit 取证，
+        // Block 由携带真实 access 的 DiskIO Read/Write 事件（on_file_open）
+        // 判定——Create 事件本身已把 FileObject→Name 建入缓存，紧随的真实
+        // 读写必然缓存命中，降级不损失检出。归档产物分支不受影响：新建产物
+        // 文件名即信号，且 on_file_open 无归档判定，Create 是唯一触发点。
         if crate::rules::under_git_dir(path) {
-            let mut v = judge_perm_sync(&rules, &id, path, hg_model::Access::Write);
-            v.evidence.summary = format!("{}（创建，pid {pid}）", v.evidence.summary);
-            v.evidence.detail = serde_json::json!({
-                "path": path.display().to_string(),
-                "via": "file-create",
-            });
-            match v.action {
-                Action::Block => {
-                    let summary = v.evidence.summary.clone();
-                    self.emit_verdict(pid, &id.exe.display().to_string(), v, ts);
-                    // 杀进程升级由 git_dir_kill 决定（拍板记录 13，缺省不杀）
-                    if rules.git_dir_kill {
-                        self.send(EngineOutput::Kill {
-                            pid,
-                            start_time: id.start_time,
-                            reason: summary.clone(),
-                        });
-                    }
-                    self.send(EngineOutput::Notify {
-                        title: "HarnessGuard：已阻断敏感路径访问".into(),
-                        body: summary,
-                    });
-                }
-                Action::Audit => {
-                    self.emit_verdict(pid, &id.exe.display().to_string(), v, ts);
-                }
-                Action::Allow => {
-                    if self.root_git_flow.insert(root.0.clone()) {
-                        self.emit_verdict(pid, &id.exe.display().to_string(), v, ts);
-                    }
-                }
+            let v = judge_perm_sync(&rules, &id, path, hg_model::Access::Write);
+            if v.rule_id.0 == "git-dir" {
+                // 注入面 Create 打开：Audit 取证——读写意图由后续 DiskIO 事件判定
+                let summary = format!(
+                    "[{}] {} 触碰 .git 注入面（Create 打开）：{}（pid {pid}）",
+                    root.0,
+                    id.exe.display(),
+                    path.display()
+                );
+                let v = Verdict {
+                    rule_id: v.rule_id,
+                    action: Action::Audit,
+                    evidence: Evidence {
+                        summary,
+                        detail: serde_json::json!({
+                            "path": path.display().to_string(),
+                            "via": "file-create",
+                        }),
+                    },
+                };
+                self.emit_verdict(pid, &id.exe.display().to_string(), v, ts);
+            } else if self.root_git_flow.insert(root.0.clone()) {
+                // 工作流面 Create：root 首见取证（与 on_file_open Allow 分支同构，
+                // 防 __git_ps1 类高频读打开刷库）
+                let v = Verdict {
+                    rule_id: v.rule_id,
+                    action: Action::Allow,
+                    evidence: Evidence {
+                        summary: format!(
+                            "[{}] {} 访问 .git 工作流面（Create 打开）：{}",
+                            root.0,
+                            id.exe.display(),
+                            path.display()
+                        ),
+                        detail: serde_json::json!({
+                            "path": path.display().to_string(),
+                            "via": "file-create",
+                        }),
+                    },
+                };
+                self.emit_verdict(pid, &id.exe.display().to_string(), v, ts);
             }
             return Ok(());
         }
@@ -665,70 +681,58 @@ mod tests {
             .count()
     }
 
-    /// 注入面（hooks 写 / config 写）创建 → Block 判定 + 通知，**默认不杀**
-    /// （拍板记录 13：git_dir_kill 缺省 false，打包与网络两重兜底仍在）
+    /// 注入面 Create 打开 → **只出 Audit**（IRP_MJ_CREATE 含读打开，读写意图
+    /// 由后续 DiskIO 事件判定，拍板记录 14——Git Bash __git_ps1 读 .git/config
+    /// 即此形态），无 Block、无 Kill、无通知
     #[test]
-    fn 创建_git_注入面_默认阻断不杀() {
+    fn create打开_git_注入面_仅audit() {
         for p in ["D:/repo/.git/hooks/pre-commit", "D:/repo/.git/config"] {
             let (eng, mut rx) = engine();
             eng.on_file_create(20812, Path::new(p), Timestamp(0))
                 .unwrap();
             let out = drain(&mut rx);
-            assert_eq!(block_verdict_count(&out), 1, "{p}：应有 git-dir Block 判定");
-            assert_eq!(kill_count(&out), 0, "{p}：默认不得杀进程");
             assert!(
-                out.iter().any(|o| matches!(o, EngineOutput::Notify { .. })),
-                "{p}：应有通知"
+                out.iter().any(|o| matches!(
+                    o,
+                    EngineOutput::Verdict { verdict: v, .. }
+                        if v.rule_id.0 == "git-dir" && v.action == Action::Audit
+                )),
+                "{p}：Create 打开应为 git-dir Audit"
             );
+            assert!(
+                !out.iter().any(|o| matches!(
+                    o,
+                    EngineOutput::Verdict { verdict: v, .. } if v.action == Action::Block
+                )),
+                "{p}：Create 打开不得出 Block"
+            );
+            assert_eq!(kill_count(&out), 0, "{p}");
         }
     }
 
-    /// git_dir_kill=true 时注入面创建升级为杀进程（用户显式开启）
+    /// 注入面**真实读写**（DiskIO Read/Write 事件）→ Block 判定 + 通知，默认
+    /// 不杀；git_dir_kill=true 才升级杀（hooks 读 / hooks 写 / config 写）
     #[test]
-    fn 创建_git_注入面_开启kill则杀() {
-        let cfg = RulesConfig {
-            git_dir_kill: true,
-            ..Default::default()
-        };
-        let (eng, mut rx) = engine_with(cfg);
-        eng.on_file_create(
-            20812,
-            Path::new("D:/repo/.git/hooks/pre-commit"),
-            Timestamp(0),
-        )
-        .unwrap();
-        let out = drain(&mut rx);
-        assert_eq!(kill_count(&out), 1);
-        assert_eq!(block_verdict_count(&out), 1);
-    }
+    fn 读写事件_git_注入面_默认block不杀_kil开启则杀() {
+        for (p, a) in [
+            ("D:/repo/.git/hooks/pre-commit", hg_model::Access::Read),
+            ("D:/repo/.git/hooks/pre-commit", hg_model::Access::Write),
+            ("D:/repo/.git/config", hg_model::Access::Write),
+        ] {
+            let (eng, mut rx) = engine();
+            eng.on_file_open(20812, Path::new(p), a).unwrap();
+            let out = drain(&mut rx);
+            assert_eq!(block_verdict_count(&out), 1, "{p} {a:?}：真实读写应出 Block");
+            assert_eq!(kill_count(&out), 0, "{p} {a:?}：默认不杀");
 
-    /// 打开路径（Read/Write 事件）同样受 git_dir_kill 门控
-    #[test]
-    fn 打开_git_注入面_默认不杀_kil开启则杀() {
-        let (eng, mut rx) = engine();
-        eng.on_file_open(
-            20812,
-            Path::new("D:/repo/.git/hooks/pre-commit"),
-            hg_model::Access::Read,
-        )
-        .unwrap();
-        let out = drain(&mut rx);
-        assert_eq!(block_verdict_count(&out), 1);
-        assert_eq!(kill_count(&out), 0);
-
-        let cfg = RulesConfig {
-            git_dir_kill: true,
-            ..Default::default()
-        };
-        let (eng, mut rx) = engine_with(cfg);
-        eng.on_file_open(
-            20812,
-            Path::new("D:/repo/.git/hooks/pre-commit"),
-            hg_model::Access::Read,
-        )
-        .unwrap();
-        let out = drain(&mut rx);
-        assert_eq!(kill_count(&out), 1);
+            let cfg = RulesConfig {
+                git_dir_kill: true,
+                ..Default::default()
+            };
+            let (eng, mut rx) = engine_with(cfg);
+            eng.on_file_open(20812, Path::new(p), a).unwrap();
+            assert_eq!(kill_count(&drain(&mut rx)), 1, "{p} {a:?}：kill 开启应杀");
+        }
     }
 
     /// 工作流面创建（commit 写 objects / HEAD.lock）→ 放行不杀，每 root 首见一条取证
