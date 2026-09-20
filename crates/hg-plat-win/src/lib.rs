@@ -39,6 +39,30 @@ pub fn describe() -> &'static str {
     "hg-plat-win：ETW 事件源 + 杀进程/断连接/封 IP 处置（M1）"
 }
 
+/// 当前进程令牌是否提权（TokenElevation；安装器前置检查用，M4 第二批）。
+pub fn is_elevated() -> bool {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = HANDLE(std::ptr::null_mut());
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return false;
+        }
+        let mut elev = TOKEN_ELEVATION::default();
+        let mut ret = 0u32;
+        let r = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elev as *mut _ as *mut core::ffi::c_void),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret,
+        );
+        let _ = CloseHandle(token);
+        r.is_ok() && elev.TokenIsElevated != 0
+    }
+}
+
 /// 停机序列用：显式回收本服务的三个 ETW 会话（强杀进程不会自动停会话，
 /// 残留会话导致二次启动 0 事件——M1 实测教训；技术设计 §9.3）。
 pub fn stop_etw_sessions() {
