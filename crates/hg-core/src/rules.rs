@@ -538,6 +538,48 @@ pub fn is_git_injection_touch(path: &Path, access: Access) -> bool {
     false
 }
 
+/// 路径是否 `.git/hooks/**`（注入面中"读写皆拦"的子集，拍板记录 16 修订版）。
+/// Create（IRP_MJ_CREATE，含读打开）事件无读写意图信息，但 hooks 无论读写
+/// 都是注入面——Create 命中即可直接 Block，不依赖读写意图（FileIo/Read/Write
+/// 事件需 DISK_FILE_IO 订阅，当前未启用，事件流实际不存在，见拍板 16 修订版）。
+pub fn is_git_hooks_touch(path: &Path) -> bool {
+    let mut comps = path.components();
+    while let Some(c) = comps.next() {
+        if !c
+            .as_os_str()
+            .to_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case(".git"))
+        {
+            continue;
+        }
+        return comps
+            .next()
+            .is_some_and(|c| c.as_os_str().to_string_lossy().eq_ignore_ascii_case("hooks"));
+    }
+    false
+}
+
+/// 路径是否 `.git/config`/`.git/config.lock`（注入面中"仅写拦"的子集）。
+/// Create 事件无读写意图，config 的 Create 打开只能出 Audit（读打开同
+/// 事件形态），真写需 DISK_FILE_IO 事件流（未订阅）或后续手段补强。
+pub fn is_git_config_touch(path: &Path) -> bool {
+    let mut comps = path.components();
+    while let Some(c) = comps.next() {
+        if !c
+            .as_os_str()
+            .to_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case(".git"))
+        {
+            continue;
+        }
+        return comps.next().is_some_and(|c| {
+            let s = c.as_os_str().to_string_lossy();
+            s.eq_ignore_ascii_case("config") || s.eq_ignore_ascii_case("config.lock")
+        });
+    }
+    false
+}
+
 fn verdict(rule_id: &'static str, action: Action, summary: impl Into<String>) -> Verdict {
     Verdict {
         rule_id: RuleId(rule_id),

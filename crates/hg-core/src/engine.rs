@@ -429,27 +429,67 @@ impl Engine {
             return Ok(());
         };
         let rules = self.rules.load();
-        // Create 事件先于 Read/Write 到达（Windows 事后处置语义下两者都要判，
-        // 防只靠后续事件漏判）。但 ETW FileIo/Create 对应 IRP_MJ_CREATE——
-        // 任何 CreateFile 打开都触发（含纯读打开，如 Git Bash __git_ps1 读
-        // .git/config），**无法区分读写意图**（拍板记录 14）：注入面按写判
-        // 会把正常读打开误报为写触碰。故注入面的 Create 只出 Audit 取证，
-        // Block 由携带真实 access 的 DiskIO Read/Write 事件（on_file_open）
-        // 判定——Create 事件本身已把 FileObject→Name 建入缓存，紧随的真实
-        // 读写必然缓存命中，降级不损失检出。归档产物分支不受影响：新建产物
-        // 文件名即信号，且 on_file_open 无归档判定，Create 是唯一触发点。
+        // Create 事件（拍板记录 16 修订版）：ETW FileIo/Create 对应
+        // IRP_MJ_CREATE——任何 CreateFile 打开都触发（含纯读打开，如 Git
+        // Bash __git_ps1 读 .git/config），无读写意图字段；而 FileIo/Read(67)/
+        // Write(68) 事件需 DISK_FILE_IO 订阅（当前未启用），事件流实际不存在
+        // ——Create 是注入面唯一可靠触发点。分档处置：
+        // - hooks/**：注入面本就是"读写皆拦"——Create 无需读写意图即可 Block；
+        // - config/config.lock：注入面仅对写生效，Create 证明不了写意图
+        //   （bash 读 config 即此形态）→ Audit 取证；
+        // - 工作流面：root 首见取证（防 __git_ps1 高频读打开刷库）。
+        // 归档产物分支不受影响（文件名即信号，Create 是唯一触发点）。
         if crate::rules::under_git_dir(path) {
-            let v = judge_perm_sync(&rules, &id, path, hg_model::Access::Write);
-            if v.rule_id.0 == "git-dir" {
-                // 注入面 Create 打开：Audit 取证——读写意图由后续 DiskIO 事件判定
+            if crate::rules::is_git_hooks_touch(path) {
                 let summary = format!(
-                    "[{}] {} 触碰 .git 注入面（Create 打开）：{}（pid {pid}）",
+                    "[{}] {} 触碰 .git 注入面 hooks（Create 打开）：{}（pid {pid}）",
+                    root.0,
+                    id.exe.display(),
+                    path.display()
+                );
+                let action = match rules.git_dir_action {
+                    crate::rules::FileAction::Block => Action::Block,
+                    crate::rules::FileAction::Audit => Action::Audit,
+                };
+                let v = Verdict {
+                    rule_id: RuleId("git-dir"),
+                    action,
+                    evidence: Evidence {
+                        summary: summary.clone(),
+                        detail: serde_json::json!({
+                            "path": path.display().to_string(),
+                            "via": "file-create",
+                        }),
+                    },
+                };
+                self.emit_verdict(pid, &id.exe.display().to_string(), v, ts);
+                if action == Action::Block {
+                    // 杀进程升级由 git_dir_kill 决定（拍板记录 13，缺省不杀）
+                    if rules.git_dir_kill {
+                        self.send(EngineOutput::Kill {
+                            pid,
+                            start_time: id.start_time,
+                            reason: summary.clone(),
+                        });
+                    }
+                    self.send(EngineOutput::Notify {
+                        title: "HarnessGuard：已阻断敏感路径访问".into(),
+                        body: summary,
+                    });
+                }
+                return Ok(());
+            }
+            let is_config = crate::rules::is_git_config_touch(path);
+            if is_config {
+                // config Create 打开：写意图不可证（读打开同事件形态），Audit 取证
+                let summary = format!(
+                    "[{}] {} 触碰 .git config（Create 打开，写意图不可证）：{}（pid {pid}）",
                     root.0,
                     id.exe.display(),
                     path.display()
                 );
                 let v = Verdict {
-                    rule_id: v.rule_id,
+                    rule_id: RuleId("git-dir"),
                     action: Action::Audit,
                     evidence: Evidence {
                         summary,
@@ -460,11 +500,12 @@ impl Engine {
                     },
                 };
                 self.emit_verdict(pid, &id.exe.display().to_string(), v, ts);
-            } else if self.root_git_flow.insert(root.0.clone()) {
-                // 工作流面 Create：root 首见取证（与 on_file_open Allow 分支同构，
-                // 防 __git_ps1 类高频读打开刷库）
+                return Ok(());
+            }
+            // 工作流面 Create：root 首见取证（与 on_file_open Allow 分支同构）
+            if self.root_git_flow.insert(root.0.clone()) {
                 let v = Verdict {
-                    rule_id: v.rule_id,
+                    rule_id: RuleId("git-dir-workflow"),
                     action: Action::Allow,
                     evidence: Evidence {
                         summary: format!(
@@ -681,12 +722,39 @@ mod tests {
             .count()
     }
 
-    /// 注入面 Create 打开 → **只出 Audit**（IRP_MJ_CREATE 含读打开，读写意图
-    /// 由后续 DiskIO 事件判定，拍板记录 14——Git Bash __git_ps1 读 .git/config
-    /// 即此形态），无 Block、无 Kill、无通知
+    /// hooks Create 打开 → **Block**（注入面读写皆拦，无需读写意图——
+    /// 拍板记录 16 修订版：FileIo/Read/Write 需 DISK_FILE_IO 未订阅，
+    /// Create 是注入面唯一可靠触发点），默认不杀 + 通知
     #[test]
-    fn create打开_git_注入面_仅audit() {
-        for p in ["D:/repo/.git/hooks/pre-commit", "D:/repo/.git/config"] {
+    fn create打开_git_hooks_直接block() {
+        for p in ["D:/repo/.git/hooks/pre-commit", "D:/repo/.git/hooks/applypatch-msg.sample"] {
+            let (eng, mut rx) = engine();
+            eng.on_file_create(20812, Path::new(p), Timestamp(0))
+                .unwrap();
+            let out = drain(&mut rx);
+            assert_eq!(block_verdict_count(&out), 1, "{p}：hooks Create 应出 Block");
+            assert_eq!(kill_count(&out), 0, "{p}：默认不杀");
+            assert!(
+                out.iter().any(|o| matches!(o, EngineOutput::Notify { .. })),
+                "{p}：应有通知"
+            );
+
+            let cfg = RulesConfig {
+                git_dir_kill: true,
+                ..Default::default()
+            };
+            let (eng, mut rx) = engine_with(cfg);
+            eng.on_file_create(20812, Path::new(p), Timestamp(0)).unwrap();
+            assert_eq!(kill_count(&drain(&mut rx)), 1, "{p}：kill 开启应杀");
+        }
+    }
+
+    /// config Create 打开 → **仅 Audit**（注入面仅对写生效，IRP_MJ_CREATE
+    /// 含纯读打开（Git Bash __git_ps1 读 .git/config 即此形态）且无意图
+    /// 字段，Create 证明不了写）——dashboard 阻断计数不被读打开噪声撑起
+    #[test]
+    fn create打开_git_config_仅audit() {
+        for p in ["D:/repo/.git/config", "D:/repo/.git/config.lock"] {
             let (eng, mut rx) = engine();
             eng.on_file_create(20812, Path::new(p), Timestamp(0))
                 .unwrap();
@@ -697,14 +765,14 @@ mod tests {
                     EngineOutput::Verdict { verdict: v, .. }
                         if v.rule_id.0 == "git-dir" && v.action == Action::Audit
                 )),
-                "{p}：Create 打开应为 git-dir Audit"
+                "{p}：config Create 应为 git-dir Audit"
             );
             assert!(
                 !out.iter().any(|o| matches!(
                     o,
                     EngineOutput::Verdict { verdict: v, .. } if v.action == Action::Block
                 )),
-                "{p}：Create 打开不得出 Block"
+                "{p}：config Create 不得出 Block"
             );
             assert_eq!(kill_count(&out), 0, "{p}");
         }
