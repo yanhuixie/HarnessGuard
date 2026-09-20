@@ -71,7 +71,7 @@ pub fn spawn_sec_audit(inner: Arc<EtwInner>, watch_paths: Vec<String>) {
                     None,
                     Some(ctx),
                     Some(on_event),
-                    EvtSubscribeToFutureEvents.0 as u32,
+                    EvtSubscribeToFutureEvents.0,
                 )
             };
             match sub {
@@ -110,7 +110,7 @@ unsafe fn render_xml(event: EVT_HANDLE) -> Option<String> {
     let _ = EvtRender(
         None,
         event,
-        EvtRenderEventXml.0 as u32,
+        EvtRenderEventXml.0,
         0,
         None,
         &mut needed,
@@ -124,7 +124,7 @@ unsafe fn render_xml(event: EVT_HANDLE) -> Option<String> {
     EvtRender(
         None,
         event,
-        EvtRenderEventXml.0 as u32,
+        EvtRenderEventXml.0,
         needed,
         Some(buf.as_mut_ptr().cast()),
         &mut used,
