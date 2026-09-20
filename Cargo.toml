@@ -16,6 +16,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 publish = false
 
 # 依赖方向（技术设计 §2，无环）：
