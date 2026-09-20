@@ -40,7 +40,11 @@ pub struct EbpfSource {
 
 impl EbpfSource {
     pub fn new(procs: Arc<ProcTable>, tx: mpsc::Sender<Envelope>) -> Self {
-        Self { procs, tx, base: std::time::Instant::now() }
+        Self {
+            procs,
+            tx,
+            base: std::time::Instant::now(),
+        }
     }
 
     fn now(&self) -> Timestamp {
@@ -63,7 +67,11 @@ impl EbpfSource {
             }
         };
         // tracepoint 挂载
-        for tp in ["sched_process_exec", "sched_process_exit", "sched_process_fork"] {
+        for tp in [
+            "sched_process_exec",
+            "sched_process_exit",
+            "sched_process_fork",
+        ] {
             let prog: &mut aya::programs::TracePoint = bpf
                 .program_mut(tp)
                 .ok_or_else(|| anyhow::anyhow!("BPF 程序缺失：{tp}"))?
@@ -98,7 +106,11 @@ impl EbpfSource {
         match ev.kind {
             0 => {
                 // exec：filename（NT 无关，直接是绝对路径）+ cmdline 补读 + start_time
-                let len = ev.filename.iter().position(|&b| b == 0).unwrap_or(ev.filename.len());
+                let len = ev
+                    .filename
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(ev.filename.len());
                 let exe = String::from_utf8_lossy(&ev.filename[..len]).into_owned();
                 let cmdline = read_cmdline(ev.pid);
                 let st = StartTime(proc_starttime(ev.pid));
@@ -117,15 +129,22 @@ impl EbpfSource {
             1 => {
                 let _ = self.tx.try_send(Envelope::new(
                     self.now(),
-                    RawEvent::Exit { pid: ev.pid, start_time: StartTime(0) },
+                    RawEvent::Exit {
+                        pid: ev.pid,
+                        start_time: StartTime(0),
+                    },
                 ));
             }
-            2 => { /* fork：ppid 关联在 exec 事件流内完成（ProcTable 按表查询父身份） */ }
+            2 => { /* fork：ppid 关联在 exec 事件流内完成（ProcTable 按表查询父身份） */
+            }
             3 => {
                 // tcp_send：按 cookie 累计；conn_id 直接用 cookie（稳定且天然防复用）
                 let _ = self.tx.try_send(Envelope::new(
                     self.now(),
-                    RawEvent::ConnTx { conn_id: ConnId(ev.cookie), bytes_out_delta: ev.bytes },
+                    RawEvent::ConnTx {
+                        conn_id: ConnId(ev.cookie),
+                        bytes_out_delta: ev.bytes,
+                    },
                 ));
             }
             _ => {}
@@ -135,7 +154,12 @@ impl EbpfSource {
 
 /// cookie 归因采样：`ss -te` 输出含 sk（cookie）与 pid/四元组。
 /// 周期调用，结果交引擎 ConnRegistry 关联（M2 校准项：采样间隔 vs 短连接寿命）。
-pub fn sample_socket_cookies() -> Vec<(u64 /*cookie*/, Pid, String /*local*/, String /*remote*/)> {
+pub fn sample_socket_cookies() -> Vec<(
+    u64, /*cookie*/
+    Pid,
+    String, /*local*/
+    String, /*remote*/
+)> {
     let out = std::process::Command::new("ss")
         .args(["-tne", "state", "established"])
         .output();
@@ -144,7 +168,10 @@ pub fn sample_socket_cookies() -> Vec<(u64 /*cookie*/, Pid, String /*local*/, St
         let text = String::from_utf8_lossy(&o.stdout);
         for line in text.lines() {
             // ss 行形如：... local peer ... pid=123 sk=abcd12 ...（字段顺序按版本校准）
-            let cookie = line.split("sk=").nth(1).and_then(|s| s.split_whitespace().next());
+            let cookie = line
+                .split("sk=")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next());
             let pid = line.split("pid=").nth(1).and_then(|s| s.split(',').next());
             let mut cols = line.split_whitespace().filter(|c| c.contains(':'));
             let local = cols.next().unwrap_or_default().to_string();
@@ -176,7 +203,9 @@ fn read_cwd(pid: Pid) -> std::path::PathBuf {
 
 /// /proc/<pid>/stat 第 22 字段（starttime，jiffies since boot）
 pub fn proc_starttime(pid: Pid) -> u64 {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { return 0 };
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return 0;
+    };
     // 字段 2 (comm) 可能含空格——从最后 ')' 之后切
     let tail = match stat.rfind(')') {
         Some(i) => &stat[i + 2..],

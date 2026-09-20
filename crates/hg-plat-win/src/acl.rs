@@ -22,13 +22,13 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{LocalFree, HLOCAL};
 use windows::Win32::Security::Authorization::{
     ConvertStringSidToSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW,
-    EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SET_ACCESS, TRUSTEE_W,
-    TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP,
+    EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID,
+    TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
 };
 use windows::Win32::Security::{
-    EqualSid, GetAce, GetAclInformation, AclSizeInformation, ACCESS_ALLOWED_ACE,
-    ACE_HEADER, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, NO_INHERITANCE,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSID, PSECURITY_DESCRIPTOR,
+    AclSizeInformation, EqualSid, GetAce, GetAclInformation, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
+    ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, NO_INHERITANCE,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
 };
 
 /// ACE 类型 0 = ACCESS_ALLOWED_ACE（winnt.h；windows crate 该常量在
@@ -194,7 +194,9 @@ unsafe fn dacl_is_protected(dacl: *mut ACL) -> bool {
     {
         return false;
     }
-    let Some(sys) = sid_from_str(SID_SYSTEM) else { return false };
+    let Some(sys) = sid_from_str(SID_SYSTEM) else {
+        return false;
+    };
     let Some(admins) = sid_from_str(SID_ADMINS) else {
         let _ = LocalFree(Some(HLOCAL(sys.0.cast())));
         return false;
@@ -245,7 +247,9 @@ unsafe fn dacl_is_protected(dacl: *mut ACL) -> bool {
 unsafe fn sid_from_str(s: &str) -> Option<PSID> {
     let w = wide(s);
     let mut sid = PSID(std::ptr::null_mut());
-    ConvertStringSidToSidW(PCWSTR(w.as_ptr()), &mut sid).ok().map(|_| sid)
+    ConvertStringSidToSidW(PCWSTR(w.as_ptr()), &mut sid)
+        .ok()
+        .map(|_| sid)
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -269,7 +273,10 @@ mod tests {
         apply_dacl(&f, &[(SID_EVERYONE, FILE_ALL_ACCESS)]).unwrap();
         assert!(!check_protected(&f).unwrap(), "Everyone 允许 ACE 未保护");
         protect_file(&f).unwrap();
-        assert!(check_protected(&f).unwrap(), "管理员全控+Users 只读 → 保护成立");
+        assert!(
+            check_protected(&f).unwrap(),
+            "管理员全控+Users 只读 → 保护成立"
+        );
         // 还原以便清理（验证 DACL 可再次改写）
         apply_dacl(&f, &[(SID_EVERYONE, FILE_ALL_ACCESS)]).unwrap();
         assert!(!check_protected(&f).unwrap(), "还原后未保护");
@@ -291,7 +298,10 @@ mod tests {
         let f = dir.join("t.txt");
         std::fs::write(&f, "x").unwrap();
         apply_dacl(&f, &[(SID_USERS, FILE_GENERIC_READ)]).unwrap();
-        assert!(!check_protected(&f).unwrap(), "仅 Users 无 SYSTEM/Admins：未保护");
+        assert!(
+            !check_protected(&f).unwrap(),
+            "仅 Users 无 SYSTEM/Admins：未保护"
+        );
         apply_dacl(
             &f,
             &[(SID_SYSTEM, FILE_ALL_ACCESS), (SID_USERS, FILE_ALL_ACCESS)],
@@ -299,7 +309,10 @@ mod tests {
         .unwrap();
         assert!(!check_protected(&f).unwrap(), "Users 带写位：未保护");
         protect_file(&f).unwrap();
-        assert!(check_protected(&f).unwrap(), "管理员全控 + Users 纯读：保护成立");
+        assert!(
+            check_protected(&f).unwrap(),
+            "管理员全控 + Users 纯读：保护成立"
+        );
         std::fs::remove_file(&f).unwrap();
         std::fs::remove_dir(&dir).unwrap();
     }

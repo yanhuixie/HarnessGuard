@@ -121,7 +121,10 @@ mod tests {
     #[test]
     fn 累计上行字节并归因() {
         let r = ConnRegistry::new();
-        r.on_open(ConnId(7), open_entry(42, Some("claude-code"), "1.2.3.4:443"));
+        r.on_open(
+            ConnId(7),
+            open_entry(42, Some("claude-code"), "1.2.3.4:443"),
+        );
         assert_eq!(r.on_tx(ConnId(7), 1000).unwrap().bytes_out_total, 1000);
         let s = r.on_tx(ConnId(7), 2_000).unwrap();
         assert_eq!(s.bytes_out_total, 3000);

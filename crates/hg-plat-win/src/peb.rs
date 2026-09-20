@@ -2,15 +2,15 @@
 //! 降级链第一级：SYSTEM/管理员读 PEB；失败由调用方置空并披露）。
 
 use std::ffi::OsString;
-use std::path::PathBuf;
 use std::os::windows::ffi::OsStringExt;
+use std::path::PathBuf;
 
+use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_BASIC_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
 };
-use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
 
 /// 返回 (cmdline, start_time_filetime, cwd)。任一步失败对应项为空/0——按设计
 /// "显式失败"原则，调用方负责记录可见性缺口。
@@ -21,9 +21,7 @@ pub fn query_process(pid: u32) -> (Vec<OsString>, u64, PathBuf) {
 }
 
 fn open(pid: u32) -> Option<HANDLE> {
-    unsafe {
-        OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid).ok()
-    }
+    unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid).ok() }
 }
 
 /// 进程创建时间（FILETIME u64）。进程已退出或无权限 → 0（竞态容忍，调用方披露）。
@@ -34,9 +32,17 @@ pub fn process_start_time(pid: u32) -> u64 {
     let mut kernel = windows::Win32::Foundation::FILETIME::default();
     let mut user = windows::Win32::Foundation::FILETIME::default();
     let r = unsafe {
-        windows::Win32::System::Threading::GetProcessTimes(h, &mut creation, &mut exit_t, &mut kernel, &mut user)
+        windows::Win32::System::Threading::GetProcessTimes(
+            h,
+            &mut creation,
+            &mut exit_t,
+            &mut kernel,
+            &mut user,
+        )
     };
-    unsafe { let _ = CloseHandle(h); };
+    unsafe {
+        let _ = CloseHandle(h);
+    };
     if r.is_ok() {
         ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64
     } else {
@@ -99,7 +105,12 @@ fn read_params(pid: u32) -> Option<(Vec<OsString>, PathBuf)> {
             buf: usize,
         }
         let read_unistr = |off: usize| -> Option<OsString> {
-            let mut us = UniStr { len: 0, _max: 0, _pad: 0, buf: 0 };
+            let mut us = UniStr {
+                len: 0,
+                _max: 0,
+                _pad: 0,
+                buf: 0,
+            };
             if ReadProcessMemory(
                 h,
                 (params + off) as *const core::ffi::c_void,
@@ -128,7 +139,9 @@ fn read_params(pid: u32) -> Option<(Vec<OsString>, PathBuf)> {
             }
             Some(OsString::from_wide(&buf))
         };
-        let cmdline = read_unistr(PARAMS_COMMAND_LINE).map(|s| split_cmdline(&s)).unwrap_or_default();
+        let cmdline = read_unistr(PARAMS_COMMAND_LINE)
+            .map(|s| split_cmdline(&s))
+            .unwrap_or_default();
         let cwd = read_unistr(PARAMS_CURRENT_DIR)
             .map(|s| PathBuf::from(s.to_string_lossy().trim_end_matches('\\').to_string()))
             .unwrap_or_default();

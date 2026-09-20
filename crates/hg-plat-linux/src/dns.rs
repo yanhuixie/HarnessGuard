@@ -15,7 +15,10 @@ pub struct DnsSource {
 
 impl DnsSource {
     pub fn new(tx: mpsc::Sender<Envelope>) -> Self {
-        Self { tx, base: std::time::Instant::now() }
+        Self {
+            tx,
+            base: std::time::Instant::now(),
+        }
     }
 
     fn now(&self) -> Timestamp {
@@ -29,18 +32,36 @@ impl DnsSource {
         const SOCK_NONBLOCK: libc::c_int = 0o4000;
         const SOCK_CLOEXEC: libc::c_int = 0o2000000;
         let proto = u16::to_be(3u16) as libc::c_int; // ETH_P_ALL 网络序
-        let fd = unsafe { libc::socket(libc::AF_PACKET, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, proto) };
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_PACKET,
+                SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK,
+                proto,
+            )
+        };
         if fd < 0 {
-            return Err(anyhow::anyhow!("AF_PACKET socket 失败 errno={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(0)));
+            return Err(anyhow::anyhow!(
+                "AF_PACKET socket 失败 errno={}",
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+            ));
         }
         let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
         sll.sll_family = libc::AF_PACKET as u16;
         sll.sll_protocol = proto as u16;
         sll.sll_ifindex = ifindex as i32;
-        let rc = unsafe { libc::bind(fd, &sll as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_ll>() as u32) };
+        let rc = unsafe {
+            libc::bind(
+                fd,
+                &sll as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_ll>() as u32,
+            )
+        };
         if rc != 0 {
             unsafe { libc::close(fd) };
-            return Err(anyhow::anyhow!("AF_PACKET bind 失败 errno={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(0)));
+            return Err(anyhow::anyhow!(
+                "AF_PACKET bind 失败 errno={}",
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+            ));
         }
         let mut buf = [0u8; 65536];
         loop {
@@ -66,7 +87,11 @@ impl DnsSource {
                         // 精确 pid 需 conntrack 关联——M2 校准项；暂 0（引擎容忍）
                         let _ = self.tx.try_send(Envelope::new(
                             self.now(),
-                            RawEvent::DnsQuery { pid: 0, qname, answers },
+                            RawEvent::DnsQuery {
+                                pid: 0,
+                                qname,
+                                answers,
+                            },
                         ));
                     }
                 }
@@ -86,7 +111,11 @@ fn parse_eth_udp_port53(frame: &[u8]) -> Option<(&[u8], bool)> {
         0x86DD => (14, false),
         _ => return None,
     };
-    let ihl_size = if is_v4 { ((frame[ip_off] & 0x0f) as usize) * 4 } else { 40 };
+    let ihl_size = if is_v4 {
+        ((frame[ip_off] & 0x0f) as usize) * 4
+    } else {
+        40
+    };
     let udp = ip_off + ihl_size;
     if frame.len() < udp + 8 {
         return None;

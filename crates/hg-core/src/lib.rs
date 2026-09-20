@@ -9,9 +9,11 @@ pub mod health;
 pub mod proc_table;
 pub mod rules;
 
-pub use conn_registry::{ConnEntry, ConnRegistry, ConnSummary, TxSample};
-pub use proc_table::ProcTable;
 pub use config::FileConfig;
+pub use conn_registry::{ConnEntry, ConnRegistry, ConnSummary, TxSample};
 pub use engine::{Engine, EngineOutput};
 pub use health::{EngineStats, SourceStats};
-pub use rules::{judge_perm_sync, FileAction, HarnessFeature, RulesConfig, RulesSnapshot, ToolExemptConf};
+pub use proc_table::ProcTable;
+pub use rules::{
+    judge_perm_sync, FileAction, HarnessFeature, RulesConfig, RulesSnapshot, ToolExemptConf,
+};

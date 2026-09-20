@@ -65,7 +65,10 @@ impl LruCache {
         if self.head == Some(idx) {
             return;
         }
-        let (prev, next) = (self.entries[idx as usize].prev, self.entries[idx as usize].next);
+        let (prev, next) = (
+            self.entries[idx as usize].prev,
+            self.entries[idx as usize].next,
+        );
         // 摘出
         if let Some(p) = prev {
             self.entries[p as usize].next = next;
@@ -99,11 +102,21 @@ impl LruCache {
         }
         let idx = match self.free.pop() {
             Some(i) => {
-                self.entries[i as usize] = Entry { key, val, prev: self.head, next: None };
+                self.entries[i as usize] = Entry {
+                    key,
+                    val,
+                    prev: self.head,
+                    next: None,
+                };
                 i
             }
             None => {
-                self.entries.push(Entry { key, val, prev: self.head, next: None });
+                self.entries.push(Entry {
+                    key,
+                    val,
+                    prev: self.head,
+                    next: None,
+                });
                 (self.entries.len() - 1) as u32
             }
         };
@@ -122,7 +135,12 @@ impl LruCache {
         let key = self.entries[tail as usize].key;
         let next = self.entries[tail as usize].next;
         self.map.remove(&key);
-        self.entries[tail as usize] = Entry { key: 0, val: String::new(), prev: None, next: None };
+        self.entries[tail as usize] = Entry {
+            key: 0,
+            val: String::new(),
+            prev: None,
+            next: None,
+        };
         self.free.push(tail);
         self.tail = next;
         if let Some(n) = next {
@@ -199,7 +217,11 @@ mod tests {
             c.insert(i, format!("v{i}"));
         }
         assert_eq!(c.len(), 3);
-        assert!(c.entries.len() <= 3, "slab 槽位须复用，实际 {}", c.entries.len());
+        assert!(
+            c.entries.len() <= 3,
+            "slab 槽位须复用，实际 {}",
+            c.entries.len()
+        );
     }
 
     #[test]

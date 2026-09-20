@@ -9,10 +9,7 @@ use std::time::Duration;
 use hg_model::{Envelope, PersistenceKind, RawEvent, Timestamp};
 use tokio::sync::mpsc;
 
-const WATCH_DIRS: &[&str] = &[
-    "/Library/LaunchAgents",
-    "/Library/LaunchDaemons",
-];
+const WATCH_DIRS: &[&str] = &["/Library/LaunchAgents", "/Library/LaunchDaemons"];
 
 const POLL: Duration = Duration::from_secs(10);
 

@@ -127,7 +127,11 @@ async fn auth(
 
 async fn index() -> Html<String> {
     let page = Assets::get("index.html").expect("嵌入 index.html");
-    Html(std::str::from_utf8(page.data.as_ref()).unwrap_or("<html>M1</html>").to_string())
+    Html(
+        std::str::from_utf8(page.data.as_ref())
+            .unwrap_or("<html>M1</html>")
+            .to_string(),
+    )
 }
 
 type ApiResult = Result<Json<serde_json::Value>, (StatusCode, String)>;
@@ -174,10 +178,7 @@ struct LimitQ {
     since: Option<i64>,
 }
 
-async fn verdicts(
-    State(st): State<Arc<AppState>>,
-    Query(p): Query<LimitQ>,
-) -> ApiResult {
+async fn verdicts(State(st): State<Arc<AppState>>, Query(p): Query<LimitQ>) -> ApiResult {
     let limit = p.limit.unwrap_or(50).min(500) as i64;
     // db 打开失败按 500 返回（原 unwrap_or_else(unreachable!) 在库缺失/损坏时
     // 直接 panic 整个 worker——M4 待修清单 12，三处同修）
@@ -201,10 +202,7 @@ async fn verdicts(
     Ok(Json(json!(out)))
 }
 
-async fn events(
-    State(st): State<Arc<AppState>>,
-    Query(p): Query<LimitQ>,
-) -> ApiResult {
+async fn events(State(st): State<Arc<AppState>>, Query(p): Query<LimitQ>) -> ApiResult {
     let limit = p.limit.unwrap_or(50).min(500) as i64;
     let conn = hg_store::open(&st.db_path).map_err(db_err)?;
     let mut stmt = conn
@@ -247,15 +245,17 @@ async fn wl_list(State(st): State<Arc<AppState>>) -> ApiResult {
     let mut stmt = conn
         .prepare("SELECT id, kind, value, note, created_ts FROM whitelist ORDER BY id DESC")
         .map_err(db_err)?;
-    let rows = stmt.query_map([], |r| {
-        Ok(json!({
-            "id": r.get::<_, i64>(0)?,
-            "kind": r.get::<_, String>(1)?,
-            "value": r.get::<_, String>(2)?,
-            "note": r.get::<_, String>(3)?,
-            "created_ts": r.get::<_, i64>(4)?,
-        }))
-    }).map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "kind": r.get::<_, String>(1)?,
+                "value": r.get::<_, String>(2)?,
+                "note": r.get::<_, String>(3)?,
+                "created_ts": r.get::<_, i64>(4)?,
+            }))
+        })
+        .map_err(db_err)?;
     Ok(Json(json!(rows.filter_map(|x| x.ok()).collect::<Vec<_>>())))
 }
 
@@ -267,17 +267,17 @@ struct WlAdd {
     note: String,
 }
 
-async fn wl_add(
-    State(st): State<Arc<AppState>>,
-    Json(body): Json<WlAdd>,
-) -> Response {
+async fn wl_add(State(st): State<Arc<AppState>>, Json(body): Json<WlAdd>) -> Response {
     if !matches!(body.kind.as_str(), "endpoint" | "path" | "proc") {
         return (StatusCode::BAD_REQUEST, "kind 须为 endpoint|path|proc").into_response();
     }
     let Ok(conn) = hg_store::open(&st.db_path) else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "打开数据库失败").into_response();
     };
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
     match conn.execute(
         "INSERT OR IGNORE INTO whitelist(kind, value, note, created_ts) VALUES (?1,?2,?3,?4)",
         rusqlite::params![body.kind, body.value, body.note, ts],
@@ -315,7 +315,15 @@ async fn config_get(State(st): State<Arc<AppState>>) -> Response {
     let text = std::fs::read_to_string(&st.config_path).unwrap_or_else(|_| {
         toml::to_string_pretty(&*st.config.read().unwrap()).unwrap_or_default()
     });
-    (StatusCode::OK, [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        text,
+    )
+        .into_response()
 }
 
 async fn config_put(State(st): State<Arc<AppState>>, body: String) -> Response {
@@ -330,7 +338,11 @@ async fn config_put(State(st): State<Arc<AppState>>, body: String) -> Response {
     }
     *st.config.write().unwrap() = parsed;
     if let Err(e) = st.rebuild_rules() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("快照重建失败: {e:#}")).into_response();
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("快照重建失败: {e:#}"),
+        )
+            .into_response();
     }
     (StatusCode::OK, "配置已生效").into_response()
 }
@@ -344,7 +356,11 @@ fn toml_parse(s: &str) -> anyhow::Result<FileConfig> {
 /// dns_map 全量 + processes 已退出，白名单与配置不动）。
 async fn data_clear(State(st): State<Arc<AppState>>) -> Response {
     let (ack_tx, ack_rx) = std::sync::mpsc::channel::<u64>();
-    if st.store_tx.send(hg_store::writer::StoreOp::Purge { ack: ack_tx }).is_err() {
+    if st
+        .store_tx
+        .send(hg_store::writer::StoreOp::Purge { ack: ack_tx })
+        .is_err()
+    {
         return (StatusCode::SERVICE_UNAVAILABLE, "存储写入线程未运行").into_response();
     }
     // 写入线程 200ms 批量窗口 + 全表 DELETE，正常毫秒级返回；超时按 504 上报
@@ -382,8 +398,9 @@ async fn stream(State(st): State<Arc<AppState>>) -> Response {
         Duration::from_secs(15),
     );
     ka.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let keepalive = tokio_stream::wrappers::IntervalStream::new(ka)
-        .map(|_| Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b": keepalive\n\n")));
+    let keepalive = tokio_stream::wrappers::IntervalStream::new(ka).map(|_| {
+        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b": keepalive\n\n"))
+    });
     let body = Body::from_stream(retry.chain(events.merge(keepalive)));
     (
         StatusCode::OK,
@@ -449,9 +466,18 @@ mod tests {
         let dir = std::env::temp_dir().join("hg-web-db-500-test");
         std::fs::create_dir_all(&dir).unwrap();
         let st = test_state_with_db(&dir.display().to_string());
-        assert_eq!(call(&st, "/api/verdicts", true).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(call(&st, "/api/events", true).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(call(&st, "/api/whitelist", true).await.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            call(&st, "/api/verdicts", true).await.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            call(&st, "/api/events", true).await.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            call(&st, "/api/whitelist", true).await.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     async fn call(state: &Arc<AppState>, uri: &str, bearer: bool) -> axum::response::Response {
@@ -508,7 +534,8 @@ mod tests {
             conn.execute(
                 "INSERT INTO whitelist(kind, value, note, created_ts) VALUES ('path','C:/ok','',1)",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
         }
         let (tx, rx) = std::sync::mpsc::channel::<hg_store::writer::StoreOp>();
         let writer = hg_store::writer::spawn_writer(&db_path, rx, 30);
@@ -523,7 +550,11 @@ mod tests {
         // 库内验证：判定已清、白名单保留
         let conn = hg_store::open(&db_path).unwrap();
         let (v, w): (i64, i64) = conn
-            .query_row("SELECT (SELECT COUNT(*) FROM verdicts), (SELECT COUNT(*) FROM whitelist)", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM verdicts), (SELECT COUNT(*) FROM whitelist)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert_eq!((v, w), (0, 1));
         drop(st); // 通道唯一发送端随 state 释放，写入线程退出
@@ -533,8 +564,14 @@ mod tests {
 
     #[test]
     fn sse_帧编码() {
-        let f = sse_frame(&SseEvent { event: "verdict", data: "{\"id\":1}".into() });
-        assert_eq!(std::str::from_utf8(&f).unwrap(), "event: verdict\ndata: {\"id\":1}\n\n");
+        let f = sse_frame(&SseEvent {
+            event: "verdict",
+            data: "{\"id\":1}".into(),
+        });
+        assert_eq!(
+            std::str::from_utf8(&f).unwrap(),
+            "event: verdict\ndata: {\"id\":1}\n\n"
+        );
     }
 
     /// 拍板记录 8 的验收：query token 仅放行 /api/stream，其余端点仅 Bearer。
@@ -542,11 +579,20 @@ mod tests {
     async fn query_token_仅放行_stream端点() {
         let st = test_state();
         // 无任何 token
-        assert_eq!(call(&st, "/api/status", false).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            call(&st, "/api/status", false).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
         // query token 打普通 API → 拒绝
-        assert_eq!(call(&st, "/api/status?token=t123", false).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            call(&st, "/api/status?token=t123", false).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
         // 错误 query token 打 SSE → 拒绝
-        assert_eq!(call(&st, "/api/stream?token=wrong", false).await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            call(&st, "/api/stream?token=wrong", false).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
         // 正确 query token 打 SSE → 放行且为事件流
         let r = call(&st, "/api/stream?token=t123", false).await;
         assert_eq!(r.status(), StatusCode::OK);
@@ -556,7 +602,10 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.starts_with("text/event-stream")));
         // Bearer 打普通 API → 正常（回归）
-        assert_eq!(call(&st, "/api/status", true).await.status(), StatusCode::OK);
+        assert_eq!(
+            call(&st, "/api/status", true).await.status(),
+            StatusCode::OK
+        );
     }
 
     /// SSE 首帧为 retry 指令、事件帧可推送到订阅者（端到端经完整 router）。
@@ -573,14 +622,20 @@ mod tests {
         assert_eq!(f1.data_ref().unwrap(), "retry: 3000\n\n");
         // 喂入一帧事件，应原样到达订阅端
         st.sse
-            .send(SseEvent { event: "verdict", data: "{\"rule\":\"r\"}".into() })
+            .send(SseEvent {
+                event: "verdict",
+                data: "{\"rule\":\"r\"}".into(),
+            })
             .expect("发送事件");
         let f2 = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
             .await
             .expect("事件帧超时")
             .unwrap()
             .expect("流提前结束");
-        assert_eq!(f2.data_ref().unwrap(), "event: verdict\ndata: {\"rule\":\"r\"}\n\n");
+        assert_eq!(
+            f2.data_ref().unwrap(),
+            "event: verdict\ndata: {\"rule\":\"r\"}\n\n"
+        );
     }
 
     #[test]

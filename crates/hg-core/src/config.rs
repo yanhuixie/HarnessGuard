@@ -93,12 +93,17 @@ pub struct FileAuditConf {
 
 impl Default for NetworkConf {
     fn default() -> Self {
-        Self { upload_threshold_mb: 100, sensitive_escalation_divisor: 10 }
+        Self {
+            upload_threshold_mb: 100,
+            sensitive_escalation_divisor: 10,
+        }
     }
 }
 impl Default for EndpointsConf {
     fn default() -> Self {
-        Self { allow: crate::rules::default_endpoints_allow() }
+        Self {
+            allow: crate::rules::default_endpoints_allow(),
+        }
     }
 }
 impl Default for FilesConf {
@@ -108,10 +113,20 @@ impl Default for FilesConf {
             git_dir_kill: false,
             archive_action: "block".into(),
             sensitive_patterns: vec![
-                ".env".into(), ".env.*".into(), "*_rsa".into(), "*.pem".into(), "*credentials*".into(),
+                ".env".into(),
+                ".env.*".into(),
+                "*_rsa".into(),
+                "*.pem".into(),
+                "*credentials*".into(),
             ],
             archive_patterns: vec![
-                "*.zip".into(), "*.tar".into(), "*.tar.gz".into(), "*.tgz".into(), "*.7z".into(), "*.gz".into(), "*.zst".into(),
+                "*.zip".into(),
+                "*.tar".into(),
+                "*.tar.gz".into(),
+                "*.tgz".into(),
+                "*.7z".into(),
+                "*.gz".into(),
+                "*.zst".into(),
             ],
         }
     }
@@ -134,17 +149,25 @@ impl Default for CommandsConf {
 }
 impl Default for ProcessesConf {
     fn default() -> Self {
-        Self { harness: crate::rules::default_harness_features() }
+        Self {
+            harness: crate::rules::default_harness_features(),
+        }
     }
 }
 impl Default for StorageConf {
     fn default() -> Self {
-        Self { retention_days: 30, max_disk_mb: 500, db_path: default_db_path() }
+        Self {
+            retention_days: 30,
+            max_disk_mb: 500,
+            db_path: default_db_path(),
+        }
     }
 }
 impl Default for WebConf {
     fn default() -> Self {
-        Self { bind: "127.0.0.1:8377".into() }
+        Self {
+            bind: "127.0.0.1:8377".into(),
+        }
     }
 }
 impl Default for FileConfig {
@@ -503,8 +526,8 @@ mod tests {
     /// 模板与 Default 的值必须一致（防止模板与结构体默认漂移）。
     #[test]
     fn 默认模板与默认值一致() {
-        let parsed: FileConfig = toml::from_str(&FileConfig::default_toml())
-            .expect("默认模板必须是合法 TOML");
+        let parsed: FileConfig =
+            toml::from_str(&FileConfig::default_toml()).expect("默认模板必须是合法 TOML");
         let a = toml::to_string_pretty(&parsed).unwrap();
         let b = toml::to_string_pretty(&FileConfig::default()).unwrap();
         assert_eq!(a, b, "默认模板与 FileConfig::default 值不一致");
@@ -596,7 +619,9 @@ bind = "127.0.0.1:8377"
         assert!(!rules.git_dir_kill);
         // 编译期兜底：git 豁免在快照中存活（任意路径的 git.exe）
         assert_eq!(
-            rules.match_tool_exempt(std::path::Path::new("C:/Program Files/Git/mingw64/bin/git.exe")),
+            rules.match_tool_exempt(std::path::Path::new(
+                "C:/Program Files/Git/mingw64/bin/git.exe"
+            )),
             Some("git")
         );
     }

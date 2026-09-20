@@ -90,11 +90,16 @@ fn on_process(record: &EventRecord, loc: &SchemaLocator) {
     } else {
         return;
     }
-    let Ok(schema) = loc.event_schema(record) else { return };
+    let Ok(schema) = loc.event_schema(record) else {
+        return;
+    };
     let p = Parser::create(record, &schema);
     let pid = parse_u32(&p, &["ProcessId", "ProcessID"]).unwrap_or(0);
     let ppid = parse_u32(&p, &["ParentId", "ParentID"]).unwrap_or(0);
-    let img: Option<String> = p.try_parse::<String>("ImageName").ok().filter(|s| !s.is_empty());
+    let img: Option<String> = p
+        .try_parse::<String>("ImageName")
+        .ok()
+        .filter(|s| !s.is_empty());
     if img.is_some() {
         PROC_IMG_OK.fetch_add(1, Relaxed);
     }
@@ -106,9 +111,14 @@ fn on_process(record: &EventRecord, loc: &SchemaLocator) {
 fn on_file(record: &EventRecord, loc: &SchemaLocator) {
     FILE_TOTAL.fetch_add(1, Relaxed);
     bump(&FILE_OPCODES, record.opcode());
-    let Ok(schema) = loc.event_schema(record) else { return };
+    let Ok(schema) = loc.event_schema(record) else {
+        return;
+    };
     let p = Parser::create(record, &schema);
-    let name: Option<String> = p.try_parse::<String>("FileName").ok().filter(|s| !s.is_empty());
+    let name: Option<String> = p
+        .try_parse::<String>("FileName")
+        .ok()
+        .filter(|s| !s.is_empty());
     let obj: Option<u64> = p
         .try_parse::<Pointer>("FileObject")
         .ok()
@@ -144,7 +154,9 @@ fn on_file(record: &EventRecord, loc: &SchemaLocator) {
 fn on_net(record: &EventRecord, loc: &SchemaLocator) {
     NET_TOTAL.fetch_add(1, Relaxed);
     bump(&NET_OPCODES, record.opcode());
-    let Ok(schema) = loc.event_schema(record) else { return };
+    let Ok(schema) = loc.event_schema(record) else {
+        return;
+    };
     let p = Parser::create(record, &schema);
     if let Some(size) = parse_u32(&p, &["size", "Size"]) {
         NET_SIZE_SUM.fetch_add(size as u64, Relaxed);
@@ -157,21 +169,32 @@ fn on_net(record: &EventRecord, loc: &SchemaLocator) {
         let saddr: Option<IpAddr> = p.try_parse("saddr").ok();
         let dport = parse_u32(&p, &["dport"]).unwrap_or(0);
         let pid = parse_u32(&p, &["PID", "ProcessId"]).unwrap_or(0);
-        println!("[net 样例] opcode={} pid={pid} {saddr:?} -> {daddr:?}:{dport}", record.opcode());
+        println!(
+            "[net 样例] opcode={} pid={pid} {saddr:?} -> {daddr:?}:{dport}",
+            record.opcode()
+        );
     }
 }
 
 fn on_dns(record: &EventRecord, loc: &SchemaLocator) {
     DNS_TOTAL.fetch_add(1, Relaxed);
-    let Ok(schema) = loc.event_schema(record) else { return };
+    let Ok(schema) = loc.event_schema(record) else {
+        return;
+    };
     let p = Parser::create(record, &schema);
-    let q: Option<String> = p.try_parse::<String>("QueryName").ok().filter(|s| !s.is_empty());
+    let q: Option<String> = p
+        .try_parse::<String>("QueryName")
+        .ok()
+        .filter(|s| !s.is_empty());
     if q.is_some() {
         DNS_QUERY_OK.fetch_add(1, Relaxed);
     }
     if DNS_SAMPLES.fetch_add(1, Relaxed) < 5 {
         let r: Option<String> = p.try_parse("QueryResults").ok();
-        println!("[dns 样例] event_id={} qname={q:?} results={r:?}", record.event_id());
+        println!(
+            "[dns 样例] event_id={} qname={q:?} results={r:?}",
+            record.event_id()
+        );
     }
 }
 
@@ -185,13 +208,21 @@ fn on_manifest_process(record: &EventRecord, loc: &SchemaLocator) {
     } else if eid == 2 {
         MP_STOPS.fetch_add(1, Relaxed);
     }
-    let Ok(schema) = loc.event_schema(record) else { return };
+    let Ok(schema) = loc.event_schema(record) else {
+        return;
+    };
     let p = Parser::create(record, &schema);
     if eid != 1 {
         return;
     }
-    let img: Option<String> = p.try_parse::<String>("ImageName").ok().filter(|s| !s.is_empty());
-    let cmd: Option<String> = p.try_parse::<String>("CommandLine").ok().filter(|s| !s.is_empty());
+    let img: Option<String> = p
+        .try_parse::<String>("ImageName")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let cmd: Option<String> = p
+        .try_parse::<String>("CommandLine")
+        .ok()
+        .filter(|s| !s.is_empty());
     if img.is_some() {
         MP_IMG_OK.fetch_add(1, Relaxed);
     }
@@ -212,9 +243,14 @@ fn on_image_load(record: &EventRecord, loc: &SchemaLocator) {
     if record.opcode() != 10 {
         return;
     }
-    let Ok(schema) = loc.event_schema(record) else { return };
+    let Ok(schema) = loc.event_schema(record) else {
+        return;
+    };
     let p = Parser::create(record, &schema);
-    let name: Option<String> = p.try_parse::<String>("FileName").ok().filter(|s| !s.is_empty());
+    let name: Option<String> = p
+        .try_parse::<String>("FileName")
+        .ok()
+        .filter(|s| !s.is_empty());
     if name.is_some() {
         IL_NAME_OK.fetch_add(1, Relaxed);
     }
@@ -282,8 +318,14 @@ fn main() {
 /// 补充 spike：manifest 版 Kernel-Process（ImageName/CommandLine 可用性）+
 /// Dns-Client 按 GUID 直连（by_name 在本机返回 PlaError::NotFound）。
 fn run_manifest_spike(secs: u64, kernel_session: bool) {
-    let session_kind = if kernel_session { "KernelTrace" } else { "UserTrace" };
-    println!("== M0 补充 spike（{session_kind} + manifest Kernel-Process + Dns-Client）：{secs}s ==");
+    let session_kind = if kernel_session {
+        "KernelTrace"
+    } else {
+        "UserTrace"
+    };
+    println!(
+        "== M0 补充 spike（{session_kind} + manifest Kernel-Process + Dns-Client）：{secs}s =="
+    );
     let kp = Provider::by_guid("22fb2cd6-0ef7-4a76-a270-5d6c8a5ae9e5")
         .add_callback(on_manifest_process)
         .build();
@@ -366,7 +408,10 @@ fn run_manifest_spike(secs: u64, kernel_session: bool) {
 }
 
 fn run_kernel_spike(secs: u64) {
-    println!("== HarnessGuard M0 Windows spike：采样 {secs}s，进程 PID={} ==", std::process::id());
+    println!(
+        "== HarnessGuard M0 Windows spike：采样 {secs}s，进程 PID={} ==",
+        std::process::id()
+    );
 
     let process = Provider::kernel(&kernel_providers::PROCESS_PROVIDER)
         .add_callback(on_process)
@@ -403,7 +448,11 @@ fn run_kernel_spike(secs: u64) {
 
     let dns_trace = match Provider::by_name("Microsoft-Windows-Dns-Client") {
         Ok(b) => match b.add_callback(on_dns).build() {
-            provider => match UserTrace::new().named("HgSpikeDns".into()).enable(provider).start_and_process() {
+            provider => match UserTrace::new()
+                .named("HgSpikeDns".into())
+                .enable(provider)
+                .start_and_process()
+            {
                 Ok(t) => {
                     println!("UserTrace（Dns-Client）已启动");
                     Some(t)
@@ -461,7 +510,11 @@ fn run_kernel_spike(secs: u64) {
     let resolved = FILE_RESOLVED.load(Relaxed);
     let unresolved = FILE_UNRESOLVED.load(Relaxed);
     let noobj = FILE_NOOBJ.load(Relaxed);
-    let cache_n = FILE_OBJ_CACHE.lock().unwrap().as_ref().map_or(0, |m| m.len());
+    let cache_n = FILE_OBJ_CACHE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or(0, |m| m.len());
     println!(
         "[Kernel-File] 总事件 {}（{:.0}/s）| Name事件 {} | 缓存命中 {} | unknown {} | 无FileObject {}",
         FILE_TOTAL.load(Relaxed),
@@ -481,7 +534,11 @@ fn run_kernel_spike(secs: u64) {
     if let Some(m) = FILE_OPCODES.lock().unwrap().as_ref() {
         let mut v: Vec<_> = m.iter().collect();
         v.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
-        let top: Vec<String> = v.iter().take(10).map(|(o, c)| format!("op{o}:{c}")).collect();
+        let top: Vec<String> = v
+            .iter()
+            .take(10)
+            .map(|(o, c)| format!("op{o}:{c}"))
+            .collect();
         println!("  文件 opcode 分布（前10）：{}", top.join(" "));
     }
     println!(
@@ -495,7 +552,11 @@ fn run_kernel_spike(secs: u64) {
     if let Some(m) = NET_OPCODES.lock().unwrap().as_ref() {
         let mut v: Vec<_> = m.iter().collect();
         v.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
-        let top: Vec<String> = v.iter().take(10).map(|(o, c)| format!("op{o}:{c}")).collect();
+        let top: Vec<String> = v
+            .iter()
+            .take(10)
+            .map(|(o, c)| format!("op{o}:{c}"))
+            .collect();
         println!("  网络 opcode 分布（前10）：{}", top.join(" "));
     }
     println!(

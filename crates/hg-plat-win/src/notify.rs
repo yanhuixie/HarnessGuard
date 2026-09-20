@@ -11,8 +11,8 @@ use windows::Win32::System::RemoteDesktop::{
     WTSActive, WTSEnumerateSessionsW, WTSFreeMemory, WTSQueryUserToken, WTS_SESSION_INFOW,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, CREATE_DEFAULT_ERROR_MODE, CREATE_NO_WINDOW,
-    CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessAsUserW, CREATE_DEFAULT_ERROR_MODE, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+    PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 pub struct WinNotifier {
@@ -22,7 +22,9 @@ pub struct WinNotifier {
 
 impl WinNotifier {
     pub fn new() -> Self {
-        Self { failures: std::sync::atomic::AtomicU64::new(0) }
+        Self {
+            failures: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
     pub fn notify(&self, title: &str, body: &str) {
@@ -33,7 +35,10 @@ impl WinNotifier {
         if spawn_common(None, title, body) {
             return;
         }
-        let n = self.failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let n = self
+            .failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         tracing::error!("OS 通知投递失败（累计 {n} 次），UI 红色横幅兜底");
     }
 
@@ -83,10 +88,9 @@ fn spawn_common(token: Option<HANDLE>, title: &str, body: &str) -> bool {
             ..Default::default()
         };
         let mut pi = PROCESS_INFORMATION::default();
-        let app: Vec<u16> =
-            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\0"
-                .encode_utf16()
-                .collect();
+        let app: Vec<u16> = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\0"
+            .encode_utf16()
+            .collect();
         let r = CreateProcessAsUserW(
             token,
             PCWSTR(app.as_ptr()),
@@ -95,7 +99,11 @@ fn spawn_common(token: Option<HANDLE>, title: &str, body: &str) -> bool {
             None,
             false,
             CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_DEFAULT_ERROR_MODE,
-            if have_env { Some(env as *const core::ffi::c_void) } else { None },
+            if have_env {
+                Some(env as *const core::ffi::c_void)
+            } else {
+                None
+            },
             PCWSTR::null(),
             &si,
             &mut pi,
@@ -166,12 +174,24 @@ fn base64_utf16le(s: &str) -> String {
     let bytes: Vec<u8> = s.encode_utf16().flat_map(|w| w.to_le_bytes()).collect();
     let mut out = String::new();
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         out.push(T[(n >> 18) as usize & 63] as char);
         out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }

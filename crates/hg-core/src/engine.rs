@@ -146,9 +146,14 @@ impl Engine {
 
     async fn handle(&self, env: Envelope) -> anyhow::Result<()> {
         match env.event {
-            RawEvent::Exec { pid, ppid, start_time, exe, cmdline, cwd } => {
-                self.on_exec(pid, ppid, start_time, exe, cmdline, cwd, env.ts)
-            }
+            RawEvent::Exec {
+                pid,
+                ppid,
+                start_time,
+                exe,
+                cmdline,
+                cwd,
+            } => self.on_exec(pid, ppid, start_time, exe, cmdline, cwd, env.ts),
             RawEvent::Exit { pid, start_time } => {
                 if let Some(id) = self.procs.apply_exit(pid, start_time) {
                     if let Some(root) = &id.harness_root {
@@ -164,13 +169,25 @@ impl Engine {
                 }
                 Ok(())
             }
-            RawEvent::FileOpen { pid, start_time: _, path, access } => {
-                self.on_file_open(pid, &path, access)
-            }
-            RawEvent::FileCreate { pid, start_time: _, path } => {
-                self.on_file_create(pid, &path, env.ts)
-            }
-            RawEvent::ConnOpen { pid, start_time, conn_id, proto, local, remote } => {
+            RawEvent::FileOpen {
+                pid,
+                start_time: _,
+                path,
+                access,
+            } => self.on_file_open(pid, &path, access),
+            RawEvent::FileCreate {
+                pid,
+                start_time: _,
+                path,
+            } => self.on_file_create(pid, &path, env.ts),
+            RawEvent::ConnOpen {
+                pid,
+                start_time,
+                conn_id,
+                proto,
+                local,
+                remote,
+            } => {
                 // 只登记监控树进程的连接（非监控进程不干预，技术设计 §3.3 快路径规则 1）
                 if let Some(id) = self.procs.get(&pid) {
                     if id.harness_root.is_some() {
@@ -191,7 +208,10 @@ impl Engine {
                 }
                 Ok(())
             }
-            RawEvent::ConnTx { conn_id, bytes_out_delta } => {
+            RawEvent::ConnTx {
+                conn_id,
+                bytes_out_delta,
+            } => {
                 self.on_conn_tx(conn_id, bytes_out_delta, env.ts);
                 Ok(())
             }
@@ -212,7 +232,11 @@ impl Engine {
                 }
                 Ok(())
             }
-            RawEvent::DnsQuery { pid, qname, answers } => {
+            RawEvent::DnsQuery {
+                pid,
+                qname,
+                answers,
+            } => {
                 let ts = self.utc(env.ts);
                 // 容量护栏（评审 #4：长期运行内存上限，粗粒度整表重建）
                 if self.dns.len() > 65536 {
@@ -235,7 +259,11 @@ impl Engine {
                 }
                 Ok(())
             }
-            RawEvent::Persistence { pid, kind: _, detail } => {
+            RawEvent::Persistence {
+                pid,
+                kind: _,
+                detail,
+            } => {
                 // 高可疑告警（审计不阻断，需求 §3.5）
                 let v = Verdict {
                     rule_id: RuleId("persistence"),
@@ -266,7 +294,9 @@ impl Engine {
         ts: Timestamp,
     ) -> anyhow::Result<()> {
         let rules = self.rules.load();
-        let id = self.procs.apply_exec(&rules, pid, ppid, start_time, &exe, cmdline);
+        let id = self
+            .procs
+            .apply_exec(&rules, pid, ppid, start_time, &exe, cmdline);
         tracing::debug!(
             "[exec] pid={pid} ppid={ppid} root={:?} exe={} cwd={} cmdline='{}'",
             id.harness_root.as_ref().map(|r| r.0.clone()),
@@ -274,16 +304,23 @@ impl Engine {
             cwd.display(),
             join_cmdline(&id.cmdline)
         );
-        let Some(root) = &id.harness_root else { return Ok(()) };
+        let Some(root) = &id.harness_root else {
+            return Ok(());
+        };
 
         // 命令封堵（需求 §3.3）。cmdline 为空（短命进程 PEB 读取竞态，M1 报告披露）
         // 时按 exe 文件名兜底匹配——宁多判勿漏判，命中即视为导出型命令。
         let blocked_hit = if id.cmdline.is_empty() {
             let mut argv = vec![std::ffi::OsString::from(
-                exe.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
+                exe.file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
             )];
             argv[0] = std::ffi::OsString::from(
-                argv[0].to_string_lossy().trim_end_matches(".exe").to_string(),
+                argv[0]
+                    .to_string_lossy()
+                    .trim_end_matches(".exe")
+                    .to_string(),
             );
             rules.match_blocked_command(&argv)
         } else {
@@ -304,7 +341,11 @@ impl Engine {
                 },
             };
             self.emit_verdict(pid, &exe.display().to_string(), v, ts);
-            self.send(EngineOutput::Kill { pid, start_time, reason: summary.clone() });
+            self.send(EngineOutput::Kill {
+                pid,
+                start_time,
+                reason: summary.clone(),
+            });
             self.send(EngineOutput::Notify {
                 title: "HarnessGuard：已封堵导出命令".into(),
                 body: summary,
@@ -327,7 +368,9 @@ impl Engine {
         path: &std::path::Path,
         access: hg_model::Access,
     ) -> anyhow::Result<()> {
-        let Some(id) = self.procs.get(&pid) else { return Ok(()) };
+        let Some(id) = self.procs.get(&pid) else {
+            return Ok(());
+        };
         let rules = self.rules.load();
         let v = judge_perm_sync(&rules, &id, path, access);
         match v.action {
@@ -371,9 +414,18 @@ impl Engine {
         Ok(())
     }
 
-    fn on_file_create(&self, pid: Pid, path: &std::path::Path, ts: Timestamp) -> anyhow::Result<()> {
-        let Some(id) = self.procs.get(&pid) else { return Ok(()) };
-        let Some(root) = &id.harness_root else { return Ok(()) };
+    fn on_file_create(
+        &self,
+        pid: Pid,
+        path: &std::path::Path,
+        ts: Timestamp,
+    ) -> anyhow::Result<()> {
+        let Some(id) = self.procs.get(&pid) else {
+            return Ok(());
+        };
+        let Some(root) = &id.harness_root else {
+            return Ok(());
+        };
         let rules = self.rules.load();
         // Create 事件先于 Read/Write 到达（Windows 事后处置语义下两者都要判，
         // 防只靠后续事件漏判）。按写语义复用快路径统一判定，仅注入面 Kill
@@ -391,7 +443,11 @@ impl Engine {
                     self.emit_verdict(pid, &id.exe.display().to_string(), v, ts);
                     // 杀进程升级由 git_dir_kill 决定（拍板记录 13，缺省不杀）
                     if rules.git_dir_kill {
-                        self.send(EngineOutput::Kill { pid, start_time: id.start_time, reason: summary.clone() });
+                        self.send(EngineOutput::Kill {
+                            pid,
+                            start_time: id.start_time,
+                            reason: summary.clone(),
+                        });
                     }
                     self.send(EngineOutput::Notify {
                         title: "HarnessGuard：已阻断敏感路径访问".into(),
@@ -410,11 +466,7 @@ impl Engine {
             return Ok(());
         }
         if rules.match_archive(path) {
-            let summary = format!(
-                "[{}] 创建归档产物：{}（pid {pid}）",
-                root.0,
-                path.display()
-            );
+            let summary = format!("[{}] 创建归档产物：{}（pid {pid}）", root.0, path.display());
             let v = Verdict {
                 rule_id: RuleId("archive-create"),
                 action: match rules.archive_action {
@@ -443,8 +495,12 @@ impl Engine {
     }
 
     fn on_conn_tx(&self, conn_id: ConnId, delta: u64, ts: Timestamp) {
-        let Some(sample) = self.conns.on_tx(conn_id, delta) else { return };
-        let Some(root) = &sample.harness_root else { return };
+        let Some(sample) = self.conns.on_tx(conn_id, delta) else {
+            return;
+        };
+        let Some(root) = &sample.harness_root else {
+            return;
+        };
         if self.handled_conns.contains(&conn_id.0) {
             return;
         }
@@ -455,10 +511,7 @@ impl Engine {
             return; // 白名单端点不累计阈值（仍会关闭落库）
         }
         let total = {
-            let mut e = self
-                .root_bytes
-                .entry((root.0.clone(), ip))
-                .or_insert(0);
+            let mut e = self.root_bytes.entry((root.0.clone(), ip)).or_insert(0);
             *e += delta;
             *e
         };
@@ -507,7 +560,10 @@ impl Engine {
                 .unwrap_or_default();
             self.emit_verdict(sample.pid, &exe, v, ts);
             self.send(EngineOutput::DropTcp {
-                quad: TcpQuad { local: sample.local, remote: sample.remote },
+                quad: TcpQuad {
+                    local: sample.local,
+                    remote: sample.remote,
+                },
                 reason: summary.clone(),
             });
             self.send(EngineOutput::BlockIp {
@@ -528,7 +584,11 @@ impl Engine {
             self.stats.blocks.fetch_add(1, Relaxed);
         }
         self.send(EngineOutput::Verdict {
-            ts: if ts.0 == 0 { utc_now_ms() } else { self.utc(ts) },
+            ts: if ts.0 == 0 {
+                utc_now_ms()
+            } else {
+                self.utc(ts)
+            },
             pid,
             exe: exe.to_string(),
             verdict,
@@ -557,7 +617,9 @@ mod tests {
     use crate::rules::{RulesConfig, RulesSnapshot};
     use std::path::Path;
 
-    fn engine_with(mut cfg: RulesConfig) -> (Arc<Engine>, tokio::sync::mpsc::Receiver<EngineOutput>) {
+    fn engine_with(
+        mut cfg: RulesConfig,
+    ) -> (Arc<Engine>, tokio::sync::mpsc::Receiver<EngineOutput>) {
         let (tx, rx) = mpsc::channel(64);
         let procs = Arc::new(ProcTable::new());
         procs.bootstrap_insert(ProcTable::test_identity(
@@ -566,7 +628,13 @@ mod tests {
             Some("zcode"),
         ));
         let rules = Arc::new(ArcSwap::from_pointee(RulesSnapshot::compile(&cfg).unwrap()));
-        let eng = Engine::new(procs, Arc::new(ConnRegistry::new()), rules, tx, Arc::new(EngineStats::default()));
+        let eng = Engine::new(
+            procs,
+            Arc::new(ConnRegistry::new()),
+            rules,
+            tx,
+            Arc::new(EngineStats::default()),
+        );
         (Arc::new(eng), rx)
     }
 
@@ -583,7 +651,9 @@ mod tests {
     }
 
     fn kill_count(out: &[EngineOutput]) -> usize {
-        out.iter().filter(|o| matches!(o, EngineOutput::Kill { .. })).count()
+        out.iter()
+            .filter(|o| matches!(o, EngineOutput::Kill { .. }))
+            .count()
     }
 
     fn block_verdict_count(out: &[EngineOutput]) -> usize {
@@ -601,11 +671,15 @@ mod tests {
     fn 创建_git_注入面_默认阻断不杀() {
         for p in ["D:/repo/.git/hooks/pre-commit", "D:/repo/.git/config"] {
             let (eng, mut rx) = engine();
-            eng.on_file_create(20812, Path::new(p), Timestamp(0)).unwrap();
+            eng.on_file_create(20812, Path::new(p), Timestamp(0))
+                .unwrap();
             let out = drain(&mut rx);
             assert_eq!(block_verdict_count(&out), 1, "{p}：应有 git-dir Block 判定");
             assert_eq!(kill_count(&out), 0, "{p}：默认不得杀进程");
-            assert!(out.iter().any(|o| matches!(o, EngineOutput::Notify { .. })), "{p}：应有通知");
+            assert!(
+                out.iter().any(|o| matches!(o, EngineOutput::Notify { .. })),
+                "{p}：应有通知"
+            );
         }
     }
 
@@ -615,7 +689,12 @@ mod tests {
         let mut cfg = RulesConfig::default();
         cfg.git_dir_kill = true;
         let (eng, mut rx) = engine_with(cfg);
-        eng.on_file_create(20812, Path::new("D:/repo/.git/hooks/pre-commit"), Timestamp(0)).unwrap();
+        eng.on_file_create(
+            20812,
+            Path::new("D:/repo/.git/hooks/pre-commit"),
+            Timestamp(0),
+        )
+        .unwrap();
         let out = drain(&mut rx);
         assert_eq!(kill_count(&out), 1);
         assert_eq!(block_verdict_count(&out), 1);
@@ -625,7 +704,12 @@ mod tests {
     #[test]
     fn 打开_git_注入面_默认不杀_kil开启则杀() {
         let (eng, mut rx) = engine();
-        eng.on_file_open(20812, Path::new("D:/repo/.git/hooks/pre-commit"), hg_model::Access::Read).unwrap();
+        eng.on_file_open(
+            20812,
+            Path::new("D:/repo/.git/hooks/pre-commit"),
+            hg_model::Access::Read,
+        )
+        .unwrap();
         let out = drain(&mut rx);
         assert_eq!(block_verdict_count(&out), 1);
         assert_eq!(kill_count(&out), 0);
@@ -633,7 +717,12 @@ mod tests {
         let mut cfg = RulesConfig::default();
         cfg.git_dir_kill = true;
         let (eng, mut rx) = engine_with(cfg);
-        eng.on_file_open(20812, Path::new("D:/repo/.git/hooks/pre-commit"), hg_model::Access::Read).unwrap();
+        eng.on_file_open(
+            20812,
+            Path::new("D:/repo/.git/hooks/pre-commit"),
+            hg_model::Access::Read,
+        )
+        .unwrap();
         let out = drain(&mut rx);
         assert_eq!(kill_count(&out), 1);
     }
@@ -642,7 +731,12 @@ mod tests {
     #[test]
     fn 创建_git_工作流面_放行且首见留痕() {
         let (eng, mut rx) = engine();
-        eng.on_file_create(20812, Path::new("D:/repo/.git/objects/1b/bdae002"), Timestamp(0)).unwrap();
+        eng.on_file_create(
+            20812,
+            Path::new("D:/repo/.git/objects/1b/bdae002"),
+            Timestamp(0),
+        )
+        .unwrap();
         let first = drain(&mut rx);
         assert_eq!(kill_count(&first), 0);
         assert!(first.iter().any(|o| matches!(
@@ -651,7 +745,8 @@ mod tests {
                 if v.rule_id.0 == "git-dir-workflow" && v.action == Action::Allow
         )));
         // 同 root 第二条工作流面访问：静默（防 status/diff 高频读写刷库）
-        eng.on_file_create(20812, Path::new("D:/repo/.git/HEAD.lock"), Timestamp(0)).unwrap();
+        eng.on_file_create(20812, Path::new("D:/repo/.git/HEAD.lock"), Timestamp(0))
+            .unwrap();
         let second = drain(&mut rx);
         assert!(second.is_empty());
     }
@@ -660,7 +755,12 @@ mod tests {
     #[test]
     fn 打开_git_工作流面_放行() {
         let (eng, mut rx) = engine();
-        eng.on_file_open(20812, Path::new("D:/repo/.git/config"), hg_model::Access::Read).unwrap();
+        eng.on_file_open(
+            20812,
+            Path::new("D:/repo/.git/config"),
+            hg_model::Access::Read,
+        )
+        .unwrap();
         let out = drain(&mut rx);
         assert_eq!(kill_count(&out), 0);
         assert!(out.iter().any(|o| matches!(
@@ -677,7 +777,8 @@ mod tests {
     fn 创建归档产物_阻断并杀进程() {
         for name in ["D:/tmp/out2.zip", "D:/tmp/repo.tar.gz", "D:/tmp/x.7z"] {
             let (eng, mut rx) = engine();
-            eng.on_file_create(20812, Path::new(name), Timestamp(0)).unwrap();
+            eng.on_file_create(20812, Path::new(name), Timestamp(0))
+                .unwrap();
             let out = drain(&mut rx);
             assert!(
                 out.iter().any(|o| matches!(
@@ -697,7 +798,8 @@ mod tests {
         let mut cfg = RulesConfig::default();
         cfg.archive_action = crate::rules::FileAction::Audit;
         let (eng, mut rx) = engine_with(cfg);
-        eng.on_file_create(20812, Path::new("D:/tmp/out.zip"), Timestamp(0)).unwrap();
+        eng.on_file_create(20812, Path::new("D:/tmp/out.zip"), Timestamp(0))
+            .unwrap();
         let out = drain(&mut rx);
         assert_eq!(kill_count(&out), 0);
         assert!(out.iter().any(|o| matches!(
@@ -730,11 +832,19 @@ mod tests {
     fn net_output_count(out: &[EngineOutput]) -> (usize, usize, usize) {
         // (net-threshold Block 判定, DropTcp, BlockIp)
         (
-            out.iter().filter(|o| matches!(o,
+            out.iter()
+                .filter(|o| {
+                    matches!(o,
                 EngineOutput::Verdict { verdict: v, .. }
-                    if v.rule_id.0 == "net-threshold" && v.action == Action::Block)).count(),
-            out.iter().filter(|o| matches!(o, EngineOutput::DropTcp { .. })).count(),
-            out.iter().filter(|o| matches!(o, EngineOutput::BlockIp { .. })).count(),
+                    if v.rule_id.0 == "net-threshold" && v.action == Action::Block)
+                })
+                .count(),
+            out.iter()
+                .filter(|o| matches!(o, EngineOutput::DropTcp { .. }))
+                .count(),
+            out.iter()
+                .filter(|o| matches!(o, EngineOutput::BlockIp { .. }))
+                .count(),
         )
     }
 
@@ -747,7 +857,11 @@ mod tests {
         conn_open(&eng, 7, "8.8.8.8:443");
         // 两笔累计 1.5MB：第一笔未超，第二笔越线触发
         eng.on_conn_tx(ConnId(7), 600 * 1024, Timestamp(0));
-        assert_eq!(net_output_count(&drain(&mut rx)), (0, 0, 0), "未超阈值不得处置");
+        assert_eq!(
+            net_output_count(&drain(&mut rx)),
+            (0, 0, 0),
+            "未超阈值不得处置"
+        );
         eng.on_conn_tx(ConnId(7), 900 * 1024, Timestamp(1));
         let (v, drop, block) = net_output_count(&drain(&mut rx));
         assert_eq!((v, drop, block), (1, 1, 1), "超阈值应出判定+断连+封IP");
@@ -760,7 +874,8 @@ mod tests {
         cfg.upload_threshold_mb = 1;
         let (eng, mut rx) = engine_with(cfg);
         conn_open(&eng, 8, "1.2.3.4:443");
-        eng.dns.insert("1.2.3.4".parse().unwrap(), "api.anthropic.com".into());
+        eng.dns
+            .insert("1.2.3.4".parse().unwrap(), "api.anthropic.com".into());
         eng.on_conn_tx(ConnId(8), 5 * 1024 * 1024, Timestamp(0)); // 5MB 远超 1MB
         let out = drain(&mut rx);
         assert!(out.is_empty(), "白名单端点大流量也不得触发处置");

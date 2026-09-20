@@ -56,10 +56,7 @@ pub enum RawEvent {
         cwd: PathBuf,
     },
     /// 进程退出（身份表据此清理；pid + start_time 双匹配防误删复用 pid 的新进程）。
-    Exit {
-        pid: Pid,
-        start_time: StartTime,
-    },
+    Exit { pid: Pid, start_time: StartTime },
     /// 文件打开。Linux fanotify PERM 事件的同步判定对象；其余平台为事后观测。
     FileOpen {
         pid: Pid,
@@ -88,9 +85,7 @@ pub enum RawEvent {
         bytes_out_delta: u64,
     },
     /// 连接关闭（ConnRegistry 汇总落库）。
-    ConnClose {
-        conn_id: ConnId,
-    },
+    ConnClose { conn_id: ConnId },
     /// DNS 查询与应答（域名→IP 关联，需求 §3.2）。
     DnsQuery {
         pid: Pid,

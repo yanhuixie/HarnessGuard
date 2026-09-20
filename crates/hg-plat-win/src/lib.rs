@@ -23,8 +23,8 @@ pub mod enforcer;
 pub mod estats;
 pub mod etw_source;
 pub mod lru;
-pub mod ntpath;
 pub mod notify;
+pub mod ntpath;
 pub mod peb;
 pub mod probe;
 pub mod runkey;
@@ -42,7 +42,9 @@ pub fn describe() -> &'static str {
 /// 当前进程令牌是否提权（TokenElevation；安装器前置检查用，M4 第二批）。
 pub fn is_elevated() -> bool {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     unsafe {
         let mut token = HANDLE(std::ptr::null_mut());

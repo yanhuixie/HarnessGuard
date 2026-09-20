@@ -94,15 +94,18 @@ fn init_service_logging() -> Option<tracing_appender::non_blocking::WorkerGuard>
         return None;
     };
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("[日志] 创建日志目录失败（{}）：{e}，日志回落 stderr", dir.display());
+        eprintln!(
+            "[日志] 创建日志目录失败（{}）：{e}，日志回落 stderr",
+            dir.display()
+        );
         fallback_stderr();
         return None;
     }
     cleanup_old_logs(&dir, LOG_KEEP_DAYS);
     let appender = tracing_appender::rolling::daily(&dir, "harnessguard.log");
     let (writer, guard) = tracing_appender::non_blocking(appender);
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info".into());
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     tracing_subscriber::fmt()
         .with_writer(writer)
         .with_ansi(false) // 文件输出无 ANSI 转义
@@ -118,7 +121,9 @@ const LOG_KEEP_DAYS: i64 = 14;
 /// 清理过期轮转日志（按文件名日期判定；非本命名模式的文件不动）。
 fn cleanup_old_logs(dir: &std::path::Path, keep_days: i64) {
     let today = days_from_civil(today_ymd());
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if log_stale(&name, today, keep_days).unwrap_or(false) {
@@ -205,8 +210,13 @@ pub(crate) fn run_server(
     let args: Vec<String> = std::env::args().skip(1).collect();
     const MODES: [&str; 4] = ["run", "service", "install", "uninstall"];
     let cfg_path = PathBuf::from(match args.first().map(|s| s.as_str()) {
-        Some(m) if MODES.contains(&m) => args.get(1).cloned().unwrap_or_else(|| "config.toml".into()),
-        _ => args.first().cloned().unwrap_or_else(|| "config.toml".into()),
+        Some(m) if MODES.contains(&m) => {
+            args.get(1).cloned().unwrap_or_else(|| "config.toml".into())
+        }
+        _ => args
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "config.toml".into()),
     });
     let cfg = if cfg_path.exists() {
         FileConfig::load(&cfg_path)?
@@ -233,7 +243,8 @@ pub(crate) fn run_server(
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<EngineOutput>(4096);
     let (store_tx, store_rx) = std::sync::mpsc::channel::<StoreOp>();
     let (sse_tx, _) = tokio::sync::broadcast::channel::<hg_web::SseEvent>(1024);
-    let writer_handle = hg_store::writer::spawn_writer(&db_path, store_rx, cfg.storage.retention_days);
+    let writer_handle =
+        hg_store::writer::spawn_writer(&db_path, store_rx, cfg.storage.retention_days);
 
     // 平台事件源（Windows ETW）+ 持久化轮询
     let inner = hg_plat_win::EtwInner::new(procs.clone(), src_stats.clone());
@@ -304,8 +315,9 @@ pub(crate) fn run_server(
         // 服务模式（Session 0 无控制台，println 无人可见）：token 落 exe 目录
         // web-token.txt（评审修正：否则服务化后每次重启 token 随机且无处获取；
         // 文件 ACL 收紧入 M4 待修清单）
-        if let Some(dir) =
-            std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        if let Some(dir) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         {
             let p = dir.join("web-token.txt");
             match std::fs::write(&p, format!("{token}\n")) {
@@ -314,7 +326,9 @@ pub(crate) fn run_server(
                     // 覆盖旧版仅管理员收紧态（特权进程持 WRITE_DAC），
                     // 非提权用户可直接读取取用
                     if let Err(e) = hg_plat_win::acl::protect_file(&p) {
-                        tracing::error!("web-token.txt DACL 应用失败：{e:#}（文件可能仅管理员可读）");
+                        tracing::error!(
+                            "web-token.txt DACL 应用失败：{e:#}（文件可能仅管理员可读）"
+                        );
                     }
                     tracing::info!("服务模式：Web token 已写入 {}（Users 可读）", p.display());
                 }
@@ -324,8 +338,7 @@ pub(crate) fn run_server(
     }
     let bind = cfg.web.bind.clone();
     // 自保护自检目标（cfg_path 随 AppState 移动，先克隆；db 取实际配置路径）
-    let guard_files_seed: Vec<PathBuf> =
-        vec![cfg_path.clone(), PathBuf::from(&db_path)];
+    let guard_files_seed: Vec<PathBuf> = vec![cfg_path.clone(), PathBuf::from(&db_path)];
     let state = Arc::new(hg_web::AppState {
         expected_host: bind.clone(),
         token: token.clone(),
@@ -358,15 +371,18 @@ pub(crate) fn run_server(
         println!("==================================================================");
     } else {
         // token 不落日志（日志文件在未保护目录，防泄漏；token 见 web-token.txt）
-        tracing::info!("HarnessGuard 服务模式已启动，Web UI：http://{bind}/（token 见安装目录 web-token.txt）");
+        tracing::info!(
+            "HarnessGuard 服务模式已启动，Web UI：http://{bind}/（token 见安装目录 web-token.txt）"
+        );
         // 自保护自检（§8.2 / 待修 11）：配置/库/token（含 db WAL 衍生文件）
         // 未保护则告警并自愈应用（拍板 14 口径：管理员全控 + Users 只读，
         // 覆盖 install 后首次启动新建的文件与旧版仅管理员收紧态）
         let mut guard_files = guard_files_seed.clone();
         guard_files.push(PathBuf::from(format!("{db_path}-wal")));
         guard_files.push(PathBuf::from(format!("{db_path}-shm")));
-        if let Some(dir) =
-            std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        if let Some(dir) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         {
             guard_files.push(dir.join("web-token.txt"));
         }
@@ -416,7 +432,12 @@ fn execute(
     sse: &tokio::sync::broadcast::Sender<hg_web::SseEvent>,
 ) {
     match out {
-        EngineOutput::Verdict { ts, pid, exe, verdict } => {
+        EngineOutput::Verdict {
+            ts,
+            pid,
+            exe,
+            verdict,
+        } => {
             // SSE 推送（技术设计 §7：无订阅者时发送即弃；ts 为 UTC 毫秒，与轮询行同构）
             let _ = sse.send(hg_web::SseEvent {
                 event: "verdict",
@@ -444,7 +465,11 @@ fn execute(
                 notified: 0,
             });
         }
-        EngineOutput::Kill { pid, start_time, reason } => {
+        EngineOutput::Kill {
+            pid,
+            start_time,
+            reason,
+        } => {
             stats.kills.fetch_add(1, Relaxed);
             tracing::warn!("[处置] 杀进程 {pid}：{reason}");
             if let Err(e) = enforcer.kill_process(pid, start_time) {
@@ -468,7 +493,12 @@ fn execute(
         EngineOutput::Notify { title, body } => {
             notifier.notify(&title, &body);
         }
-        EngineOutput::StoreEvent { ts, kind, pid, detail } => {
+        EngineOutput::StoreEvent {
+            ts,
+            kind,
+            pid,
+            detail,
+        } => {
             // SSE 推送审计事件（事件流页实时刷新；数据与 /api/events 行同构减 id）
             let _ = sse.send(hg_web::SseEvent {
                 event: "audit",
@@ -488,7 +518,14 @@ fn execute(
                 detail: detail.to_string(),
             });
         }
-        EngineOutput::StoreProcess { pid, start_ts, exe, cmdline, harness_root, exit_ts } => {
+        EngineOutput::StoreProcess {
+            pid,
+            start_ts,
+            exe,
+            cmdline,
+            harness_root,
+            exit_ts,
+        } => {
             let _ = store.send(StoreOp::Process {
                 pid: pid as i64,
                 start_ts: start_ts as i64,
@@ -498,7 +535,16 @@ fn execute(
                 exit_ts: exit_ts.map(|t| t as i64),
             });
         }
-        EngineOutput::StoreConn { conn_id, pid, harness_root, remote, proto, bytes_out, opened_ts, closed_ts } => {
+        EngineOutput::StoreConn {
+            conn_id,
+            pid,
+            harness_root,
+            remote,
+            proto,
+            bytes_out,
+            opened_ts,
+            closed_ts,
+        } => {
             let _ = store.send(StoreOp::Conn {
                 conn_id: format!("c{}", conn_id.0),
                 pid: pid as i64,
@@ -550,14 +596,29 @@ mod tests {
     #[test]
     fn 日志过期判定矩阵() {
         let today = days_from_civil((2026, 9, 20));
-        assert_eq!(log_stale("harnessguard.log.2026-09-20", today, 14), Some(false));
-        assert_eq!(log_stale("harnessguard.log.2026-09-06", today, 14), Some(false), "恰好 14 天：保留");
-        assert_eq!(log_stale("harnessguard.log.2026-09-05", today, 14), Some(true), "超过 14 天：清理");
+        assert_eq!(
+            log_stale("harnessguard.log.2026-09-20", today, 14),
+            Some(false)
+        );
+        assert_eq!(
+            log_stale("harnessguard.log.2026-09-06", today, 14),
+            Some(false),
+            "恰好 14 天：保留"
+        );
+        assert_eq!(
+            log_stale("harnessguard.log.2026-09-05", today, 14),
+            Some(true),
+            "超过 14 天：清理"
+        );
         // 非本命名模式 / 非法日期：不动
         assert_eq!(log_stale("harnessguard.log", today, 14), None);
         assert_eq!(log_stale("other.log.2020-01-01", today, 14), None);
         assert_eq!(log_stale("harnessguard.log.2026-13-01", today, 14), None);
         assert_eq!(log_stale("harnessguard.log.2026-09", today, 14), None);
-        assert_eq!(log_stale("harnessguard.log.0000-01-01", today, 14), None, "年份越界不动");
+        assert_eq!(
+            log_stale("harnessguard.log.0000-01-01", today, 14),
+            None,
+            "年份越界不动"
+        );
     }
 }

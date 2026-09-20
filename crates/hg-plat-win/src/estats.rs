@@ -203,8 +203,8 @@ enum ReadOutcome {
 /// 读一条连接的 DataBytesOut 累计值；`enable_first` 时先开启 Data 采集。
 fn read_bytes_out(local: &SocketAddr, remote: &SocketAddr, enable_first: bool) -> ReadOutcome {
     use windows::Win32::NetworkManagement::IpHelper::{
-        GetPerTcp6ConnectionEStats, GetPerTcpConnectionEStats, MIB_TCP_STATE_ESTAB,
-        SetPerTcp6ConnectionEStats, SetPerTcpConnectionEStats, TcpConnectionEstatsData,
+        GetPerTcp6ConnectionEStats, GetPerTcpConnectionEStats, SetPerTcp6ConnectionEStats,
+        SetPerTcpConnectionEStats, TcpConnectionEstatsData, MIB_TCP_STATE_ESTAB,
     };
     // TCP_ESTATS_DATA_RW_v1 { BOOLEAN EnableCollection }；
     // ROD v1（评审修正：4 字段 24 字节）：DataBytesOut(8) + DataBytesIn(8)
@@ -214,13 +214,18 @@ fn read_bytes_out(local: &SocketAddr, remote: &SocketAddr, enable_first: bool) -
     unsafe {
         match (local.ip(), remote.ip()) {
             (std::net::IpAddr::V4(_), std::net::IpAddr::V4(_)) => {
-                let quad = hg_model::TcpQuad { local: *local, remote: *remote };
-                let Ok(row) = crate::enforcer::build_tcp_row_v4(&quad, MIB_TCP_STATE_ESTAB.0 as u32)
+                let quad = hg_model::TcpQuad {
+                    local: *local,
+                    remote: *remote,
+                };
+                let Ok(row) =
+                    crate::enforcer::build_tcp_row_v4(&quad, MIB_TCP_STATE_ESTAB.0 as u32)
                 else {
                     return ReadOutcome::Transient;
                 };
                 if enable_first {
-                    let src = SetPerTcpConnectionEStats(&row, TcpConnectionEstatsData, &rw_enable, 1, 0);
+                    let src =
+                        SetPerTcpConnectionEStats(&row, TcpConnectionEstatsData, &rw_enable, 1, 0);
                     if src != 0 {
                         // 复验定案 2：本机 Set 即 rc=50（NOT_SUPPORTED）——采集未开启，
                         // Get 无意义，降级该连接（调用方标记后跳过后续轮询）
@@ -230,20 +235,26 @@ fn read_bytes_out(local: &SocketAddr, remote: &SocketAddr, enable_first: bool) -
                 let rc = GetPerTcpConnectionEStats(
                     &row,
                     TcpConnectionEstatsData,
-                    None, 0,
-                    None, 0,
-                    Some(&mut rod), 1,
+                    None,
+                    0,
+                    None,
+                    0,
+                    Some(&mut rod),
+                    1,
                 );
                 estats_out(rc, &rod)
             }
             (std::net::IpAddr::V6(_), std::net::IpAddr::V6(_)) => {
-                let quad = hg_model::TcpQuad { local: *local, remote: *remote };
-                let Ok(row) = crate::enforcer::build_tcp_row_v6(&quad, MIB_TCP_STATE_ESTAB)
-                else {
+                let quad = hg_model::TcpQuad {
+                    local: *local,
+                    remote: *remote,
+                };
+                let Ok(row) = crate::enforcer::build_tcp_row_v6(&quad, MIB_TCP_STATE_ESTAB) else {
                     return ReadOutcome::Transient;
                 };
                 if enable_first {
-                    let src = SetPerTcp6ConnectionEStats(&row, TcpConnectionEstatsData, &rw_enable, 1, 0);
+                    let src =
+                        SetPerTcp6ConnectionEStats(&row, TcpConnectionEstatsData, &rw_enable, 1, 0);
                     if src != 0 {
                         return ReadOutcome::SetFailed(src);
                     }
@@ -251,9 +262,12 @@ fn read_bytes_out(local: &SocketAddr, remote: &SocketAddr, enable_first: bool) -
                 let rc = GetPerTcp6ConnectionEStats(
                     &row,
                     TcpConnectionEstatsData,
-                    None, 0,
-                    None, 0,
-                    Some(&mut rod), 1,
+                    None,
+                    0,
+                    None,
+                    0,
+                    Some(&mut rod),
+                    1,
                 );
                 estats_out(rc, &rod)
             }
@@ -340,7 +354,10 @@ mod tests {
         let mut g = EstatsGate::default();
         g.on_set_failed(1);
         g.on_gone(1);
-        assert!(matches!(g.plan(1), PollPlan::EnableAndRead), "四元组复用的新连接重新尝试");
+        assert!(
+            matches!(g.plan(1), PollPlan::EnableAndRead),
+            "四元组复用的新连接重新尝试"
+        );
     }
 
     #[test]
@@ -348,7 +365,10 @@ mod tests {
         let mut g = EstatsGate::default();
         g.on_read_ok(1);
         g.on_transient(1);
-        assert!(matches!(g.plan(1), PollPlan::EnableAndRead), "Set 重开而非直接读");
+        assert!(
+            matches!(g.plan(1), PollPlan::EnableAndRead),
+            "Set 重开而非直接读"
+        );
         assert!(!matches!(g.plan(1), PollPlan::Skip), "暂时性失败不降级");
     }
 
@@ -360,9 +380,15 @@ mod tests {
         g.on_set_failed(3);
         let live: std::collections::HashSet<u64> = [2u64, 3u64].into_iter().collect();
         g.retain_live(&live);
-        assert!(matches!(g.plan(1), PollPlan::EnableAndRead), "已消失连接的降级标记被清，复用重试");
+        assert!(
+            matches!(g.plan(1), PollPlan::EnableAndRead),
+            "已消失连接的降级标记被清，复用重试"
+        );
         assert!(matches!(g.plan(2), PollPlan::Read), "存活连接不受影响");
-        assert!(matches!(g.plan(3), PollPlan::Skip), "存活且降级的连接保持 Skip");
+        assert!(
+            matches!(g.plan(3), PollPlan::Skip),
+            "存活且降级的连接保持 Skip"
+        );
     }
 
     #[test]

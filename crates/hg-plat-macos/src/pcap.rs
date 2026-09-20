@@ -26,11 +26,21 @@ struct pcap_pkthdr {
 }
 
 extern "C" {
-    fn pcap_open_live(device: *const libc::c_char, snaplen: libc::c_int,
-                      promisc: libc::c_int, to_ms: libc::c_int, errbuf: *mut libc::c_char) -> pcap_t;
+    fn pcap_open_live(
+        device: *const libc::c_char,
+        snaplen: libc::c_int,
+        promisc: libc::c_int,
+        to_ms: libc::c_int,
+        errbuf: *mut libc::c_char,
+    ) -> pcap_t;
     fn pcap_setdirection(p: pcap_t, d: libc::c_int) -> libc::c_int; // 1=PCAP_D_IN（仅收方向）
-    fn pcap_compile(p: pcap_t, fp: *mut core::ffi::c_void, str_: *const libc::c_char,
-                    optimize: libc::c_int, netmask: bpf_u_int32) -> libc::c_int;
+    fn pcap_compile(
+        p: pcap_t,
+        fp: *mut core::ffi::c_void,
+        str_: *const libc::c_char,
+        optimize: libc::c_int,
+        netmask: bpf_u_int32,
+    ) -> libc::c_int;
     fn pcap_setfilter(p: pcap_t, fp: *mut core::ffi::c_void) -> libc::c_int;
     fn pcap_next_ex(p: pcap_t, hdr: *mut *mut pcap_pkthdr, data: *mut *const u8) -> libc::c_int;
     fn pcap_close(p: pcap_t);
@@ -50,14 +60,23 @@ mod dashmap_like {
     use std::sync::Mutex;
     pub struct DashSetU64(Mutex<std::collections::HashSet<u64>>);
     impl DashSetU64 {
-        pub fn new() -> Self { Self(Mutex::new(std::collections::HashSet::new())) }
-        pub fn insert(&self, v: u64) -> bool { self.0.lock().unwrap().insert(v) }
+        pub fn new() -> Self {
+            Self(Mutex::new(std::collections::HashSet::new()))
+        }
+        pub fn insert(&self, v: u64) -> bool {
+            self.0.lock().unwrap().insert(v)
+        }
     }
 }
 
 impl PcapSource {
     pub fn new(tx: mpsc::Sender<Envelope>) -> Self {
-        Self { tx, base: std::time::Instant::now(), quad_pid: Mutex::new(HashMap::new()), emitted: dashmap_like::DashSetU64::new() }
+        Self {
+            tx,
+            base: std::time::Instant::now(),
+            quad_pid: Mutex::new(HashMap::new()),
+            emitted: dashmap_like::DashSetU64::new(),
+        }
     }
 
     fn now(&self) -> Timestamp {
@@ -70,9 +89,10 @@ impl PcapSource {
         let dev_c = CString::new(device)?;
         let p = unsafe { pcap_open_live(dev_c.as_ptr(), 128, 0, 100, errbuf.as_mut_ptr()) };
         if p.is_null() {
-            return Err(anyhow::anyhow!("pcap_open_live({device}) 失败：{}", unsafe {
-                CStr::from_ptr(errbuf.as_ptr()).to_string_lossy()
-            }));
+            return Err(anyhow::anyhow!(
+                "pcap_open_live({device}) 失败：{}",
+                unsafe { CStr::from_ptr(errbuf.as_ptr()).to_string_lossy() }
+            ));
         }
         unsafe {
             pcap_setdirection(p, 1);
@@ -91,7 +111,12 @@ impl PcapSource {
                 std::thread::sleep(Duration::from_millis(20));
                 continue;
             }
-            let (hdr, bytes) = unsafe { (&*hdr, std::slice::from_raw_parts(data, (*hdr).caplen as usize)) };
+            let (hdr, bytes) = unsafe {
+                (
+                    &*hdr,
+                    std::slice::from_raw_parts(data, (*hdr).caplen as usize),
+                )
+            };
             let _ = hdr;
             self.on_packet(bytes);
         }
@@ -99,7 +124,11 @@ impl PcapSource {
 
     fn on_packet(&self, b: &[u8]) {
         // 链路层类型默认 EN10MB(1)：14B 头；BPF 设备回环为 NULL(0)：4B 头——按首 2 字节嗅探
-        let ip_off = if b.len() > 14 && b[12] == 0x08 && b[13] == 0 { 14 } else { 4 };
+        let ip_off = if b.len() > 14 && b[12] == 0x08 && b[13] == 0 {
+            14
+        } else {
+            4
+        };
         let (src, dst, proto, l4) = match parse_ip(&b[ip_off..]) {
             Some(x) => x,
             None => return,
@@ -115,17 +144,33 @@ impl PcapSource {
                 let local = SocketAddr::new(src, sport);
                 let remote = SocketAddr::new(dst, dport);
                 let id = conn_hash(local, remote);
-                let pid = self.quad_pid.lock().unwrap().get(&(local, remote)).copied().unwrap_or(0);
+                let pid = self
+                    .quad_pid
+                    .lock()
+                    .unwrap()
+                    .get(&(local, remote))
+                    .copied()
+                    .unwrap_or(0);
                 if self.emitted.insert(id) && pid != 0 {
                     let _ = self.tx.try_send(Envelope::new(
                         self.now(),
-                        RawEvent::ConnOpen { pid, start_time: Default::default(), conn_id: ConnId(id), proto: Proto::Tcp, local, remote },
+                        RawEvent::ConnOpen {
+                            pid,
+                            start_time: Default::default(),
+                            conn_id: ConnId(id),
+                            proto: Proto::Tcp,
+                            local,
+                            remote,
+                        },
                     ));
                 }
                 if payload_len > 0 {
                     let _ = self.tx.try_send(Envelope::new(
                         self.now(),
-                        RawEvent::ConnTx { conn_id: ConnId(id), bytes_out_delta: payload_len as u64 },
+                        RawEvent::ConnTx {
+                            conn_id: ConnId(id),
+                            bytes_out_delta: payload_len as u64,
+                        },
                     ));
                 }
             }
@@ -134,7 +179,11 @@ impl PcapSource {
                     if is_response {
                         let _ = self.tx.try_send(Envelope::new(
                             self.now(),
-                            RawEvent::DnsQuery { pid: 0, qname, answers },
+                            RawEvent::DnsQuery {
+                                pid: 0,
+                                qname,
+                                answers,
+                            },
                         ));
                     }
                 }
@@ -156,7 +205,11 @@ impl PcapSource {
                 for line in text.lines() {
                     let (k, v) = line.split_at(1);
                     match k {
-                        "p" => { pid = v.parse().unwrap_or(0); l = None; r = None; }
+                        "p" => {
+                            pid = v.parse().unwrap_or(0);
+                            l = None;
+                            r = None;
+                        }
                         "c" => {}
                         "n" => {
                             // "local->remote"
@@ -197,13 +250,17 @@ fn parse_ip(b: &[u8]) -> Option<(IpAddr, IpAddr, u8, &[u8])> {
     match b[0] >> 4 {
         4 => {
             let ihl = ((b[0] & 0x0f) as usize) * 4;
-            if b.len() < ihl + 20 { return None; }
+            if b.len() < ihl + 20 {
+                return None;
+            }
             let src = IpAddr::from([b[12], b[13], b[14], b[15]]);
             let dst = IpAddr::from([b[16], b[17], b[18], b[19]]);
             Some((src, dst, b[9], &b[ihl..]))
         }
         6 => {
-            if b.len() < 40 + 20 { return None; }
+            if b.len() < 40 + 20 {
+                return None;
+            }
             let mut a = [0u8; 16];
             a.copy_from_slice(&b[8..24]);
             let src = IpAddr::from(a);
@@ -216,7 +273,9 @@ fn parse_ip(b: &[u8]) -> Option<(IpAddr, IpAddr, u8, &[u8])> {
 }
 
 fn parse_tcp(b: &[u8]) -> Option<(u16, u16, usize)> {
-    if b.len() < 20 { return None; }
+    if b.len() < 20 {
+        return None;
+    }
     let sport = u16::from_be_bytes([b[0], b[1]]);
     let dport = u16::from_be_bytes([b[2], b[3]]);
     let doff = ((b[12] >> 4) as usize) * 4;
@@ -224,7 +283,9 @@ fn parse_tcp(b: &[u8]) -> Option<(u16, u16, usize)> {
 }
 
 fn parse_dns_udp(b: &[u8]) -> Option<(String, Vec<IpAddr>, bool)> {
-    if b.len() < 8 + 12 { return None; }
+    if b.len() < 8 + 12 {
+        return None;
+    }
     let p = &b[8..];
     let qr = p[2] & 0x80 != 0;
     let qd = u16::from_be_bytes([p[4], p[5]]) as usize;
@@ -235,9 +296,15 @@ fn parse_dns_udp(b: &[u8]) -> Option<(String, Vec<IpAddr>, bool)> {
         loop {
             let l = *p.get(off)? as usize;
             off += 1;
-            if l == 0 { break; }
-            if l & 0xC0 != 0 { return None; }
-            if !qname.is_empty() { qname.push('.'); }
+            if l == 0 {
+                break;
+            }
+            if l & 0xC0 != 0 {
+                return None;
+            }
+            if !qname.is_empty() {
+                qname.push('.');
+            }
             qname.push_str(&String::from_utf8_lossy(p.get(off..off + l)?));
             off += l;
         }
@@ -247,16 +314,25 @@ fn parse_dns_udp(b: &[u8]) -> Option<(String, Vec<IpAddr>, bool)> {
     for _ in 0..an {
         let l = *p.get(off)? as usize;
         off += 1;
-        if l & 0xC0 != 0 { off += 1; } else {
+        if l & 0xC0 != 0 {
+            off += 1;
+        } else {
             let mut ll = l;
-            while ll != 0 { off += ll; ll = *p.get(off)? as usize; off += 1; }
+            while ll != 0 {
+                off += ll;
+                ll = *p.get(off)? as usize;
+                off += 1;
+            }
         }
         let rtype = u16::from_be_bytes([*p.get(off)?, *p.get(off + 1)?]);
         let rdlen = u16::from_be_bytes([*p.get(off + 8)?, *p.get(off + 9)?]) as usize;
         let rd = off + 10;
         match (rtype, rdlen) {
             (1, 4) => answers.push(IpAddr::from([
-                *p.get(rd)?, *p.get(rd + 1)?, *p.get(rd + 2)?, *p.get(rd + 3)?,
+                *p.get(rd)?,
+                *p.get(rd + 1)?,
+                *p.get(rd + 2)?,
+                *p.get(rd + 3)?,
             ])),
             (28, 16) => {
                 let mut a = [0u8; 16];

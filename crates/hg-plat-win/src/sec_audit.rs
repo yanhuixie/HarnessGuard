@@ -44,7 +44,9 @@ struct SecAuditCtx {
 /// 启动 Security 4663 订阅线程（由 hg-app 装配，仅 [file_audit].enabled 时调用）。
 pub fn spawn_sec_audit(inner: Arc<EtwInner>, watch_paths: Vec<String>) {
     if watch_paths.is_empty() {
-        tracing::warn!("[file-audit] watch_paths 为空，4663 订阅不启动（配置见 config.toml [file_audit]）");
+        tracing::warn!(
+            "[file-audit] watch_paths 为空，4663 订阅不启动（配置见 config.toml [file_audit]）"
+        );
         return;
     }
     let watch: Vec<String> = watch_paths
@@ -58,7 +60,10 @@ pub fn spawn_sec_audit(inner: Arc<EtwInner>, watch_paths: Vec<String>) {
             // 裸指针须在线程闭包内构造（跨线程移动裸指针不 Send）
             let ctx =
                 Box::into_raw(Box::new(SecAuditCtx { inner, watch })) as *const core::ffi::c_void;
-            let channel: Vec<u16> = "Security".encode_utf16().chain(std::iter::once(0)).collect();
+            let channel: Vec<u16> = "Security"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
             let query: Vec<u16> = "*[System[EventID=4663]]"
                 .encode_utf16()
                 .chain(std::iter::once(0))
@@ -86,7 +91,9 @@ pub fn spawn_sec_audit(inner: Arc<EtwInner>, watch_paths: Vec<String>) {
                 Err(e) => {
                     // 订阅失败：回收回调上下文（线程即将退出——评审 L-7）
                     drop(unsafe { Box::from_raw(ctx as *mut SecAuditCtx) });
-                    tracing::error!("[file-audit] Security 订阅失败（需管理员或 Event Log Readers）：{e}");
+                    tracing::error!(
+                        "[file-audit] Security 订阅失败（需管理员或 Event Log Readers）：{e}"
+                    );
                 }
             }
         })
@@ -152,10 +159,14 @@ fn handle_4663(ctx: &SecAuditCtx, xml: &str) {
     if !ctx.watch.iter().any(|w| path_watch_hit(&path_str, w)) {
         // 复验诊断：watch 外事件量可能极大（全系统文件审计开启时），
         // 采样输出首条不匹配路径定位前缀归一问题
-        tracing::debug!("[file-audit] 4663 前缀不匹配：{path_str}（watch={:?}）", ctx.watch);
+        tracing::debug!(
+            "[file-audit] 4663 前缀不匹配：{path_str}（watch={:?}）",
+            ctx.watch
+        );
         return;
     }
-    ctx.inner.emit_file_event(pid, op, &path.display().to_string());
+    ctx.inner
+        .emit_file_event(pid, op, &path.display().to_string());
     tracing::debug!("[file-audit] 4663 pid={pid} op={op} {path_str}");
 }
 
@@ -167,17 +178,24 @@ fn path_watch_hit(path: &str, watch: &str) -> bool {
 
 /// 解析 4663 XML 的 (pid, opcode, NT 路径)。ProcessId/AccessMask 为 0x 前缀十六进制。
 fn parse_4663(xml: &str) -> Option<(u32, u8, std::path::PathBuf)> {
-    let pid = u32::from_str_radix(xml_field(xml, "ProcessId")?.trim_start_matches("0x"), 16).ok()?;
+    let pid =
+        u32::from_str_radix(xml_field(xml, "ProcessId")?.trim_start_matches("0x"), 16).ok()?;
     let obj = xml_field(xml, "ObjectName")?;
     if pid == 0 || obj.is_empty() {
         return None;
     }
     let mask = u32::from_str_radix(
-        xml_field(xml, "AccessMask").unwrap_or_default().trim_start_matches("0x"),
+        xml_field(xml, "AccessMask")
+            .unwrap_or_default()
+            .trim_start_matches("0x"),
         16,
     )
     .unwrap_or(0);
-    let op = if mask & WRITE_MASK != 0 { FILE_OP_WRITE } else { FILE_OP_READ };
+    let op = if mask & WRITE_MASK != 0 {
+        FILE_OP_WRITE
+    } else {
+        FILE_OP_READ
+    };
     Some((pid, op, nt_to_win32(&obj)))
 }
 
@@ -227,10 +245,16 @@ mod tests {
 
     #[test]
     fn xml字段提取与实体解码() {
-        assert_eq!(xml_field(SAMPLE, "ObjectName").unwrap(), r"\Device\HarddiskVolume4\work\repo\.git\config");
+        assert_eq!(
+            xml_field(SAMPLE, "ObjectName").unwrap(),
+            r"\Device\HarddiskVolume4\work\repo\.git\config"
+        );
         assert_eq!(xml_field(SAMPLE, "ProcessId").unwrap(), "0x1a2b");
         // 真实格式（单引号属性）双兼容——首版只匹配双引号，实机解析全败的回归锚定
-        assert_eq!(xml_field(SAMPLE_REAL, "ObjectName").unwrap(), r"\Device\HarddiskVolume4\work\repo\.git\config");
+        assert_eq!(
+            xml_field(SAMPLE_REAL, "ObjectName").unwrap(),
+            r"\Device\HarddiskVolume4\work\repo\.git\config"
+        );
         assert_eq!(xml_field(SAMPLE_REAL, "ProcessId").unwrap(), "0x1a2b");
         assert_eq!(xml_field(SAMPLE_REAL, "AccessMask").unwrap(), "0x2");
         assert!(parse_4663(SAMPLE_REAL).is_some(), "真实格式完整解析");
@@ -247,7 +271,10 @@ mod tests {
         assert_eq!(pid, 0x1a2b);
         assert_eq!(op, FILE_OP_WRITE, "AccessMask=0x2（写）");
         let nt = path.display().to_string();
-        assert!(nt.contains(".git"), "NT 路径已归一（设备名无映射时原样）：{nt}");
+        assert!(
+            nt.contains(".git"),
+            "NT 路径已归一（设备名无映射时原样）：{nt}"
+        );
         // 读掩码（0x1）→ Read；缺失 AccessMask 容错按读
         let read_xml = SAMPLE.replace("0x2</Data>", "0x1</Data>");
         assert_eq!(parse_4663(&read_xml).unwrap().1, FILE_OP_READ);
@@ -268,10 +295,16 @@ mod tests {
     fn 前缀过滤矩阵() {
         let watch = normalize_watch(r"D:\work\repo\.git");
         let hit = |p: &str| path_watch_hit(p, &watch);
-        assert!(hit("d:/work/repo/.git"), "目录本身命中（SACL 在目录上时 4663 亦上报目录访问）");
+        assert!(
+            hit("d:/work/repo/.git"),
+            "目录本身命中（SACL 在目录上时 4663 亦上报目录访问）"
+        );
         assert!(hit("d:/work/repo/.git/config"));
         assert!(hit("d:/work/repo/.git/objects/ab/cdef"));
-        assert!(!hit("d:/work/repo/.git-backup/config"), "分量边界：不误命中同名前缀目录");
+        assert!(
+            !hit("d:/work/repo/.git-backup/config"),
+            "分量边界：不误命中同名前缀目录"
+        );
         assert!(!hit("d:/other/.git/config"));
         assert!(!hit("d:/work/repo"));
     }

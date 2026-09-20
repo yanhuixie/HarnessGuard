@@ -38,7 +38,11 @@ pub fn spawn_persist_watch(tx: mpsc::Sender<Envelope>, base: std::time::Instant)
                 libc::inotify_add_watch(
                     fd,
                     format!("{dir}\0").as_ptr().cast(),
-                    libc::IN_CREATE | libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE | libc::IN_DELETE | libc::IN_MODIFY,
+                    libc::IN_CREATE
+                        | libc::IN_MOVED_TO
+                        | libc::IN_CLOSE_WRITE
+                        | libc::IN_DELETE
+                        | libc::IN_MODIFY,
                 )
             };
             if wd >= 0 {
@@ -58,15 +62,29 @@ pub fn spawn_persist_watch(tx: mpsc::Sender<Envelope>, base: std::time::Instant)
                 off += std::mem::size_of::<libc::inotify_event>() + ev.len as usize;
                 let name = String::from_utf8_lossy(unsafe {
                     std::slice::from_raw_parts(
-                        (ev as *const libc::inotify_event as *const u8).add(std::mem::size_of::<libc::inotify_event>()),
+                        (ev as *const libc::inotify_event as *const u8)
+                            .add(std::mem::size_of::<libc::inotify_event>()),
                         ev.len as usize,
                     )
                 })
                 .trim_end_matches('\0')
                 .to_string();
-                let Some(dir) = wd_map.get(&ev.wd) else { continue };
-                let kind = if dir.contains("cron") { PersistenceKind::Cron } else { PersistenceKind::LaunchAgent };
-                tracing::warn!("[持久化] {} 变更：{dir}/{name}", if kind == PersistenceKind::Cron { "cron" } else { "systemd unit" });
+                let Some(dir) = wd_map.get(&ev.wd) else {
+                    continue;
+                };
+                let kind = if dir.contains("cron") {
+                    PersistenceKind::Cron
+                } else {
+                    PersistenceKind::LaunchAgent
+                };
+                tracing::warn!(
+                    "[持久化] {} 变更：{dir}/{name}",
+                    if kind == PersistenceKind::Cron {
+                        "cron"
+                    } else {
+                        "systemd unit"
+                    }
+                );
                 let _ = tx.try_send(Envelope::new(
                     Timestamp(base.elapsed().as_millis() as u64),
                     RawEvent::Persistence {
@@ -99,10 +117,18 @@ fn run_poll_fallback(tx: mpsc::Sender<Envelope>, base: std::time::Instant) {
         let cur = snap(WATCH_DIRS);
         for c in &cur {
             if !prev.contains(c) {
-                let kind = if c.contains("cron") { PersistenceKind::Cron } else { PersistenceKind::LaunchAgent };
+                let kind = if c.contains("cron") {
+                    PersistenceKind::Cron
+                } else {
+                    PersistenceKind::LaunchAgent
+                };
                 let _ = tx.try_send(Envelope::new(
                     Timestamp(base.elapsed().as_millis() as u64),
-                    RawEvent::Persistence { pid: 0, kind, detail: format!("新增 {c}") },
+                    RawEvent::Persistence {
+                        pid: 0,
+                        kind,
+                        detail: format!("新增 {c}"),
+                    },
                 ));
             }
         }

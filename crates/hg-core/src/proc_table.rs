@@ -40,7 +40,9 @@ impl ProcTable {
         exe: &Path,
         cmdline: Vec<OsString>,
     ) -> Identity {
-        let own_root = rules.match_harness(exe).map(|name| HarnessId(name.to_string()));
+        let own_root = rules
+            .match_harness(exe)
+            .map(|name| HarnessId(name.to_string()));
         let inherited = own_root
             .is_none()
             .then(|| self.get(&ppid))
@@ -97,8 +99,15 @@ impl ProcTable {
                 if roots.get(pid).is_some_and(|r| r.is_some()) {
                     continue;
                 }
-                let own = rules.match_harness(exe).map(|name| HarnessId(name.to_string()));
-                let inherited = own.is_none().then(|| roots.get(ppid)).flatten().cloned().flatten();
+                let own = rules
+                    .match_harness(exe)
+                    .map(|name| HarnessId(name.to_string()));
+                let inherited = own
+                    .is_none()
+                    .then(|| roots.get(ppid))
+                    .flatten()
+                    .cloned()
+                    .flatten();
                 let next = own.or(inherited);
                 if next.is_some() {
                     roots.insert(*pid, next);
@@ -175,7 +184,14 @@ mod tests {
     fn exe_命中特征库自成监控根() {
         let t = ProcTable::new();
         let rules = snapshot();
-        let id = t.apply_exec(&rules, 10, 1, StartTime(100), Path::new("C:/apps/testharness.exe"), vec![]);
+        let id = t.apply_exec(
+            &rules,
+            10,
+            1,
+            StartTime(100),
+            Path::new("C:/apps/testharness.exe"),
+            vec![],
+        );
         assert_eq!(id.harness_root.as_ref().unwrap().0, "test-harness");
     }
 
@@ -184,11 +200,32 @@ mod tests {
         let t = ProcTable::new();
         let rules = snapshot();
         // harness → cmd.exe（未命中特征库，纯继承）
-        t.apply_exec(&rules, 10, 1, StartTime(100), Path::new("C:/apps/testharness.exe"), vec![]);
-        let id = t.apply_exec(&rules, 11, 10, StartTime(110), Path::new("C:/Windows/system32/cmd.exe"), vec![]);
+        t.apply_exec(
+            &rules,
+            10,
+            1,
+            StartTime(100),
+            Path::new("C:/apps/testharness.exe"),
+            vec![],
+        );
+        let id = t.apply_exec(
+            &rules,
+            11,
+            10,
+            StartTime(110),
+            Path::new("C:/Windows/system32/cmd.exe"),
+            vec![],
+        );
         assert_eq!(id.harness_root.as_ref().unwrap().0, "test-harness");
         // 再嵌一层：cmd → node
-        let id2 = t.apply_exec(&rules, 12, 11, StartTime(120), Path::new("C:/node/node.exe"), vec![]);
+        let id2 = t.apply_exec(
+            &rules,
+            12,
+            11,
+            StartTime(120),
+            Path::new("C:/node/node.exe"),
+            vec![],
+        );
         assert_eq!(id2.harness_root.as_ref().unwrap().0, "test-harness");
     }
 
@@ -196,7 +233,14 @@ mod tests {
     fn git_子进程标记豁免且不脱离进程树() {
         let t = ProcTable::new();
         let rules = snapshot();
-        t.apply_exec(&rules, 10, 1, StartTime(100), Path::new("C:/apps/testharness.exe"), vec![]);
+        t.apply_exec(
+            &rules,
+            10,
+            1,
+            StartTime(100),
+            Path::new("C:/apps/testharness.exe"),
+            vec![],
+        );
         let id = t.apply_exec(
             &rules,
             11,
@@ -225,7 +269,14 @@ mod tests {
     fn 无关进程_无监控根() {
         let t = ProcTable::new();
         let rules = snapshot();
-        let id = t.apply_exec(&rules, 100, 99, StartTime(1), Path::new("C:/Windows/system32/notepad.exe"), vec![]);
+        let id = t.apply_exec(
+            &rules,
+            100,
+            99,
+            StartTime(1),
+            Path::new("C:/Windows/system32/notepad.exe"),
+            vec![],
+        );
         assert!(id.harness_root.is_none());
         assert!(id.tool_exempt.is_none());
     }

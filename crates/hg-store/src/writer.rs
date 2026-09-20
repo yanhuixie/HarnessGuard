@@ -12,11 +12,47 @@ use crate::open;
 
 #[derive(Debug)]
 pub enum StoreOp {
-    Event { ts: i64, pid: i64, start_ts: i64, kind: String, detail: String },
-    Verdict { ts: i64, rule_id: String, action: String, pid: i64, exe: String, evidence: String, notified: i64 },
-    Conn { conn_id: String, pid: i64, harness_root: String, remote_ip: String, remote_port: i64, proto: String, bytes_out: i64, opened_ts: i64, closed_ts: i64 },
-    Dns { qname: String, ip: String, pid: i64, ts: i64 },
-    Process { pid: i64, start_ts: i64, exe: String, cmdline: String, harness_root: String, exit_ts: Option<i64> },
+    Event {
+        ts: i64,
+        pid: i64,
+        start_ts: i64,
+        kind: String,
+        detail: String,
+    },
+    Verdict {
+        ts: i64,
+        rule_id: String,
+        action: String,
+        pid: i64,
+        exe: String,
+        evidence: String,
+        notified: i64,
+    },
+    Conn {
+        conn_id: String,
+        pid: i64,
+        harness_root: String,
+        remote_ip: String,
+        remote_port: i64,
+        proto: String,
+        bytes_out: i64,
+        opened_ts: i64,
+        closed_ts: i64,
+    },
+    Dns {
+        qname: String,
+        ip: String,
+        pid: i64,
+        ts: i64,
+    },
+    Process {
+        pid: i64,
+        start_ts: i64,
+        exe: String,
+        cmdline: String,
+        harness_root: String,
+        exit_ts: Option<i64>,
+    },
     /// 手动全量清理（Web UI"清空审计数据"入口）：与每日清理同一删除路径
     /// （技术设计 §4 拍板：唯一 DELETE 路径在写入线程，临时禁用触发器）。
     /// ack 回传删除总条数（写入线程已执行完毕才回）。
@@ -42,7 +78,11 @@ const DROP_TRIGGERS_SQL: &str = "DROP TRIGGER IF EXISTS tr_events_append; DROP T
 
 /// 启动写入线程（独占一个写连接；WAL 下读连接并发不受影响）。
 /// 返回 JoinHandle 供停机序列汇合冲刷（通道全闭后线程 flush 并退出）。
-pub fn spawn_writer(db_path: &str, rx: Receiver<StoreOp>, retention_days: u32) -> std::thread::JoinHandle<()> {
+pub fn spawn_writer(
+    db_path: &str,
+    rx: Receiver<StoreOp>,
+    retention_days: u32,
+) -> std::thread::JoinHandle<()> {
     let path = db_path.to_string();
     std::thread::Builder::new()
         .name("hg-store-writer".into())
@@ -148,14 +188,22 @@ fn flush(conn: &Connection, pending: &mut Vec<StoreOp>) {
 fn cleanup(conn: &Connection, retention_days: u64) {
     let cutoff = now_ms() as i64 - (retention_days as i64) * 86_400_000;
     let _ = conn.execute_batch(DROP_TRIGGERS_SQL);
-    for (table, col) in [("events", "ts"), ("verdicts", "ts"), ("conns", "opened_ts"), ("dns_map", "ts")] {
+    for (table, col) in [
+        ("events", "ts"),
+        ("verdicts", "ts"),
+        ("conns", "opened_ts"),
+        ("dns_map", "ts"),
+    ] {
         match conn.execute(&format!("DELETE FROM {table} WHERE {col} < ?1"), [cutoff]) {
             Ok(n) if n > 0 => tracing::info!("清理 {table}：{n} 条"),
             Err(e) => tracing::warn!("清理 {table} 失败：{e}"),
             _ => {}
         }
     }
-    if let Err(e) = conn.execute("DELETE FROM processes WHERE exit_ts IS NOT NULL AND exit_ts < ?1", [cutoff]) {
+    if let Err(e) = conn.execute(
+        "DELETE FROM processes WHERE exit_ts IS NOT NULL AND exit_ts < ?1",
+        [cutoff],
+    ) {
         tracing::warn!("清理 processes 失败：{e}");
     }
     let _ = conn.execute_batch(TRIGGERS_SQL);
@@ -211,7 +259,8 @@ mod tests {
             conn.execute(
                 "INSERT INTO events(ts, pid, start_ts, kind, detail_json) VALUES (?1,1,1,'k','{}')",
                 [ts],
-            ).unwrap();
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO verdicts(ts, rule_id, action, pid, exe, evidence_json, notified) VALUES (?1,'r','block',1,'e','{}',0)",
                 [ts],
@@ -224,7 +273,8 @@ mod tests {
             conn.execute(
                 "INSERT INTO dns_map(qname, ip, pid, ts) VALUES ('q','1.1.1.1',1,?1)",
                 [ts],
-            ).unwrap();
+            )
+            .unwrap();
         }
         conn.execute(
             "INSERT INTO processes(pid, start_ts, exe, cmdline, harness_root, exit_ts) VALUES (1,1,'e','c','r',NULL)",
@@ -237,7 +287,8 @@ mod tests {
         conn.execute(
             "INSERT INTO whitelist(kind, value, note, created_ts) VALUES ('path','C:/ok','',1)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn
     }
 
@@ -257,14 +308,20 @@ mod tests {
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM dns_map"), 0);
         // 活跃进程身份与白名单保留
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM processes"), 1);
-        assert!(count(&conn, "SELECT COUNT(*) FROM processes WHERE exit_ts IS NULL") == 1);
+        assert!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM processes WHERE exit_ts IS NULL"
+            ) == 1
+        );
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM whitelist"), 1);
         // 清理后触发器防护仍生效（追加写拍板回归）：行级触发器需删到行才
         // 触发，先补插一行再验证 DELETE 被拦
         conn.execute(
             "INSERT INTO events(ts, pid, start_ts, kind, detail_json) VALUES (1,1,1,'k','{}')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         assert!(conn.execute("DELETE FROM events WHERE ts = 1", []).is_err());
     }
 
@@ -273,7 +330,15 @@ mod tests {
         let conn = seeded_conn();
         cleanup(&conn, 30); // 保留 30 天：40 天前的删、现在的留
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM events"), 1);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM conns"), 1, "conns 应按 opened_ts 清理（原按 ts 恒失败）");
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM processes"), 1, "已退出进程应被清理");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM conns"),
+            1,
+            "conns 应按 opened_ts 清理（原按 ts 恒失败）"
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM processes"),
+            1,
+            "已退出进程应被清理"
+        );
     }
 }

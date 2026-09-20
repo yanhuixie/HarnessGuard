@@ -20,9 +20,7 @@ use ferrisetw::schema_locator::SchemaLocator;
 use ferrisetw::trace::{KernelTrace, UserTrace};
 use ferrisetw::EventRecord;
 use hg_core::ProcTable;
-use hg_model::{
-    Access, ConnId, Envelope, Pid, Proto, RawEvent, StartTime, Timestamp,
-};
+use hg_model::{Access, ConnId, Envelope, Pid, Proto, RawEvent, StartTime, Timestamp};
 use tokio::sync::mpsc;
 
 use crate::lru;
@@ -95,7 +93,10 @@ pub struct EtwInner {
     probe_last: Mutex<Instant>,
     /// TCP owner 表（GetExtendedTcpTable）：四元组 → 归属 pid。
     /// 实测教训：本机 TCP-IP 经典事件 PID 字段恒为 -1，归因只能走 owner 表。
-    tcp_owner: Mutex<(std::time::Instant, HashMap<(std::net::SocketAddr, std::net::SocketAddr), Pid>)>,
+    tcp_owner: Mutex<(
+        std::time::Instant,
+        HashMap<(std::net::SocketAddr, std::net::SocketAddr), Pid>,
+    )>,
     /// 已发 ConnOpen 的连接（send/connect 任一先到都确保登记——实测 connect 事件
     /// 在部分路径缺失，send 带有效 pid 时补登记，防孤儿 send）
     emitted_conns: dashmap::DashSet<u64>,
@@ -119,7 +120,10 @@ impl EtwInner {
             pending_files: Mutex::new(HashMap::new()),
             probe_failed: Mutex::new(lru::LruCache::new(PROBE_FAIL_CAP)),
             probe_last: Mutex::new(Instant::now() - probe::PROBE_MIN_INTERVAL),
-            tcp_owner: Mutex::new((std::time::Instant::now() - std::time::Duration::from_secs(10), HashMap::new())),
+            tcp_owner: Mutex::new((
+                std::time::Instant::now() - std::time::Duration::from_secs(10),
+                HashMap::new(),
+            )),
             emitted_conns: dashmap::DashSet::new(),
             monitored_quads: dashmap::DashMap::new(),
             sched_candidates: Mutex::new(VecDeque::new()),
@@ -163,7 +167,9 @@ impl EtwInner {
     fn on_process(&self, record: &EventRecord, loc: &SchemaLocator) {
         match record.opcode() {
             1 => {
-                let Ok(schema) = loc.event_schema(record) else { return };
+                let Ok(schema) = loc.event_schema(record) else {
+                    return;
+                };
                 let p = Parser::create(record, &schema);
                 let pid = Self::parse_u32(&p, &["ProcessId", "ProcessID"]).unwrap_or(0);
                 let ppid = Self::parse_u32(&p, &["ParentId", "ParentID"]).unwrap_or(0);
@@ -182,20 +188,32 @@ impl EtwInner {
                 } else {
                     self.pid_ctx.insert(
                         pid,
-                        PidCtx { ppid, start_time: StartTime(st), exe: None, exec_sent: false, start_seen: true, cwd },
+                        PidCtx {
+                            ppid,
+                            start_time: StartTime(st),
+                            exe: None,
+                            exec_sent: false,
+                            start_seen: true,
+                            cwd,
+                        },
                     );
                 }
                 self.try_emit_exec(pid);
             }
             2 => {
-                let Ok(schema) = loc.event_schema(record) else { return };
+                let Ok(schema) = loc.event_schema(record) else {
+                    return;
+                };
                 let p = Parser::create(record, &schema);
                 let pid = Self::parse_u32(&p, &["ProcessId", "ProcessID"]).unwrap_or(0);
                 if pid == 0 {
                     return;
                 }
                 if let Some((_, ctx)) = self.pid_ctx.remove(&pid) {
-                    self.emit(RawEvent::Exit { pid, start_time: ctx.start_time });
+                    self.emit(RawEvent::Exit {
+                        pid,
+                        start_time: ctx.start_time,
+                    });
                 }
             }
             _ => {}
@@ -204,7 +222,9 @@ impl EtwInner {
 
     /// exe 路径就绪（首个 ImageLoad）且 start 已到 → 发 Exec（含 PEB 命令行降级链）。
     fn try_emit_exec(&self, pid: Pid) {
-        let Some(ctx) = self.pid_ctx.get(&pid) else { return };
+        let Some(ctx) = self.pid_ctx.get(&pid) else {
+            return;
+        };
         if ctx.exec_sent || !ctx.start_seen || ctx.exe.is_none() {
             return;
         }
@@ -234,7 +254,9 @@ impl EtwInner {
         if record.opcode() != 10 {
             return;
         }
-        let Ok(schema) = loc.event_schema(record) else { return };
+        let Ok(schema) = loc.event_schema(record) else {
+            return;
+        };
         let p = Parser::create(record, &schema);
         let pid = Self::parse_u32(&p, &["ProcessId", "ProcessID"]).unwrap_or(0);
         let file: Option<String> = p.try_parse::<String>("FileName").ok();
@@ -251,7 +273,14 @@ impl EtwInner {
             let (_, _, cwd) = peb::query_process(pid);
             self.pid_ctx.insert(
                 pid,
-                PidCtx { ppid: 0, start_time: StartTime(peb::process_start_time(pid)), exe: Some(nt_to_win32(&file)), exec_sent: false, start_seen: false, cwd },
+                PidCtx {
+                    ppid: 0,
+                    start_time: StartTime(peb::process_start_time(pid)),
+                    exe: Some(nt_to_win32(&file)),
+                    exec_sent: false,
+                    start_seen: false,
+                    cwd,
+                },
             );
             return;
         }
@@ -261,11 +290,16 @@ impl EtwInner {
     fn on_file(&self, record: &EventRecord, loc: &SchemaLocator) {
         self.stats.kernel_events_seen.fetch_add(1, Relaxed);
         let op = record.opcode();
-        let Ok(schema) = loc.event_schema(record) else { return };
+        let Ok(schema) = loc.event_schema(record) else {
+            return;
+        };
         let p = Parser::create(record, &schema);
 
         // Name 事件：建缓存（与 opcode 无关，按字段成功与否识别）
-        let name: Option<String> = p.try_parse::<String>("FileName").ok().filter(|s| !s.is_empty());
+        let name: Option<String> = p
+            .try_parse::<String>("FileName")
+            .ok()
+            .filter(|s| !s.is_empty());
         let obj: Option<u64> = p
             .try_parse::<Pointer>("FileObject")
             .ok()
@@ -290,10 +324,16 @@ impl EtwInner {
         // 经典内核 FileIo 事件的 PID 在事件头（schema 无此字段）——实测教训
         let pid = {
             let hp = record.process_id();
-            if hp != 0 { hp } else { Self::parse_u32(&p, &["ProcessId", "ProcessID"]).unwrap_or(0) }
+            if hp != 0 {
+                hp
+            } else {
+                Self::parse_u32(&p, &["ProcessId", "ProcessID"]).unwrap_or(0)
+            }
         };
         // 早过滤：非监控树进程即读即弃（M0 实测 26k/s，此为硬要求）
-        let Some(id) = self.procs.get(&pid) else { return };
+        let Some(id) = self.procs.get(&pid) else {
+            return;
+        };
         if id.harness_root.is_none() {
             return;
         }
@@ -304,16 +344,19 @@ impl EtwInner {
                 Some(n)
             }
             None => match obj.and_then(|fo| {
-                    let mut g = self.fileobj.lock().unwrap();
-                    g.get(fo).map(|s| s.to_string())
-                }) {
+                let mut g = self.fileobj.lock().unwrap();
+                g.get(fo).map(|s| s.to_string())
+            }) {
                 Some(n) => {
                     self.stats.file_resolved.fetch_add(1, Relaxed);
                     Some(n)
                 }
                 None => {
                     self.stats.file_unknown.fetch_add(1, Relaxed);
-                    tracing::debug!("[file-unknown] pid={pid} op={op} obj={:x}", obj.unwrap_or(0));
+                    tracing::debug!(
+                        "[file-unknown] pid={pid} op={op} obj={:x}",
+                        obj.unwrap_or(0)
+                    );
                     None
                 }
             },
@@ -376,14 +419,34 @@ impl EtwInner {
     /// 文件事件入引擎（含监控树早过滤与路径归一）。pub(crate)：sec_audit 的
     /// 4663 消费复用此管线（与 ETW 文件事件同构）。
     pub(crate) fn emit_file_event(&self, pid: Pid, op: u8, raw: &str) {
-        let Some(id) = self.procs.get(&pid) else { return };
+        let Some(id) = self.procs.get(&pid) else {
+            return;
+        };
         let path = self.resolve_file_name(pid, raw);
-        tracing::debug!("[file] pid={pid} op={op} root={:?} raw={raw:?} -> {}", id.harness_root.as_ref().map(|r| r.0.clone()), path.display());
+        tracing::debug!(
+            "[file] pid={pid} op={op} root={:?} raw={raw:?} -> {}",
+            id.harness_root.as_ref().map(|r| r.0.clone()),
+            path.display()
+        );
         let st = id.start_time;
         match op {
-            FILE_OP_CREATE => self.emit(RawEvent::FileCreate { pid, start_time: st, path }),
-            FILE_OP_READ => self.emit(RawEvent::FileOpen { pid, start_time: st, path, access: Access::Read }),
-            FILE_OP_WRITE => self.emit(RawEvent::FileOpen { pid, start_time: st, path, access: Access::Write }),
+            FILE_OP_CREATE => self.emit(RawEvent::FileCreate {
+                pid,
+                start_time: st,
+                path,
+            }),
+            FILE_OP_READ => self.emit(RawEvent::FileOpen {
+                pid,
+                start_time: st,
+                path,
+                access: Access::Read,
+            }),
+            FILE_OP_WRITE => self.emit(RawEvent::FileOpen {
+                pid,
+                start_time: st,
+                path,
+                access: Access::Write,
+            }),
             _ => {}
         }
     }
@@ -394,11 +457,17 @@ impl EtwInner {
         if !matches!(op, NET_OP_CONNECT | NET_OP_SEND | NET_OP_DISCONNECT) {
             return;
         }
-        let Ok(schema) = loc.event_schema(record) else { return };
+        let Ok(schema) = loc.event_schema(record) else {
+            return;
+        };
         let p = Parser::create(record, &schema);
         let mut pid = {
             let hp = record.process_id();
-            if hp != 0 && hp != u32::MAX { hp } else { Self::parse_u32(&p, &["PID", "ProcessId"]).unwrap_or(u32::MAX) }
+            if hp != 0 && hp != u32::MAX {
+                hp
+            } else {
+                Self::parse_u32(&p, &["PID", "ProcessId"]).unwrap_or(u32::MAX)
+            }
         };
         let saddr: IpAddr = p.try_parse("saddr").unwrap_or(IpAddr::from([0, 0, 0, 0]));
         let daddr: IpAddr = p.try_parse("daddr").unwrap_or(IpAddr::from([0, 0, 0, 0]));
@@ -433,9 +502,20 @@ impl EtwInner {
             NET_OP_SEND => {
                 let size = Self::parse_u32(&p, &["size", "Size"]).unwrap_or(0) as u64;
                 // connect 事件缺失时的补登记：send 携带有效 pid 且属监控树 → 先发 ConnOpen
-                if pid != u32::MAX && self.emitted_conns_guard() && self.emitted_conns.insert(conn_id.0) {
-                    if self.procs.get(&pid).is_some_and(|id| id.harness_root.is_some()) {
-                        let st = self.procs.get(&pid).map(|i| i.start_time).unwrap_or(StartTime(0));
+                if pid != u32::MAX
+                    && self.emitted_conns_guard()
+                    && self.emitted_conns.insert(conn_id.0)
+                {
+                    if self
+                        .procs
+                        .get(&pid)
+                        .is_some_and(|id| id.harness_root.is_some())
+                    {
+                        let st = self
+                            .procs
+                            .get(&pid)
+                            .map(|i| i.start_time)
+                            .unwrap_or(StartTime(0));
                         self.monitored_quads.insert(conn_id.0, (local, remote));
                         self.emit(RawEvent::ConnOpen {
                             pid,
@@ -447,7 +527,10 @@ impl EtwInner {
                         });
                     }
                 }
-                self.emit(RawEvent::ConnTx { conn_id, bytes_out_delta: size });
+                self.emit(RawEvent::ConnTx {
+                    conn_id,
+                    bytes_out_delta: size,
+                });
             }
             NET_OP_DISCONNECT => {
                 // 移除登记（同四元组复用可重登记；estats 轮询侧幂等兜底）
@@ -467,7 +550,12 @@ impl EtwInner {
         true
     }
 
-    fn lookup_tcp_owner(&self, local: SocketAddr, remote: SocketAddr, refresh: bool) -> Option<Pid> {
+    fn lookup_tcp_owner(
+        &self,
+        local: SocketAddr,
+        remote: SocketAddr,
+        refresh: bool,
+    ) -> Option<Pid> {
         {
             let g = self.tcp_owner.lock().unwrap();
             if let Some(pid) = g.1.get(&(local, remote)) {
@@ -485,16 +573,33 @@ impl EtwInner {
 
     /// GetExtendedTcpTable(TCP_TABLE_OWNER_PID_ALL) 快照（约 1-5ms，连接级调用频率下可接受）。
     fn refresh_tcp_owner(&self) {
-        use windows::Win32::NetworkManagement::IpHelper::{GetExtendedTcpTable, TCP_TABLE_OWNER_PID_ALL};
-            use windows::Win32::Networking::WinSock::AF_INET;
+        use windows::Win32::NetworkManagement::IpHelper::{
+            GetExtendedTcpTable, TCP_TABLE_OWNER_PID_ALL,
+        };
+        use windows::Win32::Networking::WinSock::AF_INET;
         unsafe {
             let mut size = 0u32;
-            let _ = GetExtendedTcpTable(None, &mut size, false, AF_INET.0 as u32, TCP_TABLE_OWNER_PID_ALL, 0);
+            let _ = GetExtendedTcpTable(
+                None,
+                &mut size,
+                false,
+                AF_INET.0 as u32,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            );
             if size == 0 || size > 16 * 1024 * 1024 {
                 return;
             }
             let mut buf = vec![0u8; size as usize];
-            if GetExtendedTcpTable(Some(buf.as_mut_ptr() as *mut _), &mut size, false, AF_INET.0 as u32, TCP_TABLE_OWNER_PID_ALL, 0) != 0 {
+            if GetExtendedTcpTable(
+                Some(buf.as_mut_ptr() as *mut _),
+                &mut size,
+                false,
+                AF_INET.0 as u32,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            ) != 0
+            {
                 return;
             }
             let n = *(buf.as_ptr() as *const u32);
@@ -520,11 +625,18 @@ impl EtwInner {
     /// cmd/tar 的相对打开只给相对名）。相对名按进程 cwd 拼接后做词法归一。
     fn resolve_file_name(&self, pid: Pid, raw: &str) -> PathBuf {
         let norm = raw.replace(chr_backslash(), "/");
-        if norm.starts_with("/Device/") || norm.starts_with("/??/") || (norm.len() >= 2 && norm.as_bytes()[1] == b':') {
+        if norm.starts_with("/Device/")
+            || norm.starts_with("/??/")
+            || (norm.len() >= 2 && norm.as_bytes()[1] == b':')
+        {
             return nt_to_win32(raw);
         }
         // 相对路径：cwd 拼接
-        let cwd = self.pid_ctx.get(&pid).map(|c| c.cwd.clone()).unwrap_or_default();
+        let cwd = self
+            .pid_ctx
+            .get(&pid)
+            .map(|c| c.cwd.clone())
+            .unwrap_or_default();
         if cwd.as_os_str().is_empty() {
             return PathBuf::from(raw);
         }
@@ -560,14 +672,23 @@ impl EtwInner {
         if record.event_id() != 3008 {
             return;
         }
-        let Ok(schema) = loc.event_schema(record) else { return };
+        let Ok(schema) = loc.event_schema(record) else {
+            return;
+        };
         let p = Parser::create(record, &schema);
-        let qname: Option<String> = p.try_parse::<String>("QueryName").ok().filter(|s| !s.is_empty());
+        let qname: Option<String> = p
+            .try_parse::<String>("QueryName")
+            .ok()
+            .filter(|s| !s.is_empty());
         let Some(qname) = qname else { return };
         let pid = Self::parse_u32(&p, &["ProcessId", "PID"]).unwrap_or(0);
         let results: Option<String> = p.try_parse("QueryResults").ok();
         let answers = parse_dns_answers(results.as_deref());
-        self.emit(RawEvent::DnsQuery { pid, qname, answers });
+        self.emit(RawEvent::DnsQuery {
+            pid,
+            qname,
+            answers,
+        });
     }
 
     /// TaskScheduler 持久化检测（技术设计 §5.1 原文；M1 偏差表归位：原仅 RunKey
@@ -587,9 +708,14 @@ impl EtwInner {
         if !matches!(record.event_id(), 106 | 140 | 141) {
             return;
         }
-        let Ok(schema) = loc.event_schema(record) else { return };
+        let Ok(schema) = loc.event_schema(record) else {
+            return;
+        };
         let p = Parser::create(record, &schema);
-        let task: Option<String> = p.try_parse::<String>("TaskName").ok().filter(|s| !s.is_empty());
+        let task: Option<String> = p
+            .try_parse::<String>("TaskName")
+            .ok()
+            .filter(|s| !s.is_empty());
         let Some(task) = task else { return };
         let user: String = p.try_parse::<String>("UserContext").unwrap_or_default();
         let kind = match record.event_id() {
@@ -641,11 +767,19 @@ impl EtwInner {
         if !is_task_registrar_cmdline(cmdline) {
             return;
         }
-        let joined = cmdline.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" ");
+        let joined = cmdline
+            .iter()
+            .map(|a| a.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
         let mut g = self.sched_candidates.lock().unwrap();
         prune_sched_candidates(&mut g, Instant::now());
         g.retain(|c| c.pid != pid);
-        g.push_back(SchedCandidate { pid, cmdline: joined, at: Instant::now() });
+        g.push_back(SchedCandidate {
+            pid,
+            cmdline: joined,
+            at: Instant::now(),
+        });
     }
 
     /// 取最新候选（供 106 事件归因兜底）；顺带做时效清理。
@@ -831,16 +965,37 @@ mod tests {
 
     #[test]
     fn 注册工具特征匹配矩阵() {
-        assert!(is_task_registrar_cmdline(&args(&["cmd", "/c", "SCHTASKS", "/create", "/tn", "X"])), "大小写不敏感");
-        assert!(is_task_registrar_cmdline(&args(&["powershell", "-Command", "Register-ScheduledTask", "-Name", "X"])));
-        assert!(is_task_registrar_cmdline(&args(&["powershell", "-ComObj", "RegisterTask('x')"])), "COM RegisterTask 变体");
-        assert!(!is_task_registrar_cmdline(&args(&["cmd", "/c", "type", "secret.txt"])));
+        assert!(
+            is_task_registrar_cmdline(&args(&["cmd", "/c", "SCHTASKS", "/create", "/tn", "X"])),
+            "大小写不敏感"
+        );
+        assert!(is_task_registrar_cmdline(&args(&[
+            "powershell",
+            "-Command",
+            "Register-ScheduledTask",
+            "-Name",
+            "X"
+        ])));
+        assert!(
+            is_task_registrar_cmdline(&args(&["powershell", "-ComObj", "RegisterTask('x')"])),
+            "COM RegisterTask 变体"
+        );
+        assert!(!is_task_registrar_cmdline(&args(&[
+            "cmd",
+            "/c",
+            "type",
+            "secret.txt"
+        ])));
         assert!(!is_task_registrar_cmdline(&args(&["git", "status"])));
         assert!(!is_task_registrar_cmdline(&[]), "空 cmdline 不匹配");
     }
 
     fn cand(pid: u32, cmdline: &str, at: Instant) -> SchedCandidate {
-        SchedCandidate { pid, cmdline: cmdline.into(), at }
+        SchedCandidate {
+            pid,
+            cmdline: cmdline.into(),
+            at,
+        }
     }
 
     #[test]
@@ -861,7 +1016,11 @@ mod tests {
     fn 候选表_过期清理保留新鲜() {
         let mut g: VecDeque<SchedCandidate> = VecDeque::new();
         let now = Instant::now();
-        g.push_back(cand(1, "schtasks", now - SCHED_CAND_MAX_AGE - std::time::Duration::from_secs(1)));
+        g.push_back(cand(
+            1,
+            "schtasks",
+            now - SCHED_CAND_MAX_AGE - std::time::Duration::from_secs(1),
+        ));
         g.push_back(cand(2, "schtasks", now));
         prune_sched_candidates(&mut g, now);
         assert_eq!(g.len(), 1);
@@ -872,7 +1031,10 @@ mod tests {
     fn 候选缓存_同pid覆盖_非注册工具不入缓存() {
         let inner = EtwInner::new(Arc::new(ProcTable::new()), Arc::new(SourceStats::default()));
         inner.remember_task_registrar(100, &args(&["schtasks", "/create", "/tn", "A"]));
-        inner.remember_task_registrar(101, &args(&["powershell", "-Command", "Register-ScheduledTask"]));
+        inner.remember_task_registrar(
+            101,
+            &args(&["powershell", "-Command", "Register-ScheduledTask"]),
+        );
         let (pid, _) = inner.cached_task_registrar().expect("应有候选");
         assert_eq!(pid, 101, "取最新候选");
         // 同 pid 重新 Exec：覆盖旧候选而非并存

@@ -26,10 +26,12 @@ use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{LocalFree, HLOCAL};
 use windows::Win32::Security::Authorization::{
     ConvertStringSidToSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW,
-    EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT,
-    SET_AUDIT_SUCCESS, TRUSTEE_W, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP,
+    EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SET_AUDIT_SUCCESS, SE_FILE_OBJECT,
+    TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
 };
-use windows::Win32::Security::{ACL, PSID, SACL_SECURITY_INFORMATION, SUB_CONTAINERS_AND_OBJECTS_INHERIT};
+use windows::Win32::Security::{
+    ACL, PSID, SACL_SECURITY_INFORMATION, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+};
 use windows::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE};
 
 /// Everyone SID（审计 ACE 主体：审计所有访问者；判定/豁免由引擎侧规则负责，
@@ -51,8 +53,9 @@ pub fn enable_file_audit(path: &Path, config_path: &Path) -> Result<()> {
         let _ = apply_audit_ace(&dir, false);
         return Err(e).context("auditpol 设置失败（SACL 已回滚）");
     }
-    let cfg = config_update(config_path, &dir.display().to_string(), true)
-        .context("系统侧已启用，但配置更新失败——请手工在 [file_audit] 设 enabled=true 并加入 watch_paths")?;
+    let cfg = config_update(config_path, &dir.display().to_string(), true).context(
+        "系统侧已启用，但配置更新失败——请手工在 [file_audit] 设 enabled=true 并加入 watch_paths",
+    )?;
     println!("文件审计已启用：{}", dir.display());
     println!(
         "config.toml [file_audit] enabled={}，watch_paths={:?}（配置文件：{}，请核对非预期目录）",
@@ -60,7 +63,9 @@ pub fn enable_file_audit(path: &Path, config_path: &Path) -> Result<()> {
         cfg.file_audit.watch_paths,
         config_path.display()
     );
-    println!("重启 HarnessGuard 后消费端生效（服务：sc stop HarnessGuard && sc start HarnessGuard）");
+    println!(
+        "重启 HarnessGuard 后消费端生效（服务：sc stop HarnessGuard && sc start HarnessGuard）"
+    );
     Ok(())
 }
 
@@ -95,8 +100,12 @@ fn enable_security_privilege() -> Result<()> {
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     unsafe {
         let mut token = HANDLE(std::ptr::null_mut());
-        OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token)
-            .context("OpenProcessToken 失败（需管理员）")?;
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+        .context("OpenProcessToken 失败（需管理员）")?;
         let r = (|| -> Result<()> {
             let name: Vec<u16> = "SeSecurityPrivilege\u{0}".encode_utf16().collect();
             let mut luid = LUID::default();
@@ -104,7 +113,10 @@ fn enable_security_privilege() -> Result<()> {
                 .context("LookupPrivilegeValue(SeSecurityPrivilege) 失败")?;
             let tp = TOKEN_PRIVILEGES {
                 PrivilegeCount: 1,
-                Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+                Privileges: [LUID_AND_ATTRIBUTES {
+                    Luid: luid,
+                    Attributes: SE_PRIVILEGE_ENABLED,
+                }],
             };
             AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None)
                 .context("AdjustTokenPrivileges 失败（需管理员）")?;
@@ -121,20 +133,30 @@ fn enable_security_privilege() -> Result<()> {
 
 /// 归一到绝对原生路径（fs::canonicalize 的 \\?\ 前缀剥除；目录不存在报错）。
 fn canonical_dir(path: &Path) -> Result<std::path::PathBuf> {
-    let c = std::fs::canonicalize(path).with_context(|| format!("路径不存在：{}", path.display()))?;
+    let c =
+        std::fs::canonicalize(path).with_context(|| format!("路径不存在：{}", path.display()))?;
     let s = c.display().to_string();
-    Ok(std::path::PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s)))
+    Ok(std::path::PathBuf::from(
+        s.strip_prefix(r"\\?\").unwrap_or(&s),
+    ))
 }
 
 /// auditpol 开/关 File System 成功审计（子类别 GUID 形式，免本地化差异）。
 fn auditpol_set(enable: bool) -> Result<()> {
     let state = if enable { "enable" } else { "disable" };
     let out = std::process::Command::new("auditpol")
-        .args(["/set", &format!("/subcategory:{FILE_SYSTEM_SUBCATALOG_GUID}"), &format!("/success:{state}")])
+        .args([
+            "/set",
+            &format!("/subcategory:{FILE_SYSTEM_SUBCATALOG_GUID}"),
+            &format!("/success:{state}"),
+        ])
         .output()
         .context("启动 auditpol 失败（需管理员）")?;
     if !out.status.success() {
-        bail!("auditpol 设置失败：{}", String::from_utf8_lossy(&out.stderr));
+        bail!(
+            "auditpol 设置失败：{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(())
 }
@@ -144,7 +166,11 @@ fn auditpol_set(enable: bool) -> Result<()> {
 fn audit_ea(sid: PSID, add: bool) -> EXPLICIT_ACCESS_W {
     EXPLICIT_ACCESS_W {
         grfAccessPermissions: FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0,
-        grfAccessMode: if add { SET_AUDIT_SUCCESS } else { REVOKE_ACCESS },
+        grfAccessMode: if add {
+            SET_AUDIT_SUCCESS
+        } else {
+            REVOKE_ACCESS
+        },
         grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
         Trustee: TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
@@ -160,9 +186,17 @@ fn audit_ea(sid: PSID, add: bool) -> EXPLICIT_ACCESS_W {
 /// SetNamedSecurityInfoW 写回）。幂等：SET_AUDIT_SUCCESS 对已存在的同 trustee
 /// ACE 为合并语义；REVOKE_ACCESS 对不存在条目不报错。
 fn apply_audit_ace(dir: &Path, add: bool) -> Result<()> {
-    let path_w: Vec<u16> = dir.display().to_string().encode_utf16().chain(std::iter::once(0)).collect();
+    let path_w: Vec<u16> = dir
+        .display()
+        .to_string()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     unsafe {
-        let sid_w: Vec<u16> = EVERYONE_SID.encode_utf16().chain(std::iter::once(0)).collect();
+        let sid_w: Vec<u16> = EVERYONE_SID
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let mut everyone = PSID(std::ptr::null_mut());
         ConvertStringSidToSidW(PCWSTR(sid_w.as_ptr()), &mut everyone)
             .context("Everyone SID 构造失败")?;
@@ -217,12 +251,19 @@ fn config_update(config_path: &Path, dir: &str, enable: bool) -> Result<hg_core:
         hg_core::FileConfig::default()
     };
     if enable {
-        if !cfg.file_audit.watch_paths.iter().any(|p| p.eq_ignore_ascii_case(dir)) {
+        if !cfg
+            .file_audit
+            .watch_paths
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(dir))
+        {
             cfg.file_audit.watch_paths.push(dir.to_string());
         }
         cfg.file_audit.enabled = true;
     } else {
-        cfg.file_audit.watch_paths.retain(|p| !p.eq_ignore_ascii_case(dir));
+        cfg.file_audit
+            .watch_paths
+            .retain(|p| !p.eq_ignore_ascii_case(dir));
         if cfg.file_audit.watch_paths.is_empty() {
             cfg.file_audit.enabled = false;
         }
@@ -278,7 +319,10 @@ mod tests {
     #[test]
     fn 审计ace构造_权限模式与继承() {
         let ea_add = audit_ea(PSID(std::ptr::null_mut()), true);
-        assert_eq!(ea_add.grfAccessPermissions, FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0);
+        assert_eq!(
+            ea_add.grfAccessPermissions,
+            FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0
+        );
         assert_eq!(ea_add.grfAccessMode, SET_AUDIT_SUCCESS);
         assert_eq!(ea_add.grfInheritance, SUB_CONTAINERS_AND_OBJECTS_INHERIT);
         assert_eq!(ea_add.Trustee.TrusteeForm, TRUSTEE_IS_SID);

@@ -20,7 +20,9 @@ use windows_service::service::{
     ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
     ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
-use windows_service::service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle};
+use windows_service::service_control_handler::{
+    self, ServiceControlHandlerResult, ServiceStatusHandle,
+};
 use windows_service::service_dispatcher;
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -41,7 +43,10 @@ fn service_main() {
     // SCM 服务默认 CWD 为 %WinDir%\System32——统一切到 exe 目录，使
     // config.toml / harnessguard.db 等相对路径锚定安装目录（评审修正：
     // 否则首次服务启动会在 System32 下建配置与库文件）
-    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
         if let Err(e) = std::env::set_current_dir(&dir) {
             tracing::error!("[服务] 切换工作目录到 {} 失败：{e}", dir.display());
         }
@@ -68,14 +73,20 @@ fn service_main() {
     // 状态时序（M4 待修清单 8）：先报 START_PENDING（wait_hint 30s）——run_server
     // 装配（配置/ETW/SQLite/Web 监听）有耗时，直接报 RUNNING 时初始化若超
     // wait_hint 会被 SCM 判超时；装配完成回调再报 RUNNING
-    report_state(&handle, ServiceState::StartPending, 0, Duration::from_secs(30));
+    report_state(
+        &handle,
+        ServiceState::StartPending,
+        0,
+        Duration::from_secs(30),
+    );
     tracing::info!("[服务] HarnessGuard 服务主体启动（SCM 宿主）");
 
     let on_ready = {
         let handle = handle.clone();
-        Some(Box::new(move || {
-            report_state(&handle, ServiceState::Running, 0, Duration::ZERO)
-        }) as Box<dyn FnOnce() + Send>)
+        Some(
+            Box::new(move || report_state(&handle, ServiceState::Running, 0, Duration::ZERO))
+                as Box<dyn FnOnce() + Send>,
+        )
     };
     if let Err(e) = crate::run_server(Some(stop_rx), on_ready) {
         tracing::error!("[服务] 服务主体退出（失败）：{e:#}");
@@ -86,12 +97,7 @@ fn service_main() {
 }
 
 /// 状态上报（Interrogate 由 SCM 隐式支持，无需（也无位）声明）。
-fn report_state(
-    handle: &ServiceStatusHandle,
-    state: ServiceState,
-    code: u32,
-    wait_hint: Duration,
-) {
+fn report_state(handle: &ServiceStatusHandle, state: ServiceState, code: u32, wait_hint: Duration) {
     let st = ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: state,
@@ -171,9 +177,9 @@ pub fn install() -> anyhow::Result<()> {
                 );
             }
             stop_and_wait(&service)?;
-            service
-                .change_config(&info)
-                .context("升级失败：服务已停止但 binPath 更新未生效——可重跑 install 或手工 sc config")?;
+            service.change_config(&info).context(
+                "升级失败：服务已停止但 binPath 更新未生效——可重跑 install 或手工 sc config",
+            )?;
             println!("服务配置已更新到 v{version}");
             service
         }
@@ -193,7 +199,10 @@ pub fn install() -> anyhow::Result<()> {
         for p in files {
             if p.exists() {
                 match hg_plat_win::acl::protect_file(&p) {
-                    Ok(()) => println!("已应用保护 ACL（SYSTEM/Administrators 全控 + Users 只读，拍板 14）：{}", p.display()),
+                    Ok(()) => println!(
+                        "已应用保护 ACL（SYSTEM/Administrators 全控 + Users 只读，拍板 14）：{}",
+                        p.display()
+                    ),
                     Err(e) => println!("保护 ACL 应用失败（{}）：{e:#}", p.display()),
                 }
             }
@@ -204,9 +213,12 @@ pub fn install() -> anyhow::Result<()> {
     // 注：sc.exe 的失败文本输出在 stdout（历史行为），stderr 常为空——合并读取
     let out = std::process::Command::new("sc")
         .args([
-            "failure", SERVICE_NAME,
-            "reset=", "86400",
-            "actions=", "restart/5000/restart/5000/restart/5000",
+            "failure",
+            SERVICE_NAME,
+            "reset=",
+            "86400",
+            "actions=",
+            "restart/5000/restart/5000/restart/5000",
         ])
         .output()?;
     if !out.status.success() {
@@ -244,7 +256,10 @@ pub fn install() -> anyhow::Result<()> {
     }
     if let Some(dir) = &exe_dir {
         let sure = if started { "" } else { "（启动未确认）" };
-        println!("Web UI{sure}：http://127.0.0.1:8377/（token 见 {}）", dir.join("web-token.txt").display());
+        println!(
+            "Web UI{sure}：http://127.0.0.1:8377/（token 见 {}）",
+            dir.join("web-token.txt").display()
+        );
         println!("日志：{}", dir.join("logs").display());
     }
     println!("可选：文件审计通道（场景 A 加强，系统侵入性 opt-in）：harnessguard enable-file-audit <工作区/.git>");
@@ -296,8 +311,13 @@ fn preflight(exe_dir: Option<&std::path::Path>, upgrade_mode: bool) -> anyhow::R
         Ok(st) if st.current_state == ServiceState::Running => {
             println!("前置检查：BFE（Base Filtering Engine）运行中——WFP 封禁可用")
         }
-        Ok(st) => println!("警告：BFE 服务未运行（{:?}），WFP 封禁将降级为 netsh", st.current_state),
-        Err(e) => println!("警告：BFE 状态查询失败（{e}），WFP 封禁可用性未知——未运行时将降级为 netsh"),
+        Ok(st) => println!(
+            "警告：BFE 服务未运行（{:?}），WFP 封禁将降级为 netsh",
+            st.current_state
+        ),
+        Err(e) => {
+            println!("警告：BFE 状态查询失败（{e}），WFP 封禁可用性未知——未运行时将降级为 netsh")
+        }
     }
     Ok(())
 }
@@ -361,7 +381,10 @@ pub fn uninstall() -> anyhow::Result<()> {
     }
 
     // 残留清理（exe 目录侧）
-    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
         let token = dir.join("web-token.txt");
         if token.exists() {
             match std::fs::remove_file(&token) {

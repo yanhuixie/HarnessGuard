@@ -35,7 +35,10 @@ impl Enforcer for LinuxEnforcer {
         }
         let rc = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         if rc != 0 {
-            anyhow::bail!("kill({pid}) errno={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+            anyhow::bail!(
+                "kill({pid}) errno={}",
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+            );
         }
         Ok(())
     }
@@ -77,7 +80,10 @@ impl Enforcer for LinuxEnforcer {
         let add = format!("add element {NFT_TABLE} {NFT_SET} {{ {ip} timeout {secs}s }}");
         let out = std::process::Command::new("nft").arg(&add).output()?;
         if !out.status.success() {
-            anyhow::bail!("nft add element 失败: {}", String::from_utf8_lossy(&out.stderr));
+            anyhow::bail!(
+                "nft add element 失败: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
         Ok(())
     }

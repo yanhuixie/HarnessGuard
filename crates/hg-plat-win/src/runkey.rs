@@ -30,7 +30,12 @@ pub fn spawn_runkey_poll(inner: Arc<EtwInner>) {
             let cur = snapshot();
             for e in &cur {
                 if !prev.iter().any(|p| key_of(p) == key_of(e)) {
-                    tracing::warn!("[持久化] 新增 RunKey：HKU\\{}\\...\\Run\\{} = {}", e.sid, e.name, e.value);
+                    tracing::warn!(
+                        "[持久化] 新增 RunKey：HKU\\{}\\...\\Run\\{} = {}",
+                        e.sid,
+                        e.name,
+                        e.value
+                    );
                     inner.emit(RawEvent::Persistence {
                         pid: 0, // 轮询无法归因发起进程（M1 已知缺口，M4 补 ETW 归因）
                         kind: PersistenceKind::RunKey,
@@ -59,7 +64,13 @@ fn snapshot() -> Vec<RunEntry> {
     unsafe {
         let empty = to_w("");
         let mut users = HKEY(std::ptr::null_mut());
-        let rc = RegOpenKeyExW(HKEY_USERS, PCWSTR(empty.as_ptr()), None, KEY_READ, &mut users);
+        let rc = RegOpenKeyExW(
+            HKEY_USERS,
+            PCWSTR(empty.as_ptr()),
+            None,
+            KEY_READ,
+            &mut users,
+        );
         if rc != ERROR_SUCCESS {
             return out;
         }
@@ -93,7 +104,8 @@ fn snapshot() -> Vec<RunEntry> {
                 let path = format!("{sid}\\Software\\Microsoft\\Windows\\CurrentVersion\\{sub}");
                 let path_w = to_w(&path);
                 let mut hk = HKEY(std::ptr::null_mut());
-                let rc = RegOpenKeyExW(HKEY_USERS, PCWSTR(path_w.as_ptr()), None, KEY_READ, &mut hk);
+                let rc =
+                    RegOpenKeyExW(HKEY_USERS, PCWSTR(path_w.as_ptr()), None, KEY_READ, &mut hk);
                 if rc != ERROR_SUCCESS {
                     continue;
                 }
@@ -127,7 +139,11 @@ fn snapshot() -> Vec<RunEntry> {
                         .take_while(|&w| w != 0)
                         .collect();
                     let dv = String::from_utf16_lossy(&words);
-                    out.push(RunEntry { sid: sid.clone(), name: vn, value: dv });
+                    out.push(RunEntry {
+                        sid: sid.clone(),
+                        name: vn,
+                        value: dv,
+                    });
                     vi += 1;
                 }
                 let _ = RegCloseKey(hk);

@@ -29,7 +29,7 @@ const AUDITPIPE_PRESELECT_MODE_LOCAL: i32 = 2;
 // bsm/audit.h 事件类（预选 mask，64 位）
 const AUDIT_CLASS_EX: u64 = 1 << 1; // 0x0000_0002 exec
 const AUDIT_CLASS_FC: u64 = 1 << 10; // 0x0000_0400 file control（open/create/rename...）
-// BSM token 类型
+                                     // BSM token 类型
 const AUT_HEADER32: u8 = 0x14;
 const AUT_HEADER64: u8 = 0x74;
 const AUT_PATH: u8 = 0x12;
@@ -58,7 +58,11 @@ struct BsmRecordState {
 
 impl AuditPipeSource {
     pub fn new(procs: Arc<ProcTable>, tx: mpsc::Sender<Envelope>) -> Self {
-        Self { procs, tx, base: std::time::Instant::now() }
+        Self {
+            procs,
+            tx,
+            base: std::time::Instant::now(),
+        }
     }
 
     fn now(&self) -> Timestamp {
@@ -120,12 +124,16 @@ impl AuditPipeSource {
             match tok {
                 AUT_HEADER32 => {
                     // len(u16) ver(u8) event(u16) ... time(s)
-                    if bytes.len() < off + 12 { break; }
+                    if bytes.len() < off + 12 {
+                        break;
+                    }
                     st.event = u16::from_be_bytes([bytes[off + 6], bytes[off + 7]]);
                     off += 20; // header32 定长（含时间戳）
                 }
                 AUT_HEADER64 => {
-                    if bytes.len() < off + 24 { break; }
+                    if bytes.len() < off + 24 {
+                        break;
+                    }
                     st.event = u16::from_be_bytes([bytes[off + 6], bytes[off + 7]]);
                     off += 32;
                 }
@@ -133,27 +141,55 @@ impl AuditPipeSource {
                     if let Some((s, next)) = read_str_token(bytes, off) {
                         st.path = Some(s);
                         off = next;
-                    } else { break; }
+                    } else {
+                        break;
+                    }
                 }
                 AUT_EXEC_ARGS => {
                     if let Some((v, next)) = read_str_list_token(bytes, off) {
                         st.args = v;
                         off = next;
-                    } else { break; }
+                    } else {
+                        break;
+                    }
                 }
                 AUT_SUBJECT32 => {
                     if bytes.len() >= off + 44 {
-                        st.pid = u32::from_be_bytes([bytes[off + 24], bytes[off + 25], bytes[off + 26], bytes[off + 27]]);
-                        st.ppid = u32::from_be_bytes([bytes[off + 28], bytes[off + 29], bytes[off + 30], bytes[off + 31]]);
+                        st.pid = u32::from_be_bytes([
+                            bytes[off + 24],
+                            bytes[off + 25],
+                            bytes[off + 26],
+                            bytes[off + 27],
+                        ]);
+                        st.ppid = u32::from_be_bytes([
+                            bytes[off + 28],
+                            bytes[off + 29],
+                            bytes[off + 30],
+                            bytes[off + 31],
+                        ]);
                         off += 44;
-                    } else { break; }
+                    } else {
+                        break;
+                    }
                 }
                 AUT_SUBJECT64 => {
                     if bytes.len() >= off + 60 {
-                        st.pid = u32::from_be_bytes([bytes[off + 24], bytes[off + 25], bytes[off + 26], bytes[off + 27]]);
-                        st.ppid = u32::from_be_bytes([bytes[off + 28], bytes[off + 29], bytes[off + 30], bytes[off + 31]]);
+                        st.pid = u32::from_be_bytes([
+                            bytes[off + 24],
+                            bytes[off + 25],
+                            bytes[off + 26],
+                            bytes[off + 27],
+                        ]);
+                        st.ppid = u32::from_be_bytes([
+                            bytes[off + 28],
+                            bytes[off + 29],
+                            bytes[off + 30],
+                            bytes[off + 31],
+                        ]);
                         off += 60;
-                    } else { break; }
+                    } else {
+                        break;
+                    }
                 }
                 _ => {
                     // 未知 token：无法安全跳过（长度规则未知）——终止本记录（保守丢弃）
@@ -184,7 +220,11 @@ impl AuditPipeSource {
                 if id.as_ref().is_some_and(|i| i.harness_root.is_some()) {
                     let _ = self.tx.try_send(Envelope::new(
                         self.now(),
-                        RawEvent::FileCreate { pid: st.pid, start_time: StartTime(0), path: st.path.unwrap_or_default().into() },
+                        RawEvent::FileCreate {
+                            pid: st.pid,
+                            start_time: StartTime(0),
+                            path: st.path.unwrap_or_default().into(),
+                        },
                     ));
                 }
             }
@@ -192,7 +232,12 @@ impl AuditPipeSource {
                 if id.as_ref().is_some_and(|i| i.harness_root.is_some()) {
                     let _ = self.tx.try_send(Envelope::new(
                         self.now(),
-                        RawEvent::FileOpen { pid: st.pid, start_time: StartTime(0), path: st.path.unwrap_or_default().into(), access: Access::Read },
+                        RawEvent::FileOpen {
+                            pid: st.pid,
+                            start_time: StartTime(0),
+                            path: st.path.unwrap_or_default().into(),
+                            access: Access::Read,
+                        },
                     ));
                 }
             }
@@ -203,22 +248,32 @@ impl AuditPipeSource {
 
 fn read_str_token(b: &[u8], off: usize) -> Option<(String, usize)> {
     // token(u8) len(u16) bytes + NUL 对齐 4
-    if b.len() < off + 3 { return None; }
+    if b.len() < off + 3 {
+        return None;
+    }
     let len = u16::from_be_bytes([b[off + 1], b[off + 2]]) as usize;
-    if b.len() < off + 3 + len { return None; }
-    let s = String::from_utf8_lossy(&b[off + 3..off + 3 + len]).trim_end_matches('\0').to_string();
+    if b.len() < off + 3 + len {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&b[off + 3..off + 3 + len])
+        .trim_end_matches('\0')
+        .to_string();
     let total = 3 + len;
     let next = off + (total + 3) & !3; // 4 字节对齐
     Some((s, next))
 }
 
 fn read_str_list_token(b: &[u8], off: usize) -> Option<(Vec<OsString>, usize)> {
-    if b.len() < off + 2 { return None; }
+    if b.len() < off + 2 {
+        return None;
+    }
     let count = b[off + 1] as usize;
     let mut p = off + 2;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
-        if b.len() < p + 2 { return None; }
+        if b.len() < p + 2 {
+            return None;
+        }
         let len = b[p] as usize;
         let s = OsString::from_vec(b.get(p + 1..p + 1 + len)?.to_vec());
         out.push(s);

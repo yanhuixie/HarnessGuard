@@ -29,7 +29,10 @@ impl Enforcer for MacEnforcer {
         }
         let rc = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         if rc != 0 {
-            anyhow::bail!("kill({pid}) errno={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+            anyhow::bail!(
+                "kill({pid}) errno={}",
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+            );
         }
         Ok(())
     }
@@ -63,7 +66,15 @@ impl Enforcer for MacEnforcer {
                 .output();
         }
         let out = std::process::Command::new("pfctl")
-            .args(["-a", PF_ANCHOR, "-t", PF_ANCHOR, "-T", "add", &ip.to_string()])
+            .args([
+                "-a",
+                PF_ANCHOR,
+                "-t",
+                PF_ANCHOR,
+                "-T",
+                "add",
+                &ip.to_string(),
+            ])
             .output()?;
         if !out.status.success() {
             anyhow::bail!("pfctl add 失败: {}", String::from_utf8_lossy(&out.stderr));
@@ -72,7 +83,15 @@ impl Enforcer for MacEnforcer {
         std::thread::spawn(move || {
             std::thread::sleep(ttl);
             let _ = std::process::Command::new("pfctl")
-                .args(["-a", PF_ANCHOR, "-t", PF_ANCHOR, "-T", "delete", &ip.to_string()])
+                .args([
+                    "-a",
+                    PF_ANCHOR,
+                    "-t",
+                    PF_ANCHOR,
+                    "-T",
+                    "delete",
+                    &ip.to_string(),
+                ])
                 .output();
         });
         Ok(())
@@ -89,14 +108,22 @@ fn kinfo_starttime(pid: Pid) -> Option<u64> {
         start_sec: u64,
         start_usec: u64,
     }
-    let name: [libc::c_int; 4] = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid as libc::c_int];
+    let name: [libc::c_int; 4] = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        pid as libc::c_int,
+    ];
     let mut kp = KInfoProc::default();
     let mut len = std::mem::size_of::<KInfoProc>();
     let rc = unsafe {
         libc::sysctl(
-            name.as_ptr(), 4,
-            &mut kp as *mut _ as *mut core::ffi::c_void, &mut len,
-            std::ptr::null(), 0,
+            name.as_ptr(),
+            4,
+            &mut kp as *mut _ as *mut core::ffi::c_void,
+            &mut len,
+            std::ptr::null(),
+            0,
         )
     };
     if rc != 0 {
@@ -107,5 +134,8 @@ fn kinfo_starttime(pid: Pid) -> Option<u64> {
 
 #[allow(dead_code)]
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

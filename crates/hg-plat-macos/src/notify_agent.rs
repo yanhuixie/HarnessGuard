@@ -29,10 +29,16 @@ pub fn notify_user(uid: u32, title: &str, body: &str) -> anyhow::Result<()> {
 // 极简 JSON 转义（macOS 侧不引 serde_json，减少依赖面；M3 可换）
 mod serde_json_lite {
     pub fn escape(title: &str, body: &str) -> String {
-        format!("{{\"title\":\"{}\",\"body\":\"{}\"}}", esc(title), esc(body))
+        format!(
+            "{{\"title\":\"{}\",\"body\":\"{}\"}}",
+            esc(title),
+            esc(body)
+        )
     }
     fn esc(s: &str) -> String {
-        s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
     }
 }
 

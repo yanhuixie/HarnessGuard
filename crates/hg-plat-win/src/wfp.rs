@@ -14,12 +14,12 @@ use std::time::Duration;
 use windows::core::{w, GUID, PWSTR};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmSubLayerAdd0, FWP_ACTION_BLOCK,
-    FWP_EMPTY, FWP_MATCH_EQUAL, FWPM_SESSION_FLAG_DYNAMIC, FWP_V4_ADDR_AND_MASK, FWP_V4_ADDR_MASK,
-    FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWPM_ACTION0, FWPM_ACTION0_0,
-    FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_DISPLAY_DATA0, FWPM_FILTER0, FWPM_FILTER_CONDITION0,
-    FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_SESSION0,
-    FWPM_SUBLAYER0, FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_VALUE0,
+    FwpmEngineClose0, FwpmEngineOpen0, FwpmFilterAdd0, FwpmSubLayerAdd0, FWPM_ACTION0,
+    FWPM_ACTION0_0, FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_DISPLAY_DATA0, FWPM_FILTER0,
+    FWPM_FILTER_CONDITION0, FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+    FWPM_SESSION0, FWPM_SESSION_FLAG_DYNAMIC, FWPM_SUBLAYER0, FWP_ACTION_BLOCK,
+    FWP_CONDITION_VALUE0, FWP_CONDITION_VALUE0_0, FWP_EMPTY, FWP_MATCH_EQUAL, FWP_V4_ADDR_AND_MASK,
+    FWP_V4_ADDR_MASK, FWP_V6_ADDR_AND_MASK, FWP_V6_ADDR_MASK, FWP_VALUE0,
 };
 use windows::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 
@@ -89,8 +89,14 @@ pub fn block_endpoint_wfp(ip: IpAddr, ttl: Duration) -> anyhow::Result<()> {
 unsafe fn block_with_engine(engine: HANDLE, ip: IpAddr, ttl: Duration) -> anyhow::Result<()> {
     // 3. 过滤器：ALE_AUTH_CONNECT（出站连接授权层）+ 远端地址精确匹配 + BLOCK。
     //    地址结构须存活至 FwpmFilterAdd0 返回（API 只读复制），故为局部变量。
-    let mut v4 = FWP_V4_ADDR_AND_MASK { addr: 0, mask: u32::MAX };
-    let mut v6 = FWP_V6_ADDR_AND_MASK { addr: [0; 16], prefixLength: 128 };
+    let mut v4 = FWP_V4_ADDR_AND_MASK {
+        addr: 0,
+        mask: u32::MAX,
+    };
+    let mut v6 = FWP_V6_ADDR_AND_MASK {
+        addr: [0; 16],
+        prefixLength: 128,
+    };
     let (layer, cond) = match ip {
         IpAddr::V4(a) => {
             v4.addr = u32::from(a);
@@ -98,7 +104,9 @@ unsafe fn block_with_engine(engine: HANDLE, ip: IpAddr, ttl: Duration) -> anyhow
                 FWPM_LAYER_ALE_AUTH_CONNECT_V4,
                 FWP_CONDITION_VALUE0 {
                     r#type: FWP_V4_ADDR_MASK,
-                    Anonymous: FWP_CONDITION_VALUE0_0 { v4AddrMask: &mut v4 },
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        v4AddrMask: &mut v4,
+                    },
                 },
             )
         }
@@ -108,7 +116,9 @@ unsafe fn block_with_engine(engine: HANDLE, ip: IpAddr, ttl: Duration) -> anyhow
                 FWPM_LAYER_ALE_AUTH_CONNECT_V6,
                 FWP_CONDITION_VALUE0 {
                     r#type: FWP_V6_ADDR_MASK,
-                    Anonymous: FWP_CONDITION_VALUE0_0 { v6AddrMask: &mut v6 },
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        v6AddrMask: &mut v6,
+                    },
                 },
             )
         }
@@ -130,9 +140,14 @@ unsafe fn block_with_engine(engine: HANDLE, ip: IpAddr, ttl: Duration) -> anyhow
         action: FWPM_ACTION0 {
             r#type: FWP_ACTION_BLOCK,
             // 非 callout 动作：filterType 置零 GUID（SDK 约定）
-            Anonymous: FWPM_ACTION0_0 { filterType: GUID::from_u128(0) },
+            Anonymous: FWPM_ACTION0_0 {
+                filterType: GUID::from_u128(0),
+            },
         },
-        weight: FWP_VALUE0 { r#type: FWP_EMPTY, ..Default::default() },
+        weight: FWP_VALUE0 {
+            r#type: FWP_EMPTY,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let mut filter_id = 0u64;

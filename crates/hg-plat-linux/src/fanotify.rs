@@ -78,9 +78,13 @@ impl FanotifySource {
         rules: Arc<ArcSwap<RulesSnapshot>>,
         tx: mpsc::Sender<Envelope>,
     ) -> anyhow::Result<Self> {
-        let fd = unsafe { libc::fanotify_init(FAN_CLASS_CONTENT | FAN_CLOEXEC, O_RDONLY_LARGEFILE) };
+        let fd =
+            unsafe { libc::fanotify_init(FAN_CLASS_CONTENT | FAN_CLOEXEC, O_RDONLY_LARGEFILE) };
         if fd < 0 {
-            return Err(anyhow::anyhow!("fanotify_init 失败 errno={}（需 root）", errno()));
+            return Err(anyhow::anyhow!(
+                "fanotify_init 失败 errno={}（需 root）",
+                errno()
+            ));
         }
         // 全盘 mark；M0/Linux 校准项：吞吐不可接受时收缩到工作区+harness 目录（§5.2 风险表）
         let mask = FAN_OPEN_PERM | FAN_ACCESS_PERM | FAN_CREATE | FAN_CLOSE_WRITE;
@@ -95,9 +99,19 @@ impl FanotifySource {
         };
         if rc != 0 {
             unsafe { libc::close(fd) };
-            return Err(anyhow::anyhow!("fanotify_mark(filesystem, /) 失败 errno={}", errno()));
+            return Err(anyhow::anyhow!(
+                "fanotify_mark(filesystem, /) 失败 errno={}",
+                errno()
+            ));
         }
-        Ok(Self { fd, procs, rules, tx, base: std::time::Instant::now(), stats: Arc::new(FanotifyStats::default()) })
+        Ok(Self {
+            fd,
+            procs,
+            rules,
+            tx,
+            base: std::time::Instant::now(),
+            stats: Arc::new(FanotifyStats::default()),
+        })
     }
 
     fn now(&self) -> Timestamp {
@@ -150,8 +164,16 @@ impl FanotifySource {
             if ev.mask & (FAN_CREATE | FAN_CLOSE_WRITE) != 0 {
                 if let Some(path) = &path {
                     if self.is_monitored(pid) {
-                        let st = self.procs.get(&pid).map(|i| i.start_time).unwrap_or(StartTime(0));
-                        self.try_send(RawEvent::FileCreate { pid, start_time: st, path: path.clone() });
+                        let st = self
+                            .procs
+                            .get(&pid)
+                            .map(|i| i.start_time)
+                            .unwrap_or(StartTime(0));
+                        self.try_send(RawEvent::FileCreate {
+                            pid,
+                            start_time: st,
+                            path: path.clone(),
+                        });
                     }
                 }
             }
@@ -163,13 +185,18 @@ impl FanotifySource {
         let verdict = {
             let rules = self.rules.load();
             match self.procs.get(&pid) {
-                Some(id) => judge_perm_sync(&rules, &id, &path.clone().unwrap_or_default(), Access::Read),
+                Some(id) => {
+                    judge_perm_sync(&rules, &id, &path.clone().unwrap_or_default(), Access::Read)
+                }
                 None => {
                     // 非监控进程：放行（不干预，§3.3 规则 1）
                     hg_model::Verdict {
                         rule_id: hg_model::RuleId("non-harness"),
                         action: hg_model::Action::Allow,
-                        evidence: hg_model::Evidence { summary: String::new(), detail: serde_json::Value::Null },
+                        evidence: hg_model::Evidence {
+                            summary: String::new(),
+                            detail: serde_json::Value::Null,
+                        },
                     }
                 }
             }
@@ -180,14 +207,27 @@ impl FanotifySource {
         } else {
             FAN_ALLOW
         };
-        let r = FanotifyResponse { fd: ev.fd, response: resp };
-        let _ = unsafe { libc::write(self.fd, &r as *const _ as *const libc::c_void, std::mem::size_of::<FanotifyResponse>()) };
+        let r = FanotifyResponse {
+            fd: ev.fd,
+            response: resp,
+        };
+        let _ = unsafe {
+            libc::write(
+                self.fd,
+                &r as *const _ as *const libc::c_void,
+                std::mem::size_of::<FanotifyResponse>(),
+            )
+        };
 
         // 审计（Block/Audit 才值得落库；try_send 满则丢——判定永不被审计拖累，§9.2）
         if verdict.action != hg_model::Action::Allow {
             self.try_send(RawEvent::FileOpen {
                 pid,
-                start_time: self.procs.get(&pid).map(|i| i.start_time).unwrap_or(StartTime(0)),
+                start_time: self
+                    .procs
+                    .get(&pid)
+                    .map(|i| i.start_time)
+                    .unwrap_or(StartTime(0)),
                 path: path.clone().unwrap_or_default(),
                 access: Access::Read,
             });
@@ -196,7 +236,9 @@ impl FanotifySource {
     }
 
     fn is_monitored(&self, pid: Pid) -> bool {
-        self.procs.get(&pid).is_some_and(|i| i.harness_root.is_some())
+        self.procs
+            .get(&pid)
+            .is_some_and(|i| i.harness_root.is_some())
     }
 
     fn try_send(&self, event: RawEvent) {
@@ -218,8 +260,17 @@ impl FanotifySource {
                 let ev = unsafe { &*(buf.as_ptr().add(off).cast::<FanotifyEventMetadata>()) };
                 off += ev.event_len as usize;
                 if ev.mask & (FAN_OPEN_PERM | FAN_ACCESS_PERM) != 0 {
-                    let r = FanotifyResponse { fd: ev.fd, response: FAN_ALLOW };
-                    let _ = unsafe { libc::write(self.fd, &r as *const _ as *const libc::c_void, std::mem::size_of::<FanotifyResponse>()) };
+                    let r = FanotifyResponse {
+                        fd: ev.fd,
+                        response: FAN_ALLOW,
+                    };
+                    let _ = unsafe {
+                        libc::write(
+                            self.fd,
+                            &r as *const _ as *const libc::c_void,
+                            std::mem::size_of::<FanotifyResponse>(),
+                        )
+                    };
                 }
                 close_fd(ev.fd);
             }
@@ -235,12 +286,20 @@ impl Drop for FanotifySource {
 
 fn fd_path(fd: libc::c_int) -> Option<PathBuf> {
     let mut buf = [0u8; libc::PATH_MAX as usize];
-    let n = unsafe { libc::readlink(format!("/proc/self/fd/{fd}").as_ptr().cast(), buf.as_mut_ptr().cast(), buf.len() - 1) };
+    let n = unsafe {
+        libc::readlink(
+            format!("/proc/self/fd/{fd}").as_ptr().cast(),
+            buf.as_mut_ptr().cast(),
+            buf.len() - 1,
+        )
+    };
     if n <= 0 {
         return None;
     }
     buf[n as usize] = 0;
-    Some(PathBuf::from(String::from_utf8_lossy(&buf[..n as usize]).into_owned()))
+    Some(PathBuf::from(
+        String::from_utf8_lossy(&buf[..n as usize]).into_owned(),
+    ))
 }
 
 fn close_fd(fd: libc::c_int) {

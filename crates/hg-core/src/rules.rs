@@ -88,18 +88,54 @@ pub fn default_endpoints_allow() -> Vec<String> {
 /// 资料（官方未文档化），待实机确认。
 pub fn default_harness_features() -> Vec<HarnessFeature> {
     vec![
-        HarnessFeature { name: "claude-code".into(), path_globs: vec!["**/claude*".into()] },
-        HarnessFeature { name: "zcode".into(), path_globs: vec!["**/zcode*".into()] },
-        HarnessFeature { name: "codex".into(), path_globs: vec!["**/codex*".into()] },
-        HarnessFeature { name: "cursor".into(), path_globs: vec!["**/cursor*".into()] },
-        HarnessFeature { name: "autoclaw".into(), path_globs: vec!["**/autoclaw*".into()] },
-        HarnessFeature { name: "workbuddy".into(), path_globs: vec!["**/workbuddy*".into()] },
-        HarnessFeature { name: "codebuddy".into(), path_globs: vec!["**/codebuddy*".into()] },
-        HarnessFeature { name: "qoder".into(), path_globs: vec!["**/qoder*".into()] },
-        HarnessFeature { name: "trae".into(), path_globs: vec!["**/trae*".into()] },
-        HarnessFeature { name: "cline".into(), path_globs: vec!["**/cline*".into()] },
-        HarnessFeature { name: "opencode".into(), path_globs: vec!["**/opencode*".into()] },
-        HarnessFeature { name: "kilo-code".into(), path_globs: vec!["**/kilocode*".into()] },
+        HarnessFeature {
+            name: "claude-code".into(),
+            path_globs: vec!["**/claude*".into()],
+        },
+        HarnessFeature {
+            name: "zcode".into(),
+            path_globs: vec!["**/zcode*".into()],
+        },
+        HarnessFeature {
+            name: "codex".into(),
+            path_globs: vec!["**/codex*".into()],
+        },
+        HarnessFeature {
+            name: "cursor".into(),
+            path_globs: vec!["**/cursor*".into()],
+        },
+        HarnessFeature {
+            name: "autoclaw".into(),
+            path_globs: vec!["**/autoclaw*".into()],
+        },
+        HarnessFeature {
+            name: "workbuddy".into(),
+            path_globs: vec!["**/workbuddy*".into()],
+        },
+        HarnessFeature {
+            name: "codebuddy".into(),
+            path_globs: vec!["**/codebuddy*".into()],
+        },
+        HarnessFeature {
+            name: "qoder".into(),
+            path_globs: vec!["**/qoder*".into()],
+        },
+        HarnessFeature {
+            name: "trae".into(),
+            path_globs: vec!["**/trae*".into()],
+        },
+        HarnessFeature {
+            name: "cline".into(),
+            path_globs: vec!["**/cline*".into()],
+        },
+        HarnessFeature {
+            name: "opencode".into(),
+            path_globs: vec!["**/opencode*".into()],
+        },
+        HarnessFeature {
+            name: "kilo-code".into(),
+            path_globs: vec!["**/kilocode*".into()],
+        },
     ]
 }
 
@@ -260,7 +296,10 @@ impl RulesSnapshot {
         // 空豁免表几乎必是配置链路异常（实测教训：文件与运行时快照可能分裂），
         // 不允许软状态静默失去兜底。用户自定义 git 条目存在时以用户为准。
         let mut tool_exempt_cfg = cfg.tool_exempt.clone();
-        if !tool_exempt_cfg.iter().any(|t| t.exe.eq_ignore_ascii_case("git")) {
+        if !tool_exempt_cfg
+            .iter()
+            .any(|t| t.exe.eq_ignore_ascii_case("git"))
+        {
             tracing::warn!("tool_exempt 缺少 git 条目，已按需求 §3.3 注入内置豁免（.git/**）");
             tool_exempt_cfg.push(ToolExemptConf {
                 exe: "git".into(),
@@ -477,10 +516,16 @@ pub fn under_git_dir(path: &Path) -> bool {
 pub fn is_git_injection_touch(path: &Path, access: Access) -> bool {
     let mut comps = path.components();
     while let Some(c) = comps.next() {
-        if !c.as_os_str().to_str().is_some_and(|s| s.eq_ignore_ascii_case(".git")) {
+        if !c
+            .as_os_str()
+            .to_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case(".git"))
+        {
             continue;
         }
-        let Some(first) = comps.next() else { return false };
+        let Some(first) = comps.next() else {
+            return false;
+        };
         let first = first.as_os_str().to_string_lossy().to_ascii_lowercase();
         if first == "hooks" {
             return true;
@@ -521,10 +566,19 @@ fn verdict(rule_id: &'static str, action: Action, summary: impl Into<String>) ->
 /// 进程内直接读写 .git，"harness 不直写 .git、写走 git 工具豁免分支"的
 /// 原假设不成立（拍板记录 12）；工作流面的窃取风险与"读工作区源码"同
 /// 层级，由网络层阈值 + 导出命令封堵 + 归档产物三道兜底（需求 §3.1）。
-pub fn judge_perm_sync(rules: &RulesSnapshot, id: &Identity, path: &Path, access: Access) -> Verdict {
+pub fn judge_perm_sync(
+    rules: &RulesSnapshot,
+    id: &Identity,
+    path: &Path,
+    access: Access,
+) -> Verdict {
     // 0. 用户白名单短路
     if rules.is_path_whitelisted(path) {
-        return verdict("whitelist", Action::Allow, format!("路径在用户白名单：{}", path.display()));
+        return verdict(
+            "whitelist",
+            Action::Allow,
+            format!("路径在用户白名单：{}", path.display()),
+        );
     }
 
     // 1. 非监控进程不干预
@@ -560,7 +614,12 @@ pub fn judge_perm_sync(rules: &RulesSnapshot, id: &Identity, path: &Path, access
         return verdict(
             "git-dir-workflow",
             Action::Allow,
-            format!("[{}] {} 访问 .git 工作流面：{}", root.0, id.exe.display(), path.display()),
+            format!(
+                "[{}] {} 访问 .git 工作流面：{}",
+                root.0,
+                id.exe.display(),
+                path.display()
+            ),
         );
     }
 
@@ -633,7 +692,10 @@ mod tests {
         // 均为工作流面（拍板记录 12：ZCode 内置 git 库进程内直写 .git）
         for (p, a) in [
             ("D:/repo/.git/config", Access::Read),
-            ("D:/repo/.git/objects/1b/bdae00224f257a978f5c7ba86b123dc633642c", Access::Write),
+            (
+                "D:/repo/.git/objects/1b/bdae00224f257a978f5c7ba86b123dc633642c",
+                Access::Write,
+            ),
             ("D:/repo/.git/HEAD.lock", Access::Write),
             ("D:/repo/.git/HEAD", Access::Read),
             ("D:/repo/.git/refs/heads/master", Access::Write),
@@ -659,7 +721,12 @@ mod tests {
         let rules = snapshot();
         let mut id = harness_identity("C:/Program Files/Git/cmd/git.exe");
         id.tool_exempt = Some("git".into());
-        let v = judge_perm_sync(&rules, &id, Path::new("D:/repo/.git/objects/ab/cd"), Access::Read);
+        let v = judge_perm_sync(
+            &rules,
+            &id,
+            Path::new("D:/repo/.git/objects/ab/cd"),
+            Access::Read,
+        );
         assert_eq!(v.rule_id.0, "tool-exempt");
         assert_eq!(v.action, Action::Allow);
     }
@@ -679,7 +746,12 @@ mod tests {
     fn 快路径_敏感文件审计放行() {
         let rules = snapshot();
         let id = harness_identity("C:/x/node.exe");
-        for p in ["D:/repo/.env", "D:/repo/.env.production", "D:/repo/id_rsa", "D:/x/cert.pem"] {
+        for p in [
+            "D:/repo/.env",
+            "D:/repo/.env.production",
+            "D:/repo/id_rsa",
+            "D:/x/cert.pem",
+        ] {
             let v = judge_perm_sync(&rules, &id, Path::new(p), Access::Read);
             assert_eq!(v.rule_id.0, "sensitive-read", "{p}");
             assert_eq!(v.action, Action::Audit);
@@ -700,7 +772,12 @@ mod tests {
     fn 命令封堵_导出型命令命中() {
         let rules = snapshot();
         let hit = vec![
-            vec!["C:/Program Files/Git/cmd/git.exe", "archive", "--format=zip", "HEAD"],
+            vec![
+                "C:/Program Files/Git/cmd/git.exe",
+                "archive",
+                "--format=zip",
+                "HEAD",
+            ],
             vec!["git", "bundle", "create", "x.bundle", "--all"],
             vec!["git", "format-patch", "-1"],
             vec!["/usr/bin/tar", "czf", "out.tgz", "."],
@@ -751,7 +828,10 @@ mod tests {
             rules.match_harness(Path::new("C:/Users/u/app/node_modules/.bin/claude.exe")),
             Some("claude-code")
         );
-        assert_eq!(rules.match_harness(Path::new("C:/Windows/system32/cmd.exe")), None);
+        assert_eq!(
+            rules.match_harness(Path::new("C:/Windows/system32/cmd.exe")),
+            None
+        );
     }
 
     /// 豁免编译期兜底（拍板记录 13 前置防线）：配置丢失 git 条目时，
@@ -762,9 +842,16 @@ mod tests {
         cfg.tool_exempt = vec![]; // 模拟配置链路异常（缺段/写回丢失）
         let rules = RulesSnapshot::compile(&cfg).unwrap();
         let mut id = harness_identity("C:/Program Files/Git/mingw64/bin/git.exe");
-        id.tool_exempt = rules.match_tool_exempt(Path::new("C:/Program Files/Git/mingw64/bin/git.exe")).map(String::from);
+        id.tool_exempt = rules
+            .match_tool_exempt(Path::new("C:/Program Files/Git/mingw64/bin/git.exe"))
+            .map(String::from);
         assert_eq!(id.tool_exempt.as_deref(), Some("git"));
-        let v = judge_perm_sync(&rules, &id, Path::new("D:/repo/.git/objects/ab/cd"), Access::Read);
+        let v = judge_perm_sync(
+            &rules,
+            &id,
+            Path::new("D:/repo/.git/objects/ab/cd"),
+            Access::Read,
+        );
         assert_eq!(v.rule_id.0, "tool-exempt");
         assert_eq!(v.action, Action::Allow);
     }

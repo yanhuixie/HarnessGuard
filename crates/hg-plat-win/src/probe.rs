@@ -57,11 +57,7 @@ const DUPLICATE_SAME_ACCESS: u32 = 2;
 /// 等读路径的首个事件常是 Read（op=67）而非 Create，仅限 Create 会漏掉全部读
 /// 场景——场景 A 的 .git 读取正是此路径）、该 FileObject 未探测失败过、
 /// 距上次探测超过限流间隔，三者同时满足才发起。
-pub(crate) fn probe_allowed(
-    op_file: bool,
-    already_failed: bool,
-    interval_elapsed: bool,
-) -> bool {
+pub(crate) fn probe_allowed(op_file: bool, already_failed: bool, interval_elapsed: bool) -> bool {
     op_file && !already_failed && interval_elapsed
 }
 
@@ -115,9 +111,12 @@ unsafe fn probe_with_handle(hproc: HANDLE, pid: u32, file_object: u64) -> Option
     }
     let n = *(buf.as_ptr() as *const usize);
     let base = 16; // NumberOfHandles(8) + Reserved(8)
-    // 条目数来自内核返回的缓冲首字段：异常值经 checked_mul/checked_add 防回绕
-    // 越过长度检查（M4 待修清单 1），溢出视同检索失败
-    let Some(total) = n.checked_mul(HANDLE_ENTRY_SIZE).and_then(|x| x.checked_add(base)) else {
+                   // 条目数来自内核返回的缓冲首字段：异常值经 checked_mul/checked_add 防回绕
+                   // 越过长度检查（M4 待修清单 1），溢出视同检索失败
+    let Some(total) = n
+        .checked_mul(HANDLE_ENTRY_SIZE)
+        .and_then(|x| x.checked_add(base))
+    else {
         return None;
     };
     if total > buf.len() {
@@ -160,7 +159,10 @@ unsafe fn probe_with_handle(hproc: HANDLE, pid: u32, file_object: u64) -> Option
     }
     let name = final_path(dup);
     if name.is_none() {
-        tracing::debug!("[probe] GetFinalPathNameByHandleW 失败 gle={}（复验诊断）", std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+        tracing::debug!(
+            "[probe] GetFinalPathNameByHandleW 失败 gle={}（复验诊断）",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        );
     }
     let _ = CloseHandle(dup);
     name
@@ -189,9 +191,18 @@ mod tests {
 
     #[test]
     fn 探测决策_三条件缺一不可() {
-        assert!(probe_allowed(true, false, true), "Create/Read+未失败+间隔到 → 探测");
-        assert!(!probe_allowed(false, false, true), "Write 等其他 opcode 不探测");
-        assert!(!probe_allowed(true, true, true), "失败过的 FileObject 不重试");
+        assert!(
+            probe_allowed(true, false, true),
+            "Create/Read+未失败+间隔到 → 探测"
+        );
+        assert!(
+            !probe_allowed(false, false, true),
+            "Write 等其他 opcode 不探测"
+        );
+        assert!(
+            !probe_allowed(true, true, true),
+            "失败过的 FileObject 不重试"
+        );
         assert!(!probe_allowed(true, false, false), "限流间隔未到不探测");
     }
 

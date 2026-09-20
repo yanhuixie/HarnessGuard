@@ -34,7 +34,11 @@ pub(crate) fn build_tcp_row_v4(
     use windows::Win32::NetworkManagement::IpHelper::{MIB_TCPROW_LH, MIB_TCPROW_LH_0};
     let (l, r) = match (quad.local.ip(), quad.remote.ip()) {
         (IpAddr::V4(l), IpAddr::V4(r)) => (l, r),
-        _ => anyhow::bail!("v4 行构造收到非 IPv4 四元组：{} -> {}", quad.local, quad.remote),
+        _ => anyhow::bail!(
+            "v4 行构造收到非 IPv4 四元组：{} -> {}",
+            quad.local,
+            quad.remote
+        ),
     };
     Ok(MIB_TCPROW_LH {
         Anonymous: MIB_TCPROW_LH_0 { dwState: state },
@@ -57,14 +61,22 @@ pub(crate) fn build_tcp_row_v6(
     use windows::Win32::Networking::WinSock::{IN6_ADDR, IN6_ADDR_0};
     let (l, r) = match (quad.local.ip(), quad.remote.ip()) {
         (IpAddr::V6(l), IpAddr::V6(r)) => (l, r),
-        _ => anyhow::bail!("v6 行构造收到非 IPv6 四元组：{} -> {}", quad.local, quad.remote),
+        _ => anyhow::bail!(
+            "v6 行构造收到非 IPv6 四元组：{} -> {}",
+            quad.local,
+            quad.remote
+        ),
     };
     Ok(MIB_TCP6ROW {
         State: state,
-        LocalAddr: IN6_ADDR { u: IN6_ADDR_0 { Byte: l.octets() } },
+        LocalAddr: IN6_ADDR {
+            u: IN6_ADDR_0 { Byte: l.octets() },
+        },
         dwLocalScopeId: 0,
         dwLocalPort: net_port(quad.local.port()),
-        RemoteAddr: IN6_ADDR { u: IN6_ADDR_0 { Byte: r.octets() } },
+        RemoteAddr: IN6_ADDR {
+            u: IN6_ADDR_0 { Byte: r.octets() },
+        },
         dwRemoteScopeId: 0,
         dwRemotePort: net_port(quad.remote.port()),
     })
@@ -87,19 +99,14 @@ impl Enforcer for WinEnforcer {
             PROCESS_TERMINATE,
         };
         unsafe {
-            let h = OpenProcess(
-                PROCESS_QUERY_INFORMATION | PROCESS_TERMINATE,
-                false,
-                pid,
-            )?;
+            let h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_TERMINATE, false, pid)?;
             // pid + start_time 双匹配，防复用误杀（技术设计 §3.1）
             let mut create = windows::Win32::Foundation::FILETIME::default();
             let mut exit_t = windows::Win32::Foundation::FILETIME::default();
             let mut k = windows::Win32::Foundation::FILETIME::default();
             let mut u = windows::Win32::Foundation::FILETIME::default();
             let ok = GetProcessTimes(h, &mut create, &mut exit_t, &mut k, &mut u);
-            let create_u64 =
-                ((create.dwHighDateTime as u64) << 32) | create.dwLowDateTime as u64;
+            let create_u64 = ((create.dwHighDateTime as u64) << 32) | create.dwLowDateTime as u64;
             if !ok.is_ok() {
                 let _ = CloseHandle(h);
                 anyhow::bail!("pid {pid} GetProcessTimes 失败，拒绝无校验处置");
@@ -134,7 +141,11 @@ impl Enforcer for WinEnforcer {
                     "IPv6 连接级断开无用户态 API：SetTcp6Entry 为文档幻影（头文件/导入库/DLL 导出均无，M4 实测）；本连接已由 Kill/封 IP 路径兜底"
                 )
             }
-            _ => anyhow::bail!("混合协议四元组（v4/v6 不一致）：{} -> {}", quad.local, quad.remote),
+            _ => anyhow::bail!(
+                "混合协议四元组（v4/v6 不一致）：{} -> {}",
+                quad.local,
+                quad.remote
+            ),
         };
         if rc == 0 {
             Ok(())
@@ -166,9 +177,13 @@ fn netsh_block(ip: IpAddr, ttl: Duration) {
     let rule = format!("HarnessGuard-block-{}", ip.to_string().replace(':', "-"));
     let add = std::process::Command::new("netsh")
         .args([
-            "advfirewall", "firewall", "add", "rule",
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
             &format!("name={rule}"),
-            "dir=out", "action=block",
+            "dir=out",
+            "action=block",
             &format!("remoteip={ip}"),
         ])
         .output();
@@ -178,11 +193,20 @@ fn netsh_block(ip: IpAddr, ttl: Duration) {
     }
     std::thread::sleep(ttl);
     let del = std::process::Command::new("netsh")
-        .args(["advfirewall", "firewall", "delete", "rule", &format!("name={rule}")])
+        .args([
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            &format!("name={rule}"),
+        ])
         .output();
     if let Ok(o) = &del {
         if !o.status.success() {
-            tracing::error!("netsh 移除封禁规则失败: {}", String::from_utf8_lossy(&o.stderr));
+            tracing::error!(
+                "netsh 移除封禁规则失败: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
         }
     }
 }
@@ -208,8 +232,14 @@ mod tests {
             MIB_TCP_STATE_DELETE_TCB,
         )
         .unwrap();
-        assert_eq!(row.dwLocalPort, 0x0000_901F, "本地端口 8080 应编码为低 16 位 0x901F");
-        assert_eq!(row.dwRemotePort, 0x0000_BB01, "远端端口 443(0x01BB) 应编码为 0xBB01");
+        assert_eq!(
+            row.dwLocalPort, 0x0000_901F,
+            "本地端口 8080 应编码为低 16 位 0x901F"
+        );
+        assert_eq!(
+            row.dwRemotePort, 0x0000_BB01,
+            "远端端口 443(0x01BB) 应编码为 0xBB01"
+        );
     }
 
     #[test]
@@ -266,8 +296,14 @@ mod tests {
         .unwrap();
         assert_eq!(unsafe { row.LocalAddr.u.Byte }, l.octets());
         assert_eq!(unsafe { row.RemoteAddr.u.Byte }, r.octets());
-        assert_eq!(row.dwLocalPort, 0x0000_00C0, "49152(0xC000) → 低 16 位 0x00C0");
-        assert_eq!(row.dwRemotePort, 0x0000_5503, "853(0x0355) → 低 16 位 0x5503");
+        assert_eq!(
+            row.dwLocalPort, 0x0000_00C0,
+            "49152(0xC000) → 低 16 位 0x00C0"
+        );
+        assert_eq!(
+            row.dwRemotePort, 0x0000_5503,
+            "853(0x0355) → 低 16 位 0x5503"
+        );
     }
 
     #[test]
@@ -289,13 +325,11 @@ mod tests {
 
     #[test]
     fn v6_行构造_非v6四元组应报错() {
-        assert!(
-            build_tcp_row_v6(
-                &quad_v4([1, 2, 3, 4], 1, [5, 6, 7, 8], 2),
-                windows::Win32::NetworkManagement::IpHelper::MIB_TCP_STATE_DELETE_TCB,
-            )
-            .is_err()
-        );
+        assert!(build_tcp_row_v6(
+            &quad_v4([1, 2, 3, 4], 1, [5, 6, 7, 8], 2),
+            windows::Win32::NetworkManagement::IpHelper::MIB_TCP_STATE_DELETE_TCB,
+        )
+        .is_err());
     }
 
     /// kill 对已退出 pid 的错误路径：OpenProcess 对无存活引用的已退出 pid 失败，
